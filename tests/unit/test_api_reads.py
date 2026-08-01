@@ -37,6 +37,8 @@ def test_api_exposes_stable_run_reads(temp_dir):
         name="train-run",
         config={"model": {"id": "org/model"}},
         group="package-1",
+        auto_log_cpu=False,
+        auto_log_gpu=False,
     )
     run_id = writer.id
     writer.log({"train/loss": 2.0, "event/name": "started"}, step=0)
@@ -67,7 +69,9 @@ def test_api_exposes_stable_run_reads(temp_dir):
     output = writer.log_artifact(artifact_path, name="trained-model", type="model")
     writer.finish()
 
-    consumer = trackio.init(project=project, name="eval-run")
+    consumer = trackio.init(
+        project=project, name="eval-run", auto_log_cpu=False, auto_log_gpu=False
+    )
     consumer_id = consumer.id
     consumer.use_artifact(f"{output.name}:{output.version}", type="model")
     consumer.log({"eval/score": 0.9}, step=0)
@@ -104,7 +108,9 @@ def test_api_exposes_stable_run_reads(temp_dir):
         },
         {"timestamp": run.history()[2]["timestamp"], "step": 2},
     ]
-    assert [point["value"] for point in run.metric_series(["train/loss"])["train/loss"]] == [2.0, 1.0]
+    assert [
+        point["value"] for point in run.metric_series(["train/loss"])["train/loss"]
+    ] == [2.0, 1.0]
     assert run.system_metric_names() == ["cpu/utilization"]
     assert [row["cpu/utilization"] for row in run.system_history()] == [42.0, 51.0]
 
@@ -141,7 +147,9 @@ def test_api_reads_empty_run_created_by_artifact_link(temp_dir):
     assert run.artifacts()["input"][0]["version"] == 0
 
 
-def test_api_read_only_mode_sees_new_runs_without_reopening_storage(temp_dir, monkeypatch):
+def test_api_read_only_mode_sees_new_runs_without_reopening_storage(
+    temp_dir, monkeypatch
+):
     project = "api-live-read-only"
     first = trackio.init(project=project, name="first")
     first.log({"loss": 2.0}, step=0)

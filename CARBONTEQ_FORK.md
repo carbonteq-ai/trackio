@@ -10,7 +10,7 @@ integrations.
 
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current fork release
-is `0.31.5.post5`, derived from upstream Trackio `0.31.5`.
+is `0.31.5.post6`, derived from upstream Trackio `0.31.5`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -106,6 +106,7 @@ added later without changing the Trackio SDK contract.
 | `0.31.5.post3` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post4` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post5` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
+| `0.31.5.post6` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 
 `0.31.5.post4` adds project-scoped bulk read APIs so a client can describe every
 run without one configuration request and one history request per run:
@@ -119,6 +120,13 @@ run without one configuration request and one history request per run:
 `post4` while `trackio._version.__version__` still said `post3`. That index is
 non-volatile, so `0.31.5.post5` is the corrected release: same APIs, matching
 import and distribution versions. Do not install `post4` from the index.
+
+`0.31.5.post6` adds an authenticated, preview-first project purge API. Its
+summary names the project-owned runs, artifact versions, and local artifact or
+media bytes before deletion; the apply endpoint removes only that project's
+server-owned storage. It is deliberately not a lineage cascade: a caller that
+wants to remove jobs and their downstream consumers must construct and confirm
+that closure in its job orchestration layer.
 
 Every CarbonTeq release must add a row before it is tagged. Platform consumers
 should prefer the published `carbonteq-trackio` distribution once it is on the
