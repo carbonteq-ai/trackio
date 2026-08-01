@@ -888,7 +888,11 @@ def alert(
 
 def delete_project(project: str, force: bool = False) -> bool:
     """
-    Deletes a project by removing its local SQLite database.
+    Deletes every project-scoped object owned by local Trackio storage.
+
+    This removes the project's run records, artifact metadata and locally held
+    artifact/media bytes. It deliberately does not delete a remote replica
+    owned by an external object store or dataset integration.
 
     Args:
         project (`str`):
@@ -900,40 +904,23 @@ def delete_project(project: str, force: bool = False) -> bool:
     Returns:
         `bool`: `True` if the project was deleted, `False` otherwise.
     """
-    db_path = SQLiteStorage.get_project_db_path(project)
-
-    if not db_path.exists():
+    preview = SQLiteStorage.project_delete_summary(project)
+    if not preview["exists"]:
         print(f"* Project '{project}' does not exist.")
         return False
 
     if not force:
         response = input(
             f"Are you sure you want to delete project '{project}'? "
-            f"This will permanently delete all runs and metrics. (y/N): "
+            "This permanently deletes its runs, artifacts, and local bytes. "
+            "(y/N): "
         )
         if response.lower() not in ["y", "yes"]:
             print("* Deletion cancelled.")
             return False
 
     try:
-        db_path.unlink()
-
-        for suffix in ("-wal", "-shm"):
-            sidecar = Path(str(db_path) + suffix)
-            if sidecar.exists():
-                sidecar.unlink()
-
-        for parquet_path in SQLiteStorage._project_parquet_paths(db_path):
-            if parquet_path.exists():
-                parquet_path.unlink()
-
-        for asset_dir in (
-            utils.project_artifacts_dir(project),
-            utils.project_media_dir(project),
-        ):
-            if asset_dir.exists():
-                shutil.rmtree(asset_dir, ignore_errors=True)
-
+        SQLiteStorage.delete_project(project)
         print(f"* Project '{project}' has been deleted.")
         return True
     except Exception as e:
