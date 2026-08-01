@@ -115,6 +115,19 @@ Note: Multiple runs can share the same `name`, as Trackio will use the `id` iden
 - **`delete() -> bool`**: Deletes the run from its project. Returns `True` if successful, `False` otherwise.
 - **`move(new_project: str) -> bool`**: Moves the run to a different project. Returns `True` if successful, `False` otherwise. Updates the run's `project` property after a successful move.
 
+### Deleting a project
+
+`trackio.delete_project("my_project")` first asks for confirmation and then
+removes the local project database, run evidence, artifact metadata, and local
+artifact/media bytes. `force=True` is intended for an explicit non-interactive
+cleanup. This is a project boundary operation: Trackio never follows lineage
+into a different project, and it does not remove replicas owned by an external
+object store or dataset integration.
+
+For a self-hosted server, use `RemoteClient.project_delete_plan(project)` to
+inspect the authenticated deletion set first, then call
+`RemoteClient.delete_project(project)` only after the caller has confirmed it.
+
 ## Examples
 
 ### List all runs across projects

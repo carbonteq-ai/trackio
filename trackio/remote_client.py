@@ -244,8 +244,13 @@ class _TrackioHTTPClient:
         )
         complete_response.raise_for_status()
         completed = complete_response.json()
-        if completed.get("digest") != digest or completed.get("size_bytes") != size_bytes:
-            raise RuntimeError("Trackio completed an artifact upload with the wrong identity.")
+        if (
+            completed.get("digest") != digest
+            or completed.get("size_bytes") != size_bytes
+        ):
+            raise RuntimeError(
+                "Trackio completed an artifact upload with the wrong identity."
+            )
         return True
 
 
@@ -392,3 +397,19 @@ class RemoteClient:
 
     def upload_artifact_blob(self, project: str, digest: str, path: Path) -> bool:
         return self._client.upload_artifact_blob(project, digest, path)
+
+    def project_delete_plan(self, project: str) -> dict[str, Any]:
+        """Preview authenticated deletion of all data owned by one project."""
+
+        result = self.predict(project=project, api_name="/get_project_delete_plan")
+        if not isinstance(result, dict):
+            raise RuntimeError("Trackio project delete plan must be an object")
+        return result
+
+    def delete_project(self, project: str) -> dict[str, Any]:
+        """Permanently delete an isolated project after the caller confirms its plan."""
+
+        result = self.predict(project=project, api_name="/delete_project")
+        if not isinstance(result, dict):
+            raise RuntimeError("Trackio project deletion result must be an object")
+        return result

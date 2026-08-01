@@ -25,11 +25,11 @@ except ImportError:
 import huggingface_hub as hf
 import orjson
 
-from trackio.lifecycle import lifecycle_row
 from trackio import cas, references
 from trackio import database as sqlite3
 from trackio.commit_scheduler import CommitScheduler
 from trackio.dummy_commit_scheduler import DummyCommitScheduler
+from trackio.lifecycle import lifecycle_row
 from trackio.typehints import (
     ARTIFACT_BLOB_UPLOAD_KIND,
     MEDIA_UPLOAD_KIND,
@@ -43,6 +43,7 @@ from trackio.utils import (
     deserialize_values,
     get_color_palette,
     on_spaces,
+    project_artifacts_dir,
     project_media_dir,
     serialize_values,
 )
@@ -367,6 +368,18 @@ def _system_logs_read_cache_put(
         while len(_SYSTEM_LOGS_READ_CACHE) >= _LOGS_READ_CACHE_MAX_KEYS:
             _SYSTEM_LOGS_READ_CACHE.pop(next(iter(_SYSTEM_LOGS_READ_CACHE)))
         _SYSTEM_LOGS_READ_CACHE[key] = (mtime_ns, snapshot)
+
+
+def _directory_bytes(path: Path) -> int:
+    """Count physical file bytes without following links outside project storage."""
+
+    if not path.is_dir() or path.is_symlink():
+        return 0
+    return sum(
+        item.lstat().st_size
+        for item in path.rglob("*")
+        if item.is_file() and not item.is_symlink()
+    )
 
 
 class SQLiteStorage:
@@ -2923,6 +2936,78 @@ class SQLiteStorage:
         return sorted(projects)
 
     @staticmethod
+    def project_delete_summary(project: str) -> dict[str, int | bool | str]:
+        """Describe the complete project-scoped deletion set without mutating it."""
+
+        db_path = SQLiteStorage.get_project_db_path(project)
+        artifacts_dir = project_artifacts_dir(project)
+        media_dir = project_media_dir(project)
+        exists = db_path.exists() or artifacts_dir.exists() or media_dir.exists()
+        summary: dict[str, int | bool | str] = {
+            "project": canonical_project_name(project),
+            "exists": exists,
+            "runs": 0,
+            "artifacts": 0,
+            "artifact_versions": 0,
+            "artifact_logical_bytes": 0,
+            "artifact_storage_bytes": _directory_bytes(artifacts_dir),
+            "media_storage_bytes": _directory_bytes(media_dir),
+        }
+        if not db_path.exists():
+            return summary
+        # ``get_run_records`` opens its own connection.  Do that before
+        # acquiring the project lock: on Spaces that lock is intentionally
+        # non-reentrant.
+        summary["runs"] = len(SQLiteStorage.get_run_records(project))
+        with SQLiteStorage._get_process_lock(project):
+            with SQLiteStorage._get_connection(db_path) as conn:
+                cursor = conn.cursor()
+                for table, key in (
+                    ("artifacts", "artifacts"),
+                    ("artifact_versions", "artifact_versions"),
+                ):
+                    try:
+                        row = cursor.execute(
+                            f"SELECT COUNT(*) AS count FROM {table}"
+                        ).fetchone()
+                    except sqlite3.OperationalError:
+                        continue
+                    summary[key] = int(row["count"]) if row is not None else 0
+                try:
+                    row = cursor.execute(
+                        "SELECT COALESCE(SUM(size_bytes), 0) AS total FROM artifact_versions"
+                    ).fetchone()
+                except sqlite3.OperationalError:
+                    row = None
+                summary["artifact_logical_bytes"] = (
+                    int(row["total"]) if row is not None else 0
+                )
+        return summary
+
+    @staticmethod
+    def delete_project(project: str) -> dict[str, int | bool | str]:
+        """Delete all data and local blobs owned by one isolated project.
+
+        Callers must obtain explicit destructive authorization. This primitive
+        does not follow artifact links into other projects: project names are
+        the storage and lineage boundary.
+        """
+
+        summary = SQLiteStorage.project_delete_summary(project)
+        db_path = SQLiteStorage.get_project_db_path(project)
+        if db_path.exists():
+            with SQLiteStorage._get_process_lock(project):
+                db_path.unlink(missing_ok=True)
+                for suffix in ("-wal", "-shm"):
+                    Path(str(db_path) + suffix).unlink(missing_ok=True)
+                for parquet_path in SQLiteStorage._project_parquet_paths(db_path):
+                    parquet_path.unlink(missing_ok=True)
+        for directory in (project_artifacts_dir(project), project_media_dir(project)):
+            if directory.exists():
+                shutil.rmtree(directory)
+        return {**summary, "deleted": bool(summary["exists"])}
+
+    @staticmethod
     def get_runs(project: str) -> list[str]:
         """Get list of all runs for a project, ordered by creation time."""
         return [record["name"] for record in SQLiteStorage.get_run_records(project)]
@@ -4006,11 +4091,11 @@ class SQLiteStorage:
     def get_run_lifecycles(project: str) -> dict[str, dict]:
         """Return the latest lifecycle row for every run in `project`.
 
-    Lifecycle values are logged as ordinary metric rows, so describing a run
-    otherwise costs a request per run and a listing costs one per run in the
-    project. This answers for every run at once, which is what makes listing a
-    project cost the same whether it holds one run or a thousand.
-    """
+        Lifecycle values are logged as ordinary metric rows, so describing a run
+        otherwise costs a request per run and a listing costs one per run in the
+        project. This answers for every run at once, which is what makes listing a
+        project cost the same whether it holds one run or a thousand.
+        """
         db_path = SQLiteStorage.get_project_db_path(project)
         if not db_path.exists():
             return {}

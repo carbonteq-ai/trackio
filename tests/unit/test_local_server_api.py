@@ -103,6 +103,31 @@ def test_local_dashboard_supports_remote_client(temp_dir):
         app.close()
 
 
+def test_remote_client_previews_and_deletes_an_isolated_project(temp_dir):
+    project = "remote-project-purge"
+    app, _, _, full_url = trackio.show(block_thread=False, open_browser=False)
+
+    try:
+        context_vars.current_server.set(None)
+        context_vars.current_project.set(None)
+        context_vars.current_run.set(None)
+        trackio.init(project=project, name="train", server_url=full_url)
+        trackio.log(metrics={"loss": 0.1})
+        trackio.finish()
+
+        client = Client(full_url, verbose=False)
+        preview = client.project_delete_plan(project)
+        assert preview["project"] == project
+        assert preview["exists"] is True
+        assert preview["runs"] == 1
+
+        deleted = client.delete_project(project)
+        assert deleted["deleted"] is True
+        assert client.project_delete_plan(project)["exists"] is False
+    finally:
+        app.close()
+
+
 def test_get_run_configs_returns_config_per_run(temp_dir):
     project = "run_config_per_run"
 

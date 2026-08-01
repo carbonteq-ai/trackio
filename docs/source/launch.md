@@ -85,6 +85,8 @@ The currently available HTTP endpoints are:
 - `POST /api/get_settings`
 - `POST /api/get_project_files`
 - `POST /api/delete_run`
+- `POST /api/get_project_delete_plan` (authenticated preview of project-owned data)
+- `POST /api/delete_project` (authenticated permanent project purge)
 - `POST /api/rename_run`
 - `POST /api/force_sync`
 - `POST /api/upload` for multipart file uploads used by media and file-related flows

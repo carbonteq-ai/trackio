@@ -180,6 +180,34 @@ def test_deleting_same_name_run_preserves_unowned_lineage(temp_dir):
     )
 
 
+def test_project_deletion_preview_and_apply_remove_project_scoped_artifacts(
+    temp_dir, stage_blob
+):
+    payload = b"project-owned-weights"
+    digest, blob = stage_blob("purge-me", payload)
+    _commit(
+        project="purge-me",
+        files=[{"path": "weights.bin", "digest": digest, "size": len(payload)}],
+    )
+
+    preview = SQLiteStorage.project_delete_summary("purge-me")
+
+    assert preview["exists"] is True
+    assert preview["runs"] == 1
+    assert preview["artifacts"] == 1
+    assert preview["artifact_versions"] == 1
+    assert preview["artifact_logical_bytes"] == len(payload)
+    assert preview["artifact_storage_bytes"] == len(payload)
+    assert blob.is_file()
+
+    deleted = SQLiteStorage.delete_project("purge-me")
+
+    assert deleted["deleted"] is True
+    assert not SQLiteStorage.get_project_db_path("purge-me").exists()
+    assert not blob.exists()
+    assert SQLiteStorage.project_delete_summary("purge-me")["exists"] is False
+
+
 def test_legacy_metrics_db_resolves_artifact_links_by_name(temp_dir):
     _create_legacy_project_db("p")
     _commit(run_name="legacy-run", run_id="client-uuid")

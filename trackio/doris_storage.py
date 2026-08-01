@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shutil
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -16,7 +17,6 @@ from pymysql.cursors import DictCursor
 
 import trackio.cas as cas
 import trackio.references as references
-from trackio.lifecycle import lifecycle_row
 from trackio.doris_schema import (
     MANAGED_TABLES,
     SCHEMA_VERSION,
@@ -24,8 +24,14 @@ from trackio.doris_schema import (
     schema_statements,
 )
 from trackio.dummy_commit_scheduler import DummyCommitScheduler
+from trackio.lifecycle import lifecycle_row
 from trackio.sqlite_storage import SQLiteStorage
-from trackio.utils import deserialize_values, serialize_values
+from trackio.utils import (
+    deserialize_values,
+    project_artifacts_dir,
+    project_media_dir,
+    serialize_values,
+)
 
 _DATABASE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 
@@ -43,6 +49,18 @@ def _json(value: Any) -> str:
 
 def _decode(value: str | bytes) -> Any:
     return deserialize_values(orjson.loads(value))
+
+
+def _directory_bytes(path) -> int:
+    """Count project-local bytes without following a symlink outside the project."""
+
+    if not path.is_dir() or path.is_symlink():
+        return 0
+    return sum(
+        item.lstat().st_size
+        for item in path.rglob("*")
+        if item.is_file() and not item.is_symlink()
+    )
 
 
 def _event_id(
@@ -963,6 +981,98 @@ class DorisStorage:
             return [str(row["project_id"]) for row in cursor.fetchall()]
 
     @classmethod
+    def project_delete_summary(cls, project: str) -> dict[str, int | bool | str]:
+        """Describe one project's complete server-owned deletion set."""
+
+        summary: dict[str, int | bool | str] = {
+            "project": project,
+            "exists": False,
+            "runs": 0,
+            "artifacts": 0,
+            "artifact_versions": 0,
+            "artifact_logical_bytes": 0,
+            "artifact_storage_bytes": _directory_bytes(project_artifacts_dir(project)),
+            "media_storage_bytes": _directory_bytes(project_media_dir(project)),
+        }
+        run_ids: set[str] = set()
+        with cls._connection() as connection, connection.cursor() as cursor:
+            for table in (
+                "metrics",
+                "configs",
+                "system_metrics",
+                "traces",
+                "alerts",
+                "run_artifact_links",
+            ):
+                cursor.execute(
+                    f"SELECT DISTINCT run_id FROM {table} WHERE project_id = %s",
+                    (project,),
+                )
+                run_ids.update(
+                    str(row["run_id"])
+                    for row in cursor.fetchall()
+                    if row["run_id"] is not None
+                )
+            summary["runs"] = len(run_ids)
+            for table, key in (
+                ("artifacts", "artifacts"),
+                ("artifact_versions", "artifact_versions"),
+                ("artifact_aliases", None),
+                ("metrics", None),
+                ("configs", None),
+                ("system_metrics", None),
+                ("traces", None),
+                ("alerts", None),
+                ("project_metadata", None),
+                ("run_artifact_links", None),
+            ):
+                cursor.execute(
+                    f"SELECT COUNT(*) AS count FROM {table} WHERE project_id = %s",
+                    (project,),
+                )
+                row = cursor.fetchone()
+                count = int(row["count"]) if row is not None else 0
+                if key is not None:
+                    summary[key] = count
+                if count:
+                    summary["exists"] = True
+            cursor.execute(
+                "SELECT COALESCE(SUM(size_bytes), 0) AS total FROM artifact_versions WHERE project_id = %s",
+                (project,),
+            )
+            row = cursor.fetchone()
+            summary["artifact_logical_bytes"] = (
+                int(row["total"]) if row is not None else 0
+            )
+        if summary["artifact_storage_bytes"] or summary["media_storage_bytes"]:
+            summary["exists"] = True
+        return summary
+
+    @classmethod
+    def delete_project(cls, project: str) -> dict[str, int | bool | str]:
+        """Delete all Doris rows and local project-scoped artifact/media bytes."""
+
+        summary = cls.project_delete_summary(project)
+        with cls._connection() as connection, connection.cursor() as cursor:
+            for table in (
+                "run_artifact_links",
+                "artifact_aliases",
+                "artifact_versions",
+                "artifacts",
+                "traces",
+                "alerts",
+                "system_metrics",
+                "metrics",
+                "configs",
+                "project_metadata",
+            ):
+                cursor.execute(f"DELETE FROM {table} WHERE project_id = %s", (project,))
+        for directory in (project_artifacts_dir(project), project_media_dir(project)):
+            if directory.exists():
+                shutil.rmtree(directory)
+        return {**summary, "deleted": bool(summary["exists"])}
+
+    @classmethod
     def get_run_records(cls, project: str) -> list[dict[str, str | None]]:
         with cls._connection() as connection, connection.cursor() as cursor:
             cursor.execute(
@@ -1214,11 +1324,11 @@ class DorisStorage:
     def get_run_lifecycles(cls, project: str) -> dict[str, dict]:
         """Return the latest lifecycle row for every run in `project`.
 
-    Lifecycle values are logged as ordinary metric rows, so describing a run
-    otherwise costs a request per run and a listing costs one per run in the
-    project. This answers for every run at once, which is what makes listing a
-    project cost the same whether it holds one run or a thousand.
-    """
+        Lifecycle values are logged as ordinary metric rows, so describing a run
+        otherwise costs a request per run and a listing costs one per run in the
+        project. This answers for every run at once, which is what makes listing a
+        project cost the same whether it holds one run or a thousand.
+        """
         lifecycles: dict[str, dict] = {}
         with cls._connection() as connection, connection.cursor() as cursor:
             cursor.execute(

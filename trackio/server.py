@@ -1276,6 +1276,20 @@ def delete_run(
     return Storage.delete_run(project, run, run_id=run_id)
 
 
+def get_project_delete_plan(request: Request, project: str) -> dict[str, Any]:
+    """Return the complete project-scoped deletion set without mutating it."""
+
+    assert_can_mutate_runs(request)
+    return Storage.project_delete_summary(_validate_project_name(project))
+
+
+def delete_project(request: Request, project: str) -> dict[str, Any]:
+    """Permanently delete one isolated project's runs, artifacts, and bytes."""
+
+    assert_can_mutate_runs(request)
+    return Storage.delete_project(_validate_project_name(project))
+
+
 def rename_run(
     request: Request,
     project: str,
@@ -1348,6 +1362,8 @@ def _api_registry() -> dict[str, Any]:
         "get_project_files": get_project_files,
         "get_tab_availability": get_tab_availability,
         "delete_run": delete_run,
+        "get_project_delete_plan": get_project_delete_plan,
+        "delete_project": delete_project,
         "rename_run": rename_run,
         "force_sync": force_sync,
     }
