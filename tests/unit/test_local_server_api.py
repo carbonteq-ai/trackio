@@ -121,10 +121,38 @@ def test_remote_client_previews_and_deletes_an_isolated_project(temp_dir):
         assert preview["exists"] is True
         assert preview["runs"] == 1
 
-        deleted = client.delete_project(project)
+        with pytest.raises(RuntimeError, match="project delete plan is stale"):
+            client.delete_project(project, "sha256:" + "0" * 64)
+
+        deleted = client.delete_project(project, preview["digest"])
         assert deleted["deleted"] is True
+        assert deleted["plan_digest"] == preview["digest"]
         assert client.project_delete_plan(project)["exists"] is False
     finally:
+        app.close()
+
+
+def test_remote_client_reports_stale_run_purge_and_accepts_reviewed_digest(temp_dir):
+    project = "remote-run-purge"
+    run = trackio.init(project=project, name="train")
+    trackio.log(metrics={"loss": 0.1})
+    trackio.finish()
+    app, _, _, full_url = trackio.show(block_thread=False, open_browser=False)
+
+    try:
+        client = Client(full_url, verbose=False)
+        preview = client.run_purge_plan(project, [run.id])
+        assert preview["blockers"] == []
+
+        with pytest.raises(RuntimeError, match="run purge plan is stale"):
+            client.purge_runs(project, [run.id], "sha256:" + "0" * 64)
+        assert client.run_purge_plan(project, [run.id])["exists"] is True
+
+        receipt = client.purge_runs(project, [run.id], preview["digest"])
+        assert receipt["deleted_provider_run_ids"] == [run.id]
+        assert client.run_purge_plan(project, [run.id])["exists"] is False
+    finally:
+        trackio.delete_project(project, force=True)
         app.close()
 
 
