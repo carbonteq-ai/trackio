@@ -10,7 +10,7 @@ integrations.
 
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current fork release
-is `0.31.5.post7`, derived from upstream Trackio `0.31.5`.
+is `0.31.5.post8`, derived from upstream Trackio `0.31.5`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -108,6 +108,7 @@ added later without changing the Trackio SDK contract.
 | `0.31.5.post5` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post6` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post7` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
+| `0.31.5.post8` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 
 `0.31.5.post4` adds project-scoped bulk read APIs so a client can describe every
 run without one configuration request and one history request per run:
@@ -139,6 +140,11 @@ responsible for cross-plane dependency closure and the user-facing dry-run
 plan. The same digest binding now covers the existing project-boundary delete
 endpoint, so project apply cannot race a changed inventory while retaining
 backward compatibility for older callers that only inspect the post6 summary.
+
+`0.31.5.post8` preserves the post7 purge contract and makes rejected applies
+actionable over the HTTP transport. Stale run/project digests now return a
+client error, and `RemoteClient` surfaces the server's obtain-a-new-preview
+message instead of replacing it with a generic HTTP status exception.
 
 Every CarbonTeq release must add a row before it is tagged. Platform consumers
 should prefer the published `carbonteq-trackio` distribution once it is on the

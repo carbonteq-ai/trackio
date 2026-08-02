@@ -160,10 +160,14 @@ class _TrackioHTTPClient:
             raise RuntimeError(
                 f"Space '{self.src}' does not support '/{api_name}'. Redeploy with `trackio sync`."
             )
+        try:
+            body = resp.json()
+        except ValueError:
+            resp.raise_for_status()
+            raise RuntimeError(f"Trackio '/{api_name}' returned an invalid response")
+        if isinstance(body, dict) and body.get("error") is not None:
+            raise RuntimeError(str(body["error"]))
         resp.raise_for_status()
-        body = resp.json()
-        if body.get("error") is not None:
-            raise RuntimeError(body["error"])
         return body.get("data")
 
     def _resumable_capabilities(self) -> dict[str, Any] | None:

@@ -1311,12 +1311,15 @@ def purge_runs(
         raise TrackioAPIError("run_ids must be a non-empty list of exact provider ids")
     if not isinstance(plan_digest, str) or not plan_digest.startswith("sha256:"):
         raise TrackioAPIError("plan_digest must be a sha256 digest")
-    return _purge_runs(
-        Storage,
-        _validate_project_name(project),
-        selected,
-        plan_digest=plan_digest,
-    )
+    try:
+        return _purge_runs(
+            Storage,
+            _validate_project_name(project),
+            selected,
+            plan_digest=plan_digest,
+        )
+    except ValueError as error:
+        raise TrackioAPIError(str(error)) from error
 
 
 def get_project_delete_plan(request: Request, project: str) -> dict[str, Any]:
@@ -1333,7 +1336,10 @@ def delete_project(request: Request, project: str, plan_digest: str | None = Non
     normalized = _validate_project_name(project)
     if plan_digest is None:
         return Storage.delete_project(normalized)
-    return _delete_project(Storage, normalized, plan_digest=plan_digest)
+    try:
+        return _delete_project(Storage, normalized, plan_digest=plan_digest)
+    except ValueError as error:
+        raise TrackioAPIError(str(error)) from error
 
 
 def rename_run(
