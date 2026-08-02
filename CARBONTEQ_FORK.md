@@ -10,7 +10,7 @@ integrations.
 
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current fork release
-is `0.31.5.post6`, derived from upstream Trackio `0.31.5`.
+is `0.31.5.post7`, derived from upstream Trackio `0.31.5`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -107,6 +107,7 @@ added later without changing the Trackio SDK contract.
 | `0.31.5.post4` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post5` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post6` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
+| `0.31.5.post7` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 
 `0.31.5.post4` adds project-scoped bulk read APIs so a client can describe every
 run without one configuration request and one history request per run:
@@ -128,7 +129,7 @@ server-owned storage. It is deliberately not a lineage cascade: a caller that
 wants to remove jobs and their downstream consumers must construct and confirm
 that closure in its job orchestration layer.
 
-The next unreleased fork change adds exact run purge endpoints. A caller first
+`0.31.5.post7` adds exact run purge endpoints. A caller first
 previews a list of provider run ids; Trackio reports artifact consumers and
 blocks the preview when an unselected run would retain a dependency. Apply is
 bound to the preview's SHA-256 digest, deletes run rows and unreferenced
