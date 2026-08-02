@@ -32,6 +32,9 @@ from trackio.asgi_app import (
 )
 from trackio.exceptions import TrackioAPIError
 from trackio.media import get_project_media_path
+from trackio.purge import delete_project as _delete_project
+from trackio.purge import project_delete_plan, run_purge_summary
+from trackio.purge import purge_runs as _purge_runs
 from trackio.storage import (
     Storage,
     StorageOperationalError,
@@ -1276,18 +1279,61 @@ def delete_run(
     return Storage.delete_run(project, run, run_id=run_id)
 
 
+def get_run_purge_plan(
+    request: Request,
+    project: str,
+    run_ids: list[str] | tuple[str, ...],
+) -> dict[str, Any]:
+    """Preview deletion of an exact set of provider run ids."""
+
+    assert_can_mutate_runs(request)
+    if isinstance(run_ids, str) or not isinstance(run_ids, (list, tuple)):
+        raise TrackioAPIError("run_ids must be a non-empty list of exact provider ids")
+    selected = tuple(str(run_id) for run_id in run_ids)
+    if not selected or any(not run_id for run_id in selected):
+        raise TrackioAPIError("run_ids must be a non-empty list of exact provider ids")
+    return run_purge_summary(Storage, _validate_project_name(project), selected)
+
+
+def purge_runs(
+    request: Request,
+    project: str,
+    run_ids: list[str] | tuple[str, ...],
+    plan_digest: str,
+) -> dict[str, Any]:
+    """Apply an exact run purge bound to its authenticated preview digest."""
+
+    assert_can_mutate_runs(request)
+    if isinstance(run_ids, str) or not isinstance(run_ids, (list, tuple)):
+        raise TrackioAPIError("run_ids must be a non-empty list of exact provider ids")
+    selected = tuple(str(run_id) for run_id in run_ids)
+    if not selected or any(not run_id for run_id in selected):
+        raise TrackioAPIError("run_ids must be a non-empty list of exact provider ids")
+    if not isinstance(plan_digest, str) or not plan_digest.startswith("sha256:"):
+        raise TrackioAPIError("plan_digest must be a sha256 digest")
+    return _purge_runs(
+        Storage,
+        _validate_project_name(project),
+        selected,
+        plan_digest=plan_digest,
+    )
+
+
 def get_project_delete_plan(request: Request, project: str) -> dict[str, Any]:
     """Return the complete project-scoped deletion set without mutating it."""
 
     assert_can_mutate_runs(request)
-    return Storage.project_delete_summary(_validate_project_name(project))
+    return project_delete_plan(Storage, _validate_project_name(project))
 
 
-def delete_project(request: Request, project: str) -> dict[str, Any]:
+def delete_project(request: Request, project: str, plan_digest: str | None = None) -> dict[str, Any]:
     """Permanently delete one isolated project's runs, artifacts, and bytes."""
 
     assert_can_mutate_runs(request)
-    return Storage.delete_project(_validate_project_name(project))
+    normalized = _validate_project_name(project)
+    if plan_digest is None:
+        return Storage.delete_project(normalized)
+    return _delete_project(Storage, normalized, plan_digest=plan_digest)
 
 
 def rename_run(
@@ -1362,6 +1408,8 @@ def _api_registry() -> dict[str, Any]:
         "get_project_files": get_project_files,
         "get_tab_availability": get_tab_availability,
         "delete_run": delete_run,
+        "get_run_purge_plan": get_run_purge_plan,
+        "purge_runs": purge_runs,
         "get_project_delete_plan": get_project_delete_plan,
         "delete_project": delete_project,
         "rename_run": rename_run,

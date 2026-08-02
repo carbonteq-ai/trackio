@@ -128,6 +128,17 @@ server-owned storage. It is deliberately not a lineage cascade: a caller that
 wants to remove jobs and their downstream consumers must construct and confirm
 that closure in its job orchestration layer.
 
+The next unreleased fork change adds exact run purge endpoints. A caller first
+previews a list of provider run ids; Trackio reports artifact consumers and
+blocks the preview when an unselected run would retain a dependency. Apply is
+bound to the preview's SHA-256 digest, deletes run rows and unreferenced
+artifact versions, and removes only CAS blobs no longer present in a retained
+manifest. The API is intentionally provider-scoped: the framework remains
+responsible for cross-plane dependency closure and the user-facing dry-run
+plan. The same digest binding now covers the existing project-boundary delete
+endpoint, so project apply cannot race a changed inventory while retaining
+backward compatibility for older callers that only inspect the post6 summary.
+
 Every CarbonTeq release must add a row before it is tagged. Platform consumers
 should prefer the published `carbonteq-trackio` distribution once it is on the
 configured index; until then they may pin an immutable CarbonTeq commit.
