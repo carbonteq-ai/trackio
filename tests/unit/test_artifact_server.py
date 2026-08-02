@@ -3,8 +3,16 @@
 import hashlib
 import sqlite3
 
+import pytest
+
 from trackio import database as trackio_database
 from trackio import server
+from trackio.purge import (
+    delete_project,
+    project_delete_plan,
+    purge_runs,
+    run_purge_summary,
+)
 from trackio.sqlite_storage import SQLiteStorage
 
 
@@ -206,6 +214,58 @@ def test_project_deletion_preview_and_apply_remove_project_scoped_artifacts(
     assert not SQLiteStorage.get_project_db_path("purge-me").exists()
     assert not blob.exists()
     assert SQLiteStorage.project_delete_summary("purge-me")["exists"] is False
+
+
+def test_project_delete_plan_digest_rejects_stale_apply(temp_dir):
+    _commit(project="digest-project")
+    preview = project_delete_plan(SQLiteStorage, "digest-project")
+    assert preview["digest"].startswith("sha256:")
+    with pytest.raises(ValueError, match="stale"):
+        delete_project(SQLiteStorage, "digest-project", plan_digest="sha256:" + "0" * 64)
+    assert SQLiteStorage.project_delete_summary("digest-project")["exists"] is True
+    deleted = delete_project(SQLiteStorage, "digest-project", plan_digest=preview["digest"])
+    assert deleted["plan_digest"] == preview["digest"]
+
+
+def test_run_purge_requires_dependency_closure_and_removes_cas(
+    temp_dir, stage_blob
+):
+    payload = b"run-owned-weights"
+    digest, blob = stage_blob("run-purge", payload)
+    artifact = _commit(
+        project="run-purge",
+        files=[{"path": "weights.bin", "digest": digest, "size": len(payload)}],
+        run_name="producer",
+        run_id="producer-id",
+    )
+    _commit(
+        project="run-purge",
+        name="consumer-model",
+        payload=b"consumer",
+        run_name="consumer",
+        run_id="consumer-id",
+    )
+    SQLiteStorage.insert_run_artifact_link(
+        "run-purge", "consumer", "consumer-id", artifact["version_id"], "input"
+    )
+
+    blocked = run_purge_summary(SQLiteStorage, "run-purge", ("producer-id",))
+    assert blocked["blockers"]
+
+    preview = run_purge_summary(
+        SQLiteStorage, "run-purge", ("producer-id", "consumer-id")
+    )
+    assert preview["blockers"] == []
+    receipt = purge_runs(
+        SQLiteStorage,
+        "run-purge",
+        ("producer-id", "consumer-id"),
+        plan_digest=preview["digest"],
+    )
+
+    assert receipt["deleted_provider_run_ids"] == ["producer-id", "consumer-id"]
+    assert SQLiteStorage.get_run_records("run-purge") == []
+    assert not blob.exists()
 
 
 def test_legacy_metrics_db_resolves_artifact_links_by_name(temp_dir):

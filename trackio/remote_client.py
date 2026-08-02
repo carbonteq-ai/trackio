@@ -406,10 +406,45 @@ class RemoteClient:
             raise RuntimeError("Trackio project delete plan must be an object")
         return result
 
-    def delete_project(self, project: str) -> dict[str, Any]:
+    def delete_project(self, project: str, plan_digest: str | None = None) -> dict[str, Any]:
         """Permanently delete an isolated project after the caller confirms its plan."""
 
-        result = self.predict(project=project, api_name="/delete_project")
+        payload: dict[str, Any] = {"project": project}
+        if plan_digest is not None:
+            payload["plan_digest"] = plan_digest
+        result = self.predict(api_name="/delete_project", **payload)
         if not isinstance(result, dict):
             raise RuntimeError("Trackio project deletion result must be an object")
+        return result
+
+    def run_purge_plan(
+        self, project: str, provider_run_ids: list[str] | tuple[str, ...]
+    ) -> dict[str, Any]:
+        """Preview deletion of exact provider run ids."""
+
+        result = self.predict(
+            project=project,
+            run_ids=list(provider_run_ids),
+            api_name="/get_run_purge_plan",
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("Trackio run purge plan must be an object")
+        return result
+
+    def purge_runs(
+        self,
+        project: str,
+        provider_run_ids: list[str] | tuple[str, ...],
+        plan_digest: str,
+    ) -> dict[str, Any]:
+        """Apply a run purge bound to a previously previewed digest."""
+
+        result = self.predict(
+            project=project,
+            run_ids=list(provider_run_ids),
+            plan_digest=plan_digest,
+            api_name="/purge_runs",
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("Trackio run purge result must be an object")
         return result
