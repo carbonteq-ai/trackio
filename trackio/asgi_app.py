@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import inspect
 import json
 import logging
 import math
+import os
 import secrets
 import tempfile
 import threading
@@ -34,6 +36,15 @@ from trackio.resumable_uploads import (
 )
 
 logger = logging.getLogger("trackio.asgi_app")
+
+try:
+    _API_WORKERS = int(os.environ.get("TRACKIO_API_WORKERS", "64"))
+except ValueError:
+    _API_WORKERS = 64
+_API_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=max(1, min(_API_WORKERS, 256)),
+    thread_name_prefix="trackio-api",
+)
 
 
 def _normalize_allowed_file_roots(
@@ -326,7 +337,20 @@ async def run_api_request(request: Request, api_name: str) -> Response:
     _maybe_apply_hf_token_from_authorization(request, fn, args, kwargs)
 
     try:
-        result = _invoke_handler(fn, request, args=args, kwargs=kwargs)
+        if inspect.iscoroutinefunction(fn):
+            result = await _invoke_handler(fn, request, args=args, kwargs=kwargs)
+        else:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                _API_EXECUTOR,
+                _invoke_handler,
+                fn,
+                request,
+                args,
+                kwargs,
+            )
+        if inspect.isawaitable(result):
+            result = await result
         return JSONResponse({"data": _json_safe(result)})
     except TrackioAPIError as e:
         return JSONResponse({"error": str(e)}, status_code=400)

@@ -1,4 +1,5 @@
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import trackio
 from trackio import Run, fragments, utils
@@ -107,6 +108,28 @@ def test_write_local_and_import_inbox_dir(temp_dir):
     assert not fragment_path.exists()
     assert len(SQLiteStorage.get_logs("proj", "run1")) == 3
     assert fragments.import_inbox_dir() == 0
+
+
+def test_import_inbox_dir_claims_fragments_for_concurrent_workers(temp_dir):
+    writer = fragments.FragmentWriter()
+    for index in range(8):
+        entries = make_metric_entries(project="parallel", run=f"run-{index}")
+        writer.write_local([fragments.metric_record(entry) for entry in entries])
+
+    def import_one() -> int:
+        total = 0
+        while True:
+            count = fragments.import_inbox_dir(max_files=1)
+            if not count:
+                return total
+            total += count
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        imported = sum(executor.map(lambda _: import_one(), range(4)))
+
+    assert imported == 24
+    assert not list(fragments.local_inbox_dir().rglob("*.jsonl"))
+    assert not list(fragments.local_inbox_dir().rglob("*.processing"))
 
 
 def test_local_run_jsonl_mode_writes_fragments(temp_dir, monkeypatch):

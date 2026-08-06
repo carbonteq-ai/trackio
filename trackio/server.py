@@ -23,6 +23,7 @@ from starlette.responses import RedirectResponse
 from starlette.routing import Route
 
 import trackio.cas as cas
+import trackio.fragments as fragments
 import trackio.references as references
 import trackio.utils as utils
 from trackio.asgi_app import (
@@ -39,6 +40,7 @@ from trackio.storage import (
     Storage,
     StorageOperationalError,
     is_retryable_storage_error,
+    selected_engine,
 )
 from trackio.typehints import (
     AlertEntry,
@@ -76,16 +78,112 @@ _MAX_RETRIES = 30
 
 _LOGS_BATCH_MAX_RUNS = 64
 _LOGS_BATCH_MAX_POINTS = 10_000
+_server_fragment_writer = fragments.FragmentWriter()
+
+
+def _use_async_doris_writes() -> bool:
+    """Use the durable inbox for the synchronous Doris write path."""
+
+    value = os.environ.get("TRACKIO_ASYNC_DORIS_WRITES", "true").strip().lower()
+    return selected_engine() == "doris" and value not in {"0", "false", "no", "off"}
+
+
+def _enqueue_metric_fragment(
+    *,
+    project: str,
+    run: str,
+    run_id: str | None,
+    metrics_list: list[dict],
+    steps: list[int | None],
+    config: dict | None,
+    log_ids: list[str | None] | None,
+) -> None:
+    records = []
+    for index, metrics in enumerate(metrics_list):
+        records.append(
+            fragments.metric_record(
+                {
+                    "project": project,
+                    "run": run,
+                    "run_id": run_id,
+                    "metrics": metrics,
+                    "step": steps[index],
+                    "config": config if index == 0 else None,
+                    "log_id": log_ids[index] if log_ids else None,
+                }
+            )
+        )
+    _server_fragment_writer.write_local(records)
+
+
+def _enqueue_system_fragment(
+    *,
+    project: str,
+    run: str,
+    run_id: str | None,
+    metrics_list: list[dict],
+    timestamps: list[str | None],
+    log_ids: list[str | None] | None,
+) -> None:
+    records = []
+    for index, metrics in enumerate(metrics_list):
+        records.append(
+            fragments.system_metric_record(
+                {
+                    "project": project,
+                    "run": run,
+                    "run_id": run_id,
+                    "metrics": metrics,
+                    "timestamp": timestamps[index],
+                    "log_id": log_ids[index] if log_ids else None,
+                }
+            )
+        )
+    _server_fragment_writer.write_local(records)
+
+
+def _enqueue_alert_fragment(
+    *,
+    project: str,
+    run: str,
+    run_id: str | None,
+    titles: list[str],
+    texts: list[str | None],
+    levels: list[str],
+    steps: list[int | None],
+    timestamps: list[str | None],
+    alert_ids: list[str | None] | None,
+) -> None:
+    records = []
+    for index, title in enumerate(titles):
+        records.append(
+            fragments.alert_record(
+                {
+                    "project": project,
+                    "run": run,
+                    "run_id": run_id,
+                    "title": title,
+                    "text": texts[index],
+                    "level": levels[index],
+                    "step": steps[index],
+                    "timestamp": timestamps[index],
+                    "alert_id": alert_ids[index] if alert_ids else None,
+                }
+            )
+        )
+    _server_fragment_writer.write_local(records)
+
 
 _inbox_poller_thread: threading.Thread | None = None
 _inbox_poller_lock = threading.Lock()
+_inbox_poller_threads: list[threading.Thread] = []
 
 
-def import_inbox_once() -> int:
-    from trackio import fragments  # noqa: PLC0415
-
-    imported = fragments.import_inbox_dir()
-    bucket_id = os.environ.get("TRACKIO_BUCKET_ID")
+def import_inbox_once(
+    *, max_files: int | None = None, include_bucket: bool = True
+) -> int:
+    imported = fragments.import_inbox_dir(max_files=max_files)
+    bucket_id = os.environ.get("TRACKIO_BUCKET_ID") if include_bucket else None
     if bucket_id:
         imported += fragments.import_inbox_from_bucket(bucket_id)
     return imported
@@ -94,7 +192,7 @@ def import_inbox_once() -> int:
 def _inbox_poll_loop() -> None:
     while True:
         try:
-            imported = import_inbox_once()
+            imported = import_inbox_once(max_files=1, include_bucket=False)
             if imported:
                 logger.info("imported %d records from inbox fragments", imported)
         except Exception as e:
@@ -104,18 +202,29 @@ def _inbox_poll_loop() -> None:
 
 
 def start_inbox_poller() -> None:
-    global _inbox_poller_thread
+    global _inbox_poller_thread, _inbox_poller_threads
     try:
-        from trackio import fragments  # noqa: PLC0415
-
         fragments.import_inbox_dir()
     except Exception as e:
         logger.warning("inbox fragment import at startup failed: %s", e)
     with _inbox_poller_lock:
-        if _inbox_poller_thread is not None and _inbox_poller_thread.is_alive():
+        if any(thread.is_alive() for thread in _inbox_poller_threads):
             return
-        _inbox_poller_thread = threading.Thread(target=_inbox_poll_loop, daemon=True)
-        _inbox_poller_thread.start()
+        default_workers = "8" if selected_engine() == "doris" else "1"
+        try:
+            worker_count = int(
+                os.environ.get("TRACKIO_WRITE_WORKERS", default_workers)
+            )
+        except ValueError:
+            worker_count = int(default_workers)
+        worker_count = max(1, min(worker_count, 64))
+        _inbox_poller_threads = [
+            threading.Thread(target=_inbox_poll_loop, daemon=True)
+            for _ in range(worker_count)
+        ]
+        _inbox_poller_thread = _inbox_poller_threads[0]
+        for thread in _inbox_poller_threads:
+            thread.start()
 
 
 def _normalize_logs_batch_runs(runs: Any) -> list[dict[str, Any]]:
@@ -802,6 +911,17 @@ def log(
     run_id: str | None = None,
 ) -> None:
     assert_can_write_metrics(request, hf_token)
+    if _use_async_doris_writes():
+        _enqueue_metric_fragment(
+            project=project,
+            run=run,
+            run_id=run_id,
+            metrics_list=[metrics],
+            steps=[step],
+            config=None,
+            log_ids=None,
+        )
+        return
     Storage.log(project=project, run=run, run_id=run_id, metrics=metrics, step=step)
 
 
@@ -839,6 +959,9 @@ def bulk_log(
             config=data["config"],
             log_ids=data["log_ids"] if has_log_ids else None,
         )
+        if _use_async_doris_writes():
+            _enqueue_metric_fragment(**payload)
+            continue
         try:
             Storage.bulk_log(**payload)
         except StorageOperationalError as error:
@@ -873,6 +996,9 @@ def bulk_log_system(
             timestamps=data["timestamps"],
             log_ids=data["log_ids"] if has_log_ids else None,
         )
+        if _use_async_doris_writes():
+            _enqueue_system_fragment(**payload)
+            continue
         try:
             Storage.bulk_log_system(**payload)
         except StorageOperationalError as error:
@@ -920,6 +1046,9 @@ def bulk_alert(
             timestamps=data["timestamps"],
             alert_ids=data["alert_ids"] if has_alert_ids else None,
         )
+        if _use_async_doris_writes():
+            _enqueue_alert_fragment(**payload)
+            continue
         try:
             Storage.bulk_alert(**payload)
         except StorageOperationalError as error:

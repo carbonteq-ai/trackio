@@ -243,29 +243,65 @@ def import_records(records: list[dict]) -> int:
     return imported
 
 
-def import_inbox_dir(inbox_dir: Path | None = None) -> int:
+def _recover_processing_fragments(inbox: Path) -> None:
+    """Return fragments left in the processing state after a server restart."""
+
+    for processing_path in inbox.rglob("*.jsonl.processing"):
+        target = processing_path.with_suffix("")
+        try:
+            if target.exists():
+                processing_path.unlink()
+            else:
+                processing_path.replace(target)
+        except OSError:
+            continue
+
+
+def import_inbox_dir(
+    inbox_dir: Path | None = None,
+    *,
+    max_files: int | None = None,
+) -> int:
     inbox = inbox_dir or local_inbox_dir()
     if not inbox.exists():
         return 0
+    if max_files is None:
+        _recover_processing_fragments(inbox)
     imported = 0
-    for fragment_path in sorted(inbox.rglob("*.jsonl")):
+    fragment_paths = sorted(inbox.rglob("*.jsonl"))
+    if max_files is not None:
+        fragment_paths = fragment_paths[: max(0, max_files)]
+    for fragment_path in fragment_paths:
+        processing_path = fragment_path.with_suffix(
+            f"{fragment_path.suffix}.processing"
+        )
         try:
-            data = fragment_path.read_bytes()
-        except OSError:
+            # Claim the fragment atomically so multiple importer workers can
+            # safely share one inbox without double-processing it.
+            fragment_path.replace(processing_path)
+        except FileNotFoundError:
             continue
-        records = parse_fragment_bytes(data)
-        if records:
-            imported += import_records(records)
         try:
-            fragment_path.unlink()
-        except OSError:
-            pass
-    for writer_dir in inbox.glob("*"):
-        if writer_dir.is_dir():
+            data = processing_path.read_bytes()
+            records = parse_fragment_bytes(data)
+            if records:
+                imported += import_records(records)
+            processing_path.unlink()
+        except Exception:
+            # Preserve the record for a later retry. A crash between the
+            # atomic claim and this rename is recovered on the next startup.
             try:
-                writer_dir.rmdir()
+                processing_path.replace(fragment_path)
             except OSError:
                 pass
+            raise
+    if max_files is None:
+        for writer_dir in inbox.glob("*"):
+            if writer_dir.is_dir():
+                try:
+                    writer_dir.rmdir()
+                except OSError:
+                    pass
     return imported
 
 
