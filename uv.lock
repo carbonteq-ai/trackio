@@ -146,7 +146,7 @@ wheels = [
 
 [[package]]
 name = "carbonteq-trackio"
-version = "0.31.5.post9"
+version = "0.31.5.post10"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
