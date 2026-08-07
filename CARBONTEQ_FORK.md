@@ -48,12 +48,19 @@ Svelte, Vite, and Vitest releases and both full and production-only audits must
 remain at zero.
 
 The self-hosted artifact API supports bounded, resumable uploads for model-sized
-blobs. The client negotiates an 8 MiB chunk size, acknowledges chunks
-idempotently, resumes a deterministic upload session after a client or server
-restart, verifies every chunk and the complete SHA-256, and commits an artifact
-version only after every manifest blob is durable. Servers without this
-capability retain the legacy path for files up to 32 MiB; the client refuses
-larger legacy uploads instead of buffering them in server memory.
+blobs. When `TRACKIO_ARTIFACT_STORAGE_BACKEND=s3`, the client negotiates a
+multipart session and uploads each part directly to short-lived presigned URLs
+for the configured S3-compatible endpoint; Trackio receives only part ETags,
+completes the provider upload, streams the finished object once to verify its
+size and SHA-256, and commits an artifact version only after that verification.
+The configured endpoint must be reachable by the producing client (it may be
+AWS S3, RustFS, MinIO, or another S3-compatible service). Deployments where
+the server uses a private provider address can set
+`TRACKIO_ARTIFACT_S3_PRESIGN_ENDPOINT` to the worker-reachable address used
+only for signed URLs. With the default
+`local` backend, or against an older server, the client uses the bounded
+server-side compatibility path; legacy whole-file uploads remain capped at
+32 MiB instead of buffering larger files in server memory.
 
 Incomplete upload sessions are project-scoped staging state. Cleanup reports
 reclaimable bytes in dry-run mode and expires only incomplete, aged sessions.
@@ -84,6 +91,15 @@ source-diff and wheel-digest receipt until the corrected Trackio/Observatory
 services are rebuilt and promoted. Operate one Trackio server replica until
 artifact-version allocation is made safe across replicas.
 
+The unreleased inbox-throughput repair keeps `TRACKIO_ASYNC_DORIS_WRITES` as a
+durable-fragment mode, not an asyncio writer. HTTP requests append JSONL
+fragments; a single scanner claims bounded batches and a bounded thread pool
+groups synchronous Doris writes. Scalar metric/event fragments have a dedicated
+lane ahead of large rollout-trace fragments, and server startup no longer waits
+for an unbounded inbox replay. The native Verifiers trace artifact remains the
+complete replay authority. This repair is not deployed or consumable until its
+tests, immutable commit, wheel, and real-Doris backlog replay pass.
+
 Raw project SQL remains deliberately unavailable with Doris because its tables
 are shared across projects rather than stored in one project-local database.
 The first release remains single-server: the process lock and idempotent
@@ -93,7 +109,10 @@ and schema-level coordination before additional Trackio writers are allowed.
 
 Turso stores run, metric, trace, artifact-manifest, and lineage metadata. It is
 not the object store: media, model bytes, and native evaluation bundles remain
-under Trackio's existing artifact/file storage boundary. A hosted Hugging Face
+under Trackio's artifact storage boundary. The server may use the local CAS or
+any S3-compatible backend. With the S3 backend, clients receive short-lived
+presigned multipart URLs and upload bytes directly; Trackio verifies the
+completed object's SHA-256 before committing metadata. A hosted Hugging Face
 Space is optional and is not required for local operation. Remote sync can be
 added later without changing the Trackio SDK contract.
 

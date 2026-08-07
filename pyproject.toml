@@ -28,6 +28,7 @@ dependencies = [
     "brotli>=1.0.0,<2.0.0",
     "pyturso>=0.7.0,<1.0.0",
     "pymysql>=1.1.0,<2.0.0",
+    "boto3>=1.35.0,<2.0.0",
     "tomli>=2.0.0; python_version < '3.11'",
 ]
 classifiers = [

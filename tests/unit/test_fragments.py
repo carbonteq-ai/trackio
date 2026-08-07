@@ -132,6 +132,52 @@ def test_import_inbox_dir_claims_fragments_for_concurrent_workers(temp_dir):
     assert not list(fragments.local_inbox_dir().rglob("*.processing"))
 
 
+def test_claimed_batch_prioritizes_scalar_records_over_trace_records(temp_dir, monkeypatch):
+    writer = fragments.FragmentWriter()
+    writer.write_local(
+        [
+            fragments.metric_record(
+                {
+                    "project": "priority",
+                    "run": "run",
+                    "run_id": "rid",
+                    "metrics": {"traces/verifiers": {"payload": "large"}},
+                    "step": 0,
+                }
+            )
+        ]
+    )
+    writer.write_local(
+        [
+            fragments.metric_record(
+                {
+                    "project": "priority",
+                    "run": "run",
+                    "run_id": "rid",
+                    "metrics": {"train/rl/reward_mean": 0.25},
+                    "step": 1,
+                }
+            )
+        ]
+    )
+
+    imported_batches = []
+
+    def capture(records):
+        imported_batches.append(records)
+        return len(records)
+
+    monkeypatch.setattr(fragments, "import_records", capture)
+    claimed = fragments.claim_inbox_batch(max_files=2)
+    assert len(claimed) == 2
+    assert fragments.import_claimed_fragments(claimed) == 2
+    assert imported_batches[0][0]["metrics"] == {"train/rl/reward_mean": 0.25}
+    assert imported_batches[1][0]["metrics"] == {
+        "traces/verifiers": {"payload": "large"}
+    }
+    assert not list(fragments.local_inbox_dir().rglob("*.processing"))
+
+
 def test_local_run_jsonl_mode_writes_fragments(temp_dir, monkeypatch):
     monkeypatch.setenv("TRACKIO_STORAGE_MODE", "jsonl")
     run = Run(url=None, project="proj", client=None, name="run1", space_id=None)

@@ -22,6 +22,27 @@ from starlette.routing import Route
 
 from trackio import utils
 from trackio._version import __version__
+from trackio.artifact_storage import (
+    ArtifactNotFoundError,
+    ArtifactStoreError,
+    get_artifact_store,
+    selected_artifact_backend,
+)
+from trackio.direct_uploads import (
+    abort_session as abort_direct_session,
+)
+from trackio.direct_uploads import (
+    acknowledge_part as acknowledge_direct_part,
+)
+from trackio.direct_uploads import (
+    complete_session as complete_direct_session,
+)
+from trackio.direct_uploads import (
+    create_or_resume_session as create_direct_session,
+)
+from trackio.direct_uploads import (
+    get_session as get_direct_session,
+)
 from trackio.exceptions import TrackioAPIError
 from trackio.remote_client import HTTP_API_VERSION
 from trackio.resumable_uploads import (
@@ -458,6 +479,8 @@ def _upload_error(error: Exception) -> JSONResponse:
         return JSONResponse({"error": str(error)}, status_code=409)
     if isinstance(error, (TypeError, ValueError, KeyError)):
         return JSONResponse({"error": str(error)}, status_code=400)
+    if isinstance(error, ArtifactStoreError):
+        return JSONResponse({"error": str(error)}, status_code=502)
     logger.exception("Artifact upload request failed")
     return JSONResponse({"error": "Artifact upload failed."}, status_code=500)
 
@@ -471,13 +494,98 @@ def _resumable_session_lock(request: Request, upload_id: str) -> asyncio.Lock:
 
 
 async def artifact_upload_capabilities_handler(request: Request) -> Response:
-    return JSONResponse(
-        {
-            "resumable": True,
-            "compatibility_max_bytes": COMPATIBILITY_MAX_BYTES,
-            "chunk_size_bytes": DEFAULT_CHUNK_SIZE,
-        }
-    )
+    capabilities = {
+        "resumable": True,
+        "compatibility_max_bytes": COMPATIBILITY_MAX_BYTES,
+        "chunk_size_bytes": DEFAULT_CHUNK_SIZE,
+    }
+    if selected_artifact_backend() == "s3":
+        capabilities.update(
+            {
+                "direct_multipart": True,
+                "direct_init_path": "/api/artifact-upload/direct/{project}",
+                "direct_completion": "server-verifies-sha256",
+            }
+        )
+    return JSONResponse(capabilities)
+
+
+async def artifact_direct_upload_init_handler(request: Request) -> Response:
+    if unauthorized := _authorize_artifact_upload(request):
+        return unauthorized
+    try:
+        payload = await request.json()
+        with request.app.state.resumable_upload_lock:
+            session = create_direct_session(
+                project=request.path_params["project"],
+                digest=payload["digest"],
+                size_bytes=payload["size_bytes"],
+                idempotency_key=payload["idempotency_key"],
+            )
+        return JSONResponse(session)
+    except Exception as error:
+        return _upload_error(error)
+
+
+async def artifact_direct_upload_status_handler(request: Request) -> Response:
+    if unauthorized := _authorize_artifact_upload(request):
+        return unauthorized
+    try:
+        async with _resumable_session_lock(request, request.path_params["upload_id"]):
+            session = get_direct_session(
+                request.path_params["project"], request.path_params["upload_id"]
+            )
+        return JSONResponse(session)
+    except Exception as error:
+        return _upload_error(error)
+
+
+async def artifact_direct_upload_part_ack_handler(request: Request) -> Response:
+    if unauthorized := _authorize_artifact_upload(request):
+        return unauthorized
+    try:
+        payload = await request.json()
+        part_number = int(request.path_params["part_number"])
+        etag = payload.get("etag") if isinstance(payload, dict) else None
+        async with _resumable_session_lock(request, request.path_params["upload_id"]):
+            result = acknowledge_direct_part(
+                request.path_params["project"],
+                request.path_params["upload_id"],
+                part_number,
+                str(etag or ""),
+            )
+        return JSONResponse(result)
+    except Exception as error:
+        return _upload_error(error)
+
+
+async def artifact_direct_upload_complete_handler(request: Request) -> Response:
+    if unauthorized := _authorize_artifact_upload(request):
+        return unauthorized
+    try:
+        payload = await request.json()
+        async with _resumable_session_lock(request, request.path_params["upload_id"]):
+            result = complete_direct_session(
+                request.path_params["project"],
+                request.path_params["upload_id"],
+                payload.get("parts", []) if isinstance(payload, dict) else [],
+            )
+        return JSONResponse(result)
+    except Exception as error:
+        return _upload_error(error)
+
+
+async def artifact_direct_upload_abort_handler(request: Request) -> Response:
+    if unauthorized := _authorize_artifact_upload(request):
+        return unauthorized
+    try:
+        async with _resumable_session_lock(request, request.path_params["upload_id"]):
+            result = abort_direct_session(
+                request.path_params["project"], request.path_params["upload_id"]
+            )
+        return JSONResponse({"aborted": result})
+    except Exception as error:
+        return _upload_error(error)
 
 
 async def artifact_upload_init_handler(request: Request) -> Response:
@@ -595,7 +703,6 @@ async def file_handler(request: Request) -> Response:
 
 
 async def artifact_blob_handler(request: Request) -> Response:
-    from trackio import cas  # noqa: PLC0415
     from trackio import server as _server  # noqa: PLC0415
 
     project = request.path_params.get("project")
@@ -605,10 +712,43 @@ async def artifact_blob_handler(request: Request) -> Response:
         digest = _server._validate_sha256_digest(digest)
     except TrackioAPIError:
         return Response("Not found", status_code=404)
-    blob = cas.blob_path(project, digest)
-    if not blob.is_file():
+    store = get_artifact_store()
+    try:
+        stream = store.open(project, digest)
+    except ArtifactNotFoundError:
         return Response("Not found", status_code=404)
-    return FileResponse(str(blob))
+
+    def body():
+        try:
+            while chunk := stream.read(1024 * 1024):
+                yield chunk
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+
+    return StreamingResponse(body(), media_type="application/octet-stream")
+
+
+async def artifact_blob_url_handler(request: Request) -> Response:
+    from trackio import server as _server  # noqa: PLC0415
+
+    project = request.path_params.get("project")
+    digest = request.path_params.get("digest")
+    try:
+        project = _server._validate_project_name(project)
+        digest = _server._validate_sha256_digest(digest)
+        store = get_artifact_store()
+        if not store.has(project, digest):
+            return Response("Not found", status_code=404)
+        url = store.presign_get(project, digest)
+        if url is None:
+            return JSONResponse({"url": None, "direct": False})
+        return JSONResponse({"url": url, "direct": True, "expires_in": getattr(store, "presign_seconds", None)})
+    except (TrackioAPIError, ArtifactNotFoundError):
+        return Response("Not found", status_code=404)
+    except ArtifactStoreError as error:
+        return JSONResponse({"error": str(error)}, status_code=502)
 
 
 def create_trackio_starlette_app(
@@ -629,6 +769,31 @@ def create_trackio_starlette_app(
                 "/api/artifact-upload/capabilities",
                 endpoint=artifact_upload_capabilities_handler,
                 methods=["GET"],
+            ),
+            Route(
+                "/api/artifact-upload/direct/{project:str}",
+                endpoint=artifact_direct_upload_init_handler,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/artifact-upload/direct/{project:str}/{upload_id:str}",
+                endpoint=artifact_direct_upload_status_handler,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/artifact-upload/direct/{project:str}/{upload_id:str}/parts/{part_number:int}",
+                endpoint=artifact_direct_upload_part_ack_handler,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/artifact-upload/direct/{project:str}/{upload_id:str}",
+                endpoint=artifact_direct_upload_complete_handler,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/artifact-upload/direct/{project:str}/{upload_id:str}",
+                endpoint=artifact_direct_upload_abort_handler,
+                methods=["DELETE"],
             ),
             Route(
                 "/api/artifact-upload/{project:str}",
@@ -660,6 +825,11 @@ def create_trackio_starlette_app(
             Route(
                 "/artifact_blob/{project:str}/{digest:str}",
                 endpoint=artifact_blob_handler,
+                methods=["GET"],
+            ),
+            Route(
+                "/artifact_blob_url/{project:str}/{digest:str}",
+                endpoint=artifact_blob_url_handler,
                 methods=["GET"],
             ),
         ]

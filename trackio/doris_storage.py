@@ -17,6 +17,7 @@ from pymysql.cursors import DictCursor
 
 import trackio.cas as cas
 import trackio.references as references
+from trackio.artifact_storage import get_artifact_store
 from trackio.doris_schema import (
     MANAGED_TABLES,
     SCHEMA_VERSION,
@@ -992,7 +993,7 @@ class DorisStorage:
             "artifacts": 0,
             "artifact_versions": 0,
             "artifact_logical_bytes": 0,
-            "artifact_storage_bytes": _directory_bytes(project_artifacts_dir(project)),
+            "artifact_storage_bytes": get_artifact_store().bytes_for_project(project),
             "media_storage_bytes": _directory_bytes(project_media_dir(project)),
         }
         run_ids: set[str] = set()
@@ -1054,7 +1055,14 @@ class DorisStorage:
         """Delete all Doris rows and local project-scoped artifact/media bytes."""
 
         summary = cls.project_delete_summary(project)
+        artifact_digests: set[str] = set()
         with cls._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT manifest FROM artifact_versions WHERE project_id = %s",
+                (project,),
+            )
+            for row in cursor.fetchall():
+                artifact_digests.update(manifest_blob_digests(_decode(row["manifest"])))
             for table in (
                 "run_artifact_links",
                 "artifact_aliases",
@@ -1068,6 +1076,8 @@ class DorisStorage:
                 "project_metadata",
             ):
                 cursor.execute(f"DELETE FROM {table} WHERE project_id = %s", (project,))
+        for digest in artifact_digests:
+            get_artifact_store().delete(project, digest)
         for directory in (project_artifacts_dir(project), project_media_dir(project)):
             if directory.exists():
                 shutil.rmtree(directory)
@@ -2287,7 +2297,7 @@ class DorisStorage:
                 retained_digests.update(manifest_blob_digests(_decode(row["manifest"])))
 
         for digest in deleted_digests - retained_digests:
-            cas.blob_path(project, digest).unlink(missing_ok=True)
+            get_artifact_store().delete(project, digest)
 
     @classmethod
     def force_sync(cls) -> bool:
@@ -2308,9 +2318,7 @@ class DorisStorage:
 
     @classmethod
     def list_artifact_blobs_present(cls, project: str, digests: list[str]) -> list[str]:
-        return [
-            digest for digest in digests if cas.blob_path(project, digest).is_file()
-        ]
+        return [digest for digest in digests if get_artifact_store().has(project, digest)]
 
     @classmethod
     def _unsupported(cls, *args: Any, **kwargs: Any) -> Any:

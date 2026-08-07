@@ -27,9 +27,11 @@ import orjson
 
 from trackio import cas, references
 from trackio import database as sqlite3
+from trackio.artifact_storage import get_artifact_store
 from trackio.commit_scheduler import CommitScheduler
 from trackio.dummy_commit_scheduler import DummyCommitScheduler
 from trackio.lifecycle import lifecycle_row
+from trackio.purge import manifest_blob_digests
 from trackio.typehints import (
     ARTIFACT_BLOB_UPLOAD_KIND,
     MEDIA_UPLOAD_KIND,
@@ -2950,7 +2952,7 @@ class SQLiteStorage:
             "artifacts": 0,
             "artifact_versions": 0,
             "artifact_logical_bytes": 0,
-            "artifact_storage_bytes": _directory_bytes(artifacts_dir),
+            "artifact_storage_bytes": get_artifact_store().bytes_for_project(project),
             "media_storage_bytes": _directory_bytes(media_dir),
         }
         if not db_path.exists():
@@ -2995,6 +2997,20 @@ class SQLiteStorage:
 
         summary = SQLiteStorage.project_delete_summary(project)
         db_path = SQLiteStorage.get_project_db_path(project)
+        artifact_digests: set[str] = set()
+        if db_path.exists():
+            try:
+                with SQLiteStorage._get_connection(db_path) as conn:
+                    rows = conn.execute("SELECT manifest FROM artifact_versions").fetchall()
+                    for row in rows:
+                        try:
+                            artifact_digests.update(
+                                manifest_blob_digests(json_mod.loads(row["manifest"]))
+                            )
+                        except (TypeError, ValueError, json_mod.JSONDecodeError):
+                            continue
+            except sqlite3.OperationalError:
+                pass
         if db_path.exists():
             with SQLiteStorage._get_process_lock(project):
                 db_path.unlink(missing_ok=True)
@@ -3002,6 +3018,8 @@ class SQLiteStorage:
                     Path(str(db_path) + suffix).unlink(missing_ok=True)
                 for parquet_path in SQLiteStorage._project_parquet_paths(db_path):
                     parquet_path.unlink(missing_ok=True)
+        for digest in artifact_digests:
+            get_artifact_store().delete(project, digest)
         for directory in (project_artifacts_dir(project), project_media_dir(project)):
             if directory.exists():
                 shutil.rmtree(directory)
@@ -3454,7 +3472,7 @@ class SQLiteStorage:
                         pass
 
         for digest in deleted_digests - retained_digests:
-            cas.blob_path(project, digest).unlink(missing_ok=True)
+            get_artifact_store().delete(project, digest)
 
     @staticmethod
     def _update_media_paths(obj, old_prefix, new_prefix):
@@ -5469,7 +5487,7 @@ class SQLiteStorage:
         for digest in digests:
             if not cas.SHA256_DIGEST_RE.match(digest):
                 continue
-            if cas.blob_path(project, digest).is_file():
+            if get_artifact_store().has(project, digest):
                 present.add(digest)
         return present
 

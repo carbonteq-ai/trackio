@@ -3,6 +3,7 @@
 import base64
 import logging
 import os
+import queue
 import re
 import secrets
 import shutil
@@ -26,6 +27,7 @@ import trackio.cas as cas
 import trackio.fragments as fragments
 import trackio.references as references
 import trackio.utils as utils
+from trackio.artifact_storage import get_artifact_store
 from trackio.asgi_app import (
     cleanup_uploaded_temp_file,
     consume_uploaded_temp_file,
@@ -177,6 +179,18 @@ def _enqueue_alert_fragment(
 _inbox_poller_thread: threading.Thread | None = None
 _inbox_poller_lock = threading.Lock()
 _inbox_poller_threads: list[threading.Thread] = []
+# Keep parsed fragments bounded. A rollout trace can be megabytes, so metrics
+# and traces have independent queues and the scalar lane is always available.
+_inbox_metric_queue: queue.Queue = queue.Queue(maxsize=48)
+_inbox_trace_queue: queue.Queue = queue.Queue(maxsize=16)
+
+
+def _inbox_int_setting(name: str, default: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return max(1, min(value, maximum))
 
 
 def import_inbox_once(
@@ -192,38 +206,81 @@ def import_inbox_once(
 def _inbox_poll_loop() -> None:
     while True:
         try:
-            imported = import_inbox_once(max_files=1, include_bucket=False)
+            batch_size = _inbox_int_setting("TRACKIO_INBOX_BATCH_FILES", 128, 2048)
+            claimed = fragments.claim_inbox_batch(max_files=batch_size)
+            if not claimed:
+                time.sleep(utils.get_inbox_poll_interval())
+                continue
+            metric_fragments = [
+                fragment for fragment in claimed if not fragment.contains_trace
+            ]
+            trace_fragments = [
+                fragment for fragment in claimed if fragment.contains_trace
+            ]
+            for fragment in metric_fragments:
+                _inbox_metric_queue.put(fragment)
+            for fragment in trace_fragments:
+                _inbox_trace_queue.put(fragment)
+        except Exception as e:
+            logger.warning("inbox fragment import failed: %s", e)
+
+
+def _inbox_import_worker(work_queue: queue.Queue) -> None:
+    batch_size = _inbox_int_setting("TRACKIO_INBOX_BATCH_FILES", 128, 2048)
+    while True:
+        first = work_queue.get()
+        items = [first]
+        try:
+            while len(items) < batch_size:
+                item = work_queue.get_nowait()
+                items.append(item)
+        except queue.Empty:
+            pass
+        try:
+            imported = fragments.import_claimed_fragments(items)
             if imported:
                 logger.info("imported %d records from inbox fragments", imported)
         except Exception as e:
-            logger.warning("inbox fragment import failed: %s", e)
-        interval = utils.get_inbox_poll_interval()
-        time.sleep(interval)
+            logger.warning("inbox fragment batch import failed: %s", e)
+        finally:
+            for _ in items:
+                work_queue.task_done()
 
 
 def start_inbox_poller() -> None:
     global _inbox_poller_thread, _inbox_poller_threads
-    try:
-        fragments.import_inbox_dir()
-    except Exception as e:
-        logger.warning("inbox fragment import at startup failed: %s", e)
     with _inbox_poller_lock:
         if any(thread.is_alive() for thread in _inbox_poller_threads):
             return
         default_workers = "8" if selected_engine() == "doris" else "1"
+        worker_count = _inbox_int_setting(
+            "TRACKIO_WRITE_WORKERS", int(default_workers), 64
+        )
         try:
-            worker_count = int(
-                os.environ.get("TRACKIO_WRITE_WORKERS", default_workers)
-            )
-        except ValueError:
-            worker_count = int(default_workers)
-        worker_count = max(1, min(worker_count, 64))
-        _inbox_poller_threads = [
-            threading.Thread(target=_inbox_poll_loop, daemon=True)
-            for _ in range(worker_count)
+            fragments.recover_processing_fragments()
+        except Exception as e:
+            logger.warning("inbox fragment recovery failed: %s", e)
+        scanner = threading.Thread(target=_inbox_poll_loop, daemon=True)
+        trace_workers = max(1, worker_count - 1)
+        workers = [
+            threading.Thread(
+                target=_inbox_import_worker,
+                args=(_inbox_metric_queue,),
+                daemon=True,
+            ),
+            *[
+                threading.Thread(
+                    target=_inbox_import_worker,
+                    args=(_inbox_trace_queue,),
+                    daemon=True,
+                )
+                for _ in range(trace_workers)
+            ],
         ]
-        _inbox_poller_thread = _inbox_poller_threads[0]
-        for thread in _inbox_poller_threads:
+        _inbox_poller_thread = scanner
+        _inbox_poller_threads = [scanner, *workers]
+        scanner.start()
+        for thread in workers:
             thread.start()
 
 
@@ -743,7 +800,7 @@ def check_artifact_blobs(
     assert_can_write_metrics(request, hf_token)
     project = _validate_project_name(project)
     validated = [_validate_sha256_digest(d) for d in digests]
-    present = Storage.list_artifact_blobs_present(project, validated)
+    present = [digest for digest in validated if get_artifact_store().has(project, digest)]
     return {"present": [d for d in validated if d in present]}
 
 
@@ -755,13 +812,13 @@ def bulk_upload_artifact_blob(
 ) -> None:
     assert_can_write_metrics(request, hf_token)
     project = _validate_project_name(project)
+    store = get_artifact_store()
 
     def _write(upload: ArtifactBlobUploadEntry, src: Path) -> None:
         digest = _validate_sha256_digest(upload["digest"])
-        target = cas.blob_path(project, digest)
         try:
-            cas.stage_blob_from_file(src, digest, target)
-        except ValueError as e:
+            store.put_file(project, digest, src)
+        except (ValueError, RuntimeError) as e:
             raise TrackioAPIError(str(e)) from e
 
     _bulk_upload(request, uploads, _write)
