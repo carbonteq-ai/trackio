@@ -166,6 +166,21 @@ def _handle_cleanup_uploads(args):
         older_than=cutoff,
         dry_run=not args.apply,
     )
+    try:
+        from trackio.artifact_storage import selected_artifact_backend
+        from trackio.direct_uploads import expire_sessions as expire_direct_sessions
+
+        if selected_artifact_backend() == "s3":
+            direct = expire_direct_sessions(
+                project=args.project,
+                older_than=cutoff,
+                dry_run=not args.apply,
+            )
+            result["direct_session_count"] = direct["session_count"]
+            result["session_count"] += direct["session_count"]
+            result["sessions"].extend(direct["sessions"])
+    except (RuntimeError, ValueError):
+        pass
     if args.json:
         print(format_json(result))
         return
@@ -201,6 +216,43 @@ def _handle_storage_migrate(args) -> None:
         action = "migrated and verified"
     print(
         f"Trackio storage {action}: projects={len(receipt['projects'])} "
+        f"receipt={args.receipt}"
+    )
+
+
+def _handle_storage_artifacts_migrate(args) -> None:
+    from trackio.artifact_migration import migrate_local_artifacts
+    from trackio.artifact_storage import get_artifact_store, selected_artifact_backend
+
+    if args.backend != selected_artifact_backend():
+        error_exit(
+            f"--backend {args.backend!r} does not match "
+            "TRACKIO_ARTIFACT_STORAGE_BACKEND; set the server-side backend explicitly."
+        )
+    if args.delete_local and not args.verified_receipt:
+        error_exit("--delete-local requires --verified-receipt")
+    try:
+        receipt = migrate_local_artifacts(
+            Path(args.source),
+            get_artifact_store(),
+            Path(args.receipt),
+            projects=tuple(args.project or ()),
+            dry_run=args.dry_run,
+            verify_only=args.verify_only,
+            delete_local=args.delete_local,
+            verified_receipt=args.verified_receipt,
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as error:
+        error_exit(str(error))
+    if args.json:
+        print(format_json(receipt))
+        return
+    action = "planned" if receipt["dry_run"] else "verified"
+    if not receipt["dry_run"] and not receipt["verify_only"]:
+        action = "migrated and verified"
+    print(
+        f"Trackio artifact storage {action}: objects={receipt['object_count']} "
+        f"bytes={receipt['source_bytes']} failures={len(receipt['failures'])} "
         f"receipt={args.receipt}"
     )
 
@@ -540,6 +592,45 @@ def main():
         "--verify-only",
         action="store_true",
         help="Compare source and Doris counts without copying records.",
+    )
+
+    storage_artifacts_parser = storage_subparsers.add_parser(
+        "artifacts",
+        help="Inspect or migrate local artifact blobs into the selected backend.",
+    )
+    storage_artifacts_subparsers = storage_artifacts_parser.add_subparsers(
+        dest="artifact_storage_command", required=True
+    )
+    storage_artifacts_migrate_parser = storage_artifacts_subparsers.add_parser(
+        "migrate",
+        help="Copy and verify local CAS blobs through an S3-compatible backend.",
+    )
+    storage_artifacts_migrate_parser.add_argument(
+        "--backend", choices=["s3"], default="s3", help="Target artifact backend."
+    )
+    storage_artifacts_migrate_parser.add_argument(
+        "--source", required=True, help="Trackio directory or its artifacts subdirectory."
+    )
+    storage_artifacts_migrate_parser.add_argument(
+        "--receipt", required=True, help="Path for the JSON migration receipt."
+    )
+    storage_artifacts_migrate_parser.add_argument(
+        "--project", action="append", help="Migrate only this project; may be repeated."
+    )
+    storage_artifacts_migrate_parser.add_argument(
+        "--dry-run", action="store_true", help="List local blobs without uploading."
+    )
+    storage_artifacts_migrate_parser.add_argument(
+        "--verify-only", action="store_true", help="Verify target objects without copying."
+    )
+    storage_artifacts_migrate_parser.add_argument(
+        "--delete-local", action="store_true", help="Delete local blobs only after receipt verification."
+    )
+    storage_artifacts_migrate_parser.add_argument(
+        "--verified-receipt", help="Prior complete receipt required with --delete-local."
+    )
+    storage_artifacts_migrate_parser.add_argument(
+        "--json", action="store_true", help="Print the full receipt as JSON."
     )
 
     sync_parser = subparsers.add_parser(
@@ -1381,6 +1472,11 @@ def main():
     elif args.command == "storage":
         if args.storage_command == "migrate":
             _handle_storage_migrate(args)
+        elif (
+            args.storage_command == "artifacts"
+            and args.artifact_storage_command == "migrate"
+        ):
+            _handle_storage_artifacts_migrate(args)
     elif args.command == "sync":
         _handle_sync(args)
     elif args.command == "freeze":

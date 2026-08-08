@@ -16,6 +16,7 @@ import tempfile
 import threading
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -184,6 +185,22 @@ def _group_by_run(records: list[dict]) -> dict[tuple, list[dict]]:
     return grouped
 
 
+@dataclass(frozen=True)
+class ClaimedFragment:
+    """A fragment atomically claimed by the background importer."""
+
+    path: Path
+    records: list[dict]
+    contains_trace: bool
+
+
+def _record_contains_trace(record: dict) -> bool:
+    if record.get("kind") != METRIC_KIND:
+        return False
+    metrics = record.get("metrics") or {}
+    return any(str(key).startswith("traces/") for key in metrics)
+
+
 def import_records(records: list[dict]) -> int:
     from trackio.storage import Storage  # noqa: PLC0415
 
@@ -243,29 +260,135 @@ def import_records(records: list[dict]) -> int:
     return imported
 
 
-def import_inbox_dir(inbox_dir: Path | None = None) -> int:
+def claim_inbox_batch(
+    inbox_dir: Path | None = None,
+    *,
+    max_files: int | None = 128,
+) -> list[ClaimedFragment]:
+    """Claim and parse a bounded batch without touching the storage backend.
+
+    Only the scanner should call this function in the server. The atomic rename
+    keeps it safe for callers that still use ``import_inbox_dir`` concurrently.
+    Invalid or empty fragments are removed exactly as the legacy importer did.
+    """
+
+    inbox = inbox_dir or local_inbox_dir()
+    if not inbox.exists() or max_files is not None and max_files <= 0:
+        return []
+    claimed: list[ClaimedFragment] = []
+    fragment_paths = sorted(inbox.rglob("*.jsonl"))
+    if max_files is not None:
+        fragment_paths = fragment_paths[:max_files]
+    for fragment_path in fragment_paths:
+        processing_path = fragment_path.with_suffix(
+            f"{fragment_path.suffix}.processing"
+        )
+        try:
+            fragment_path.replace(processing_path)
+        except FileNotFoundError:
+            continue
+        try:
+            records = parse_fragment_bytes(processing_path.read_bytes())
+            if not records:
+                processing_path.unlink()
+                continue
+            claimed.append(
+                ClaimedFragment(
+                    path=processing_path,
+                    records=records,
+                    contains_trace=any(
+                        _record_contains_trace(record) for record in records
+                    ),
+                )
+            )
+        except Exception:
+            try:
+                processing_path.replace(fragment_path)
+            except OSError:
+                pass
+            raise
+    return claimed
+
+
+def import_claimed_fragments(fragments: list[ClaimedFragment]) -> int:
+    """Import a claimed batch, writing scalar records before trace records."""
+
+    if not fragments:
+        return 0
+    priority = [
+        record
+        for fragment in fragments
+        if not fragment.contains_trace
+        for record in fragment.records
+    ]
+    traces = [
+        record
+        for fragment in fragments
+        if fragment.contains_trace
+        for record in fragment.records
+    ]
+    try:
+        imported = import_records(priority)
+        imported += import_records(traces)
+        for fragment in fragments:
+            fragment.path.unlink(missing_ok=True)
+        return imported
+    except Exception:
+        for fragment in fragments:
+            if not fragment.path.exists():
+                continue
+            target = fragment.path.with_suffix("")
+            try:
+                fragment.path.replace(target)
+            except OSError:
+                pass
+        raise
+
+
+def _recover_processing_fragments(inbox: Path) -> None:
+    """Return fragments left in the processing state after a server restart."""
+
+    for processing_path in inbox.rglob("*.jsonl.processing"):
+        target = processing_path.with_suffix("")
+        try:
+            if target.exists():
+                processing_path.unlink()
+            else:
+                processing_path.replace(target)
+        except OSError:
+            continue
+
+
+def recover_processing_fragments(inbox_dir: Path | None = None) -> None:
+    """Return claimed fragments to the pending queue after a restart."""
+
+    inbox = inbox_dir or local_inbox_dir()
+    if inbox.exists():
+        _recover_processing_fragments(inbox)
+
+
+def import_inbox_dir(
+    inbox_dir: Path | None = None,
+    *,
+    max_files: int | None = None,
+) -> int:
     inbox = inbox_dir or local_inbox_dir()
     if not inbox.exists():
         return 0
-    imported = 0
-    for fragment_path in sorted(inbox.rglob("*.jsonl")):
-        try:
-            data = fragment_path.read_bytes()
-        except OSError:
-            continue
-        records = parse_fragment_bytes(data)
-        if records:
-            imported += import_records(records)
-        try:
-            fragment_path.unlink()
-        except OSError:
-            pass
-    for writer_dir in inbox.glob("*"):
-        if writer_dir.is_dir():
-            try:
-                writer_dir.rmdir()
-            except OSError:
-                pass
+    if max_files is None:
+        _recover_processing_fragments(inbox)
+    claimed = claim_inbox_batch(
+        inbox,
+        max_files=max_files,
+    )
+    imported = import_claimed_fragments(claimed)
+    if max_files is None:
+        for writer_dir in inbox.glob("*"):
+            if writer_dir.is_dir():
+                try:
+                    writer_dir.rmdir()
+                except OSError:
+                    pass
     return imported
 
 

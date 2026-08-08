@@ -5,7 +5,7 @@ import os
 import shutil
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,9 +27,11 @@ import orjson
 
 from trackio import cas, references
 from trackio import database as sqlite3
+from trackio.artifact_storage import get_artifact_store
 from trackio.commit_scheduler import CommitScheduler
 from trackio.dummy_commit_scheduler import DummyCommitScheduler
 from trackio.lifecycle import lifecycle_row
+from trackio.purge import manifest_blob_digests
 from trackio.typehints import (
     ARTIFACT_BLOB_UPLOAD_KIND,
     MEDIA_UPLOAD_KIND,
@@ -2027,21 +2029,35 @@ class SQLiteStorage:
         cursor: sqlite3.Cursor,
         run_identity: tuple[str, Any],
         max_points: int | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+        keys: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
-        cursor.execute(
-            f"""
+        query = f"""
             SELECT timestamp, metrics
             FROM system_metrics
             WHERE {run_identity[0]} = ?
-            ORDER BY timestamp
-            """,
-            (run_identity[1],),
-        )
+            ORDER BY timestamp, id
+        """
+        params: list[Any] = [run_identity[1]]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        if offset:
+            if limit is None:
+                query += " LIMIT -1"
+            query += " OFFSET ?"
+            params.append(max(0, int(offset)))
+        cursor.execute(query, params)
         rows = cursor.fetchall()
-        rows = SQLiteStorage._subsample_metric_rows(rows, max_points)
+        if limit is None and offset == 0 and keys is None:
+            rows = SQLiteStorage._subsample_metric_rows(rows, max_points)
         results = []
         for row in rows:
             metrics = orjson.loads(row["metrics"])
+            if keys is not None:
+                selected = set(keys)
+                metrics = {key: value for key, value in metrics.items() if key in selected}
             metrics = deserialize_values(metrics)
             metrics["timestamp"] = row["timestamp"]
             results.append(metrics)
@@ -2053,6 +2069,9 @@ class SQLiteStorage:
         run: str | None = None,
         run_id: str | None = None,
         max_points: int | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+        keys: Sequence[str] | None = None,
     ) -> list[dict]:
         """Retrieve system metrics for a specific run. Returns metrics with timestamps (no steps)."""
         db_path = SQLiteStorage.get_project_db_path(project)
@@ -2060,9 +2079,10 @@ class SQLiteStorage:
             return []
 
         cache_key = _system_logs_read_cache_key(project, run, run_id, max_points)
-        cached = _system_logs_read_cache_get(db_path, cache_key)
-        if cached is not None:
-            return cached
+        if limit is None and offset == 0 and keys is None:
+            cached = _system_logs_read_cache_get(db_path, cache_key)
+            if cached is not None:
+                return cached
 
         try:
             with SQLiteStorage._get_connection(db_path) as conn:
@@ -2074,14 +2094,15 @@ class SQLiteStorage:
                     logs: list[dict[str, Any]] = []
                 else:
                     logs = SQLiteStorage._fetch_system_logs_with_cursor(
-                        cursor, run_identity, max_points
+                        cursor, run_identity, max_points, limit, offset, keys
                     )
         except sqlite3.OperationalError as e:
             if "no such table: system_metrics" in str(e):
                 return []
             raise
 
-        _system_logs_read_cache_put(db_path, cache_key, logs)
+        if limit is None and offset == 0 and keys is None:
+            _system_logs_read_cache_put(db_path, cache_key, logs)
         return [{**d} for d in logs]
 
     @staticmethod
@@ -2317,6 +2338,7 @@ class SQLiteStorage:
         rows: list[Any],
         *,
         scalar_only: bool = False,
+        keys: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         results = []
         for row in rows:
@@ -2329,6 +2351,9 @@ class SQLiteStorage:
                 }
             else:
                 metrics = deserialize_values(metrics)
+            if keys is not None:
+                selected = set(keys)
+                metrics = {key: value for key, value in metrics.items() if key in selected}
             metrics["timestamp"] = row["timestamp"]
             metrics["step"] = row["step"]
             results.append(metrics)
@@ -2341,19 +2366,30 @@ class SQLiteStorage:
         max_points: int | None,
         *,
         scalar_only: bool = False,
+        limit: int | None = None,
+        offset: int = 0,
+        keys: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
-        cursor.execute(
-            f"""
+        query = f"""
             SELECT timestamp, step, metrics
             FROM metrics
             WHERE {run_identity[0]} = ?
-            ORDER BY timestamp
-            """,
-            (run_identity[1],),
-        )
+            ORDER BY timestamp, id
+        """
+        params: list[Any] = [run_identity[1]]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        if offset:
+            if limit is None:
+                query += " LIMIT -1"
+            query += " OFFSET ?"
+            params.append(max(0, int(offset)))
+        cursor.execute(query, params)
         rows = cursor.fetchall()
-        rows = SQLiteStorage._subsample_metric_rows(rows, max_points)
-        return SQLiteStorage._metric_rows_to_log_dicts(rows, scalar_only=scalar_only)
+        if limit is None and offset == 0 and keys is None:
+            rows = SQLiteStorage._subsample_metric_rows(rows, max_points)
+        return SQLiteStorage._metric_rows_to_log_dicts(rows, scalar_only=scalar_only, keys=keys)
 
     @staticmethod
     def get_logs(
@@ -2362,6 +2398,9 @@ class SQLiteStorage:
         max_points: int | None = None,
         run_id: str | None = None,
         scalar_only: bool = False,
+        limit: int | None = None,
+        offset: int = 0,
+        keys: Sequence[str] | None = None,
     ) -> list[dict]:
         """Retrieve logs for a specific run. Logs include the step count (int) and the timestamp (datetime object)."""
         db_path = SQLiteStorage.get_project_db_path(project)
@@ -2371,9 +2410,10 @@ class SQLiteStorage:
         cache_key = _logs_read_cache_key(
             project, run, run_id, max_points, scalar_only=scalar_only
         )
-        cached = _logs_read_cache_get(db_path, cache_key)
-        if cached is not None:
-            return cached
+        if limit is None and offset == 0 and keys is None:
+            cached = _logs_read_cache_get(db_path, cache_key)
+            if cached is not None:
+                return cached
 
         try:
             with SQLiteStorage._get_connection(db_path) as conn:
@@ -2385,14 +2425,21 @@ class SQLiteStorage:
                     logs: list[dict[str, Any]] = []
                 else:
                     logs = SQLiteStorage._fetch_metric_logs_with_cursor(
-                        cursor, run_identity, max_points, scalar_only=scalar_only
+                        cursor,
+                        run_identity,
+                        max_points,
+                        scalar_only=scalar_only,
+                        limit=limit,
+                        offset=offset,
+                        keys=keys,
                     )
         except sqlite3.OperationalError as e:
             if "no such table: metrics" in str(e):
                 return []
             raise
 
-        _logs_read_cache_put(db_path, cache_key, logs)
+        if limit is None and offset == 0 and keys is None:
+            _logs_read_cache_put(db_path, cache_key, logs)
         return [{**d} for d in logs]
 
     @staticmethod
@@ -2682,6 +2729,7 @@ class SQLiteStorage:
         run_id: str | None = None,
         step: int | None = None,
         trace_type: str | None = None,
+        include_payload: bool = True,
     ) -> list[dict[str, Any]]:
         try:
             offset = max(0, int(offset or 0))
@@ -2760,17 +2808,121 @@ class SQLiteStorage:
                 "run_id": row["run_id"],
                 "step": row["step"],
                 "timestamp": row["timestamp"],
-                "messages": deserialize_values(orjson.loads(row["messages"])),
+                "messages": SQLiteStorage._trace_messages_for_read(row["messages"], include_payload),
                 "metadata": deserialize_values(orjson.loads(row["metadata"])),
                 "trace_type": row["trace_type"],
                 "external_id": row["external_id"],
                 "schema_version": row["schema_version"],
-                "payload": deserialize_values(orjson.loads(row["payload"]))
-                if row["payload"] is not None
-                else None,
+                "payload": (
+                    SQLiteStorage._trace_payload_for_read(row["payload"], include_payload)
+                    if row["payload"] is not None
+                    else None
+                ),
             }
             for row in rows
         ]
+
+    @staticmethod
+    def _trace_payload_for_read(raw: Any, include_payload: bool) -> dict[str, Any] | None:
+        payload = deserialize_values(orjson.loads(raw))
+        if include_payload or not isinstance(payload, dict):
+            return payload
+        # Summary pages retain the fields used by Observatory's reward and
+        # outcome projections, while dropping transcript/tool-call bodies.
+        retained = {
+            key: payload[key]
+            for key in (
+                "task_id",
+                "task",
+                "info",
+                "metadata",
+                "rewards",
+                "metrics",
+                "errors",
+                "stop_condition",
+                "is_completed",
+                "success",
+                "reward",
+                "score",
+                "tokens",
+                "input_tokens",
+                "output_tokens",
+                "completion_tokens",
+                "thinking_tokens",
+                "tool_calls",
+                "usage",
+                "latency_ms",
+                "ttft_seconds",
+                "tpot_seconds",
+                "queue_seconds",
+                "prefill_seconds",
+                "decode_seconds",
+                "engine_e2e_seconds",
+                "warmup",
+                "sweep_index",
+                "error_class",
+                "error_message",
+                "task_metadata",
+            )
+            if key in payload
+        }
+        return retained
+
+    @staticmethod
+    def _trace_messages_for_read(raw: Any, include_payload: bool) -> list[Any]:
+        messages = deserialize_values(orjson.loads(raw))
+        if include_payload or not isinstance(messages, list):
+            return messages if isinstance(messages, list) else []
+        # Preserve a bounded prompt/answer preview for list projections.
+        selected: list[Any] = []
+        for item in messages:
+            if not isinstance(item, dict):
+                continue
+            message = item.get("message") if isinstance(item.get("message"), dict) else item
+            role = str(message.get("role", "")).lower()
+            if role == "user" and not selected:
+                selected.append(item)
+                break
+        for item in reversed(messages):
+            if not isinstance(item, dict):
+                continue
+            message = item.get("message") if isinstance(item.get("message"), dict) else item
+            if str(message.get("role", "")).lower() == "assistant":
+                selected.append(item)
+                break
+        return selected
+
+    @staticmethod
+    def get_trace_count(
+        project: str,
+        run: str | None = None,
+        run_id: str | None = None,
+        trace_type: str | None = None,
+    ) -> int:
+        db_path = SQLiteStorage.get_project_db_path(project)
+        if not db_path.exists():
+            return 0
+        try:
+            with SQLiteStorage._get_connection(db_path) as conn:
+                identity = SQLiteStorage._resolve_run_identity(
+                    conn, run_name=run, run_id=run_id, table="traces"
+                )
+                if identity is None:
+                    return 0
+                conditions = [f"{identity[0]} = ?"]
+                params: list[Any] = [identity[1]]
+                if trace_type:
+                    conditions.append("trace_type = ?")
+                    params.append(trace_type)
+                row = conn.execute(
+                    f"SELECT COUNT(*) FROM traces WHERE {' AND '.join(conditions)}",
+                    params,
+                ).fetchone()
+                return int(row[0]) if row is not None else 0
+        except sqlite3.OperationalError as error:
+            if "no such table: traces" in str(error):
+                return 0
+            raise
 
     @staticmethod
     def get_trace_steps(
@@ -2950,7 +3102,7 @@ class SQLiteStorage:
             "artifacts": 0,
             "artifact_versions": 0,
             "artifact_logical_bytes": 0,
-            "artifact_storage_bytes": _directory_bytes(artifacts_dir),
+            "artifact_storage_bytes": get_artifact_store().bytes_for_project(project),
             "media_storage_bytes": _directory_bytes(media_dir),
         }
         if not db_path.exists():
@@ -2995,6 +3147,20 @@ class SQLiteStorage:
 
         summary = SQLiteStorage.project_delete_summary(project)
         db_path = SQLiteStorage.get_project_db_path(project)
+        artifact_digests: set[str] = set()
+        if db_path.exists():
+            try:
+                with SQLiteStorage._get_connection(db_path) as conn:
+                    rows = conn.execute("SELECT manifest FROM artifact_versions").fetchall()
+                    for row in rows:
+                        try:
+                            artifact_digests.update(
+                                manifest_blob_digests(json_mod.loads(row["manifest"]))
+                            )
+                        except (TypeError, ValueError, json_mod.JSONDecodeError):
+                            continue
+            except sqlite3.OperationalError:
+                pass
         if db_path.exists():
             with SQLiteStorage._get_process_lock(project):
                 db_path.unlink(missing_ok=True)
@@ -3002,6 +3168,8 @@ class SQLiteStorage:
                     Path(str(db_path) + suffix).unlink(missing_ok=True)
                 for parquet_path in SQLiteStorage._project_parquet_paths(db_path):
                     parquet_path.unlink(missing_ok=True)
+        for digest in artifact_digests:
+            get_artifact_store().delete(project, digest)
         for directory in (project_artifacts_dir(project), project_media_dir(project)):
             if directory.exists():
                 shutil.rmtree(directory)
@@ -3454,7 +3622,7 @@ class SQLiteStorage:
                         pass
 
         for digest in deleted_digests - retained_digests:
-            cas.blob_path(project, digest).unlink(missing_ok=True)
+            get_artifact_store().delete(project, digest)
 
     @staticmethod
     def _update_media_paths(obj, old_prefix, new_prefix):
@@ -5469,7 +5637,7 @@ class SQLiteStorage:
         for digest in digests:
             if not cas.SHA256_DIGEST_RE.match(digest):
                 continue
-            if cas.blob_path(project, digest).is_file():
+            if get_artifact_store().has(project, digest):
                 present.add(digest)
         return present
 

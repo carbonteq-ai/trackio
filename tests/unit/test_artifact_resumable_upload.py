@@ -11,6 +11,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from trackio import cas, utils
+from trackio.artifact_storage import LocalArtifactStore
 from trackio.asgi_app import create_trackio_starlette_app
 from trackio.exceptions import TrackioAPIError
 from trackio.remote_client import _TrackioHTTPClient
@@ -96,6 +97,29 @@ def test_resumable_upload_streams_out_of_order_and_survives_app_restart(temp_dir
     )
     assert retried.status_code == 200
     assert retried.json()["already_present"] is True
+
+
+def test_legacy_resumable_completion_uses_configured_artifact_store(temp_dir, monkeypatch):
+    payload = b"provider-backed-weights"
+    store = LocalArtifactStore()
+    put_calls = []
+    original_put = store.put_file
+
+    def put_file(project, digest, source):
+        put_calls.append((project, digest, source.read_bytes()))
+        return original_put(project, digest, source)
+
+    monkeypatch.setattr(store, "put_file", put_file)
+    monkeypatch.setattr("trackio.resumable_uploads.get_artifact_store", lambda: store)
+    client = TestClient(create_trackio_starlette_app([], {}))
+    session = _init(client, digest=_digest(payload), size=len(payload))
+    assert _put(client, session["upload_id"], 0, payload).status_code == 200
+
+    completed = client.post(f"/api/artifact-upload/resumable-project/{session['upload_id']}")
+
+    assert completed.status_code == 200
+    assert put_calls == [("resumable-project", _digest(payload), payload)]
+    assert store.verify("resumable-project", _digest(payload), len(payload)).size_bytes == len(payload)
 
 
 def test_resumable_upload_rejects_corrupt_chunk_without_acknowledging_it(temp_dir):

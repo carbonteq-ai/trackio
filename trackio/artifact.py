@@ -44,11 +44,24 @@ def _fetch_blob_from_remote(
             "server_base_url is populated."
         )
     base_url = _resolve_src_url(src).rstrip("/")
-    url = f"{base_url}/artifact_blob/{utils.canonical_project_name(project)}/{digest}"
     headers = _merge_client_headers(
         get_token() if space_id else None,
         remote_source.get("write_token"),
     )
+    url = f"{base_url}/artifact_blob/{utils.canonical_project_name(project)}/{digest}"
+    try:
+        direct = httpx.get(
+            f"{base_url}/artifact_blob_url/{utils.canonical_project_name(project)}/{digest}",
+            headers=headers,
+            timeout=httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0),
+        )
+        if direct.status_code == 200:
+            candidate = direct.json().get("url")
+            if isinstance(candidate, str) and candidate:
+                url = candidate
+    except (httpx.HTTPError, ValueError, KeyError):
+        # Older Trackio servers do not expose the presigned URL capability.
+        pass
     with httpx.stream(
         "GET",
         url,

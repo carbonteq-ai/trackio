@@ -113,10 +113,23 @@ def test_api_exposes_stable_run_reads(temp_dir):
     ] == [2.0, 1.0]
     assert run.system_metric_names() == ["cpu/utilization"]
     assert [row["cpu/utilization"] for row in run.system_history()] == [42.0, 51.0]
+    projected = SQLiteStorage.get_logs(project, run_id=run_id, keys=["train/loss"])
+    assert all(set(row) <= {"train/loss", "step", "timestamp"} for row in projected)
+    projected_system = SQLiteStorage.get_system_logs(
+        project, run_id=run_id, keys=["cpu/utilization"]
+    )
+    assert all(set(row) <= {"cpu/utilization", "timestamp"} for row in projected_system)
+    assert [row["step"] for row in run.history(limit=1, offset=1)] == [1]
+    assert [row["cpu/utilization"] for row in run.system_history(limit=1, offset=1)] == [51.0]
 
     traces = run.traces(sort="step_asc")
     assert {trace["trace_type"] for trace in traces} == {"trackio", "verifiers"}
     assert run.traces(trace_type="verifiers")[0]["external_id"] == "vf-api-1"
+    summary_trace = run.traces(trace_type="verifiers", include_payload=False)[0]
+    assert len(summary_trace["messages"]) <= 2
+    assert "nodes" not in summary_trace["payload"]
+    assert run.trace_count() == 2
+    assert run.trace_count(trace_type="verifiers") == 1
     output_link = run.artifacts()["output"][0]
     assert output_link["name"] == "trained-model"
     assert output_link["digest"] == output.digest

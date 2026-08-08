@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import threading
+from collections.abc import Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
@@ -17,6 +18,7 @@ from pymysql.cursors import DictCursor
 
 import trackio.cas as cas
 import trackio.references as references
+from trackio.artifact_storage import get_artifact_store
 from trackio.doris_schema import (
     MANAGED_TABLES,
     SCHEMA_VERSION,
@@ -992,7 +994,7 @@ class DorisStorage:
             "artifacts": 0,
             "artifact_versions": 0,
             "artifact_logical_bytes": 0,
-            "artifact_storage_bytes": _directory_bytes(project_artifacts_dir(project)),
+            "artifact_storage_bytes": get_artifact_store().bytes_for_project(project),
             "media_storage_bytes": _directory_bytes(project_media_dir(project)),
         }
         run_ids: set[str] = set()
@@ -1054,7 +1056,14 @@ class DorisStorage:
         """Delete all Doris rows and local project-scoped artifact/media bytes."""
 
         summary = cls.project_delete_summary(project)
+        artifact_digests: set[str] = set()
         with cls._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT manifest FROM artifact_versions WHERE project_id = %s",
+                (project,),
+            )
+            for row in cursor.fetchall():
+                artifact_digests.update(manifest_blob_digests(_decode(row["manifest"])))
             for table in (
                 "run_artifact_links",
                 "artifact_aliases",
@@ -1068,6 +1077,8 @@ class DorisStorage:
                 "project_metadata",
             ):
                 cursor.execute(f"DELETE FROM {table} WHERE project_id = %s", (project,))
+        for digest in artifact_digests:
+            get_artifact_store().delete(project, digest)
         for directory in (project_artifacts_dir(project), project_media_dir(project)):
             if directory.exists():
                 shutil.rmtree(directory)
@@ -1138,20 +1149,32 @@ class DorisStorage:
         max_points: int | None = None,
         run_id: str | None = None,
         scalar_only: bool = False,
+        limit: int | None = None,
+        offset: int = 0,
+        keys: Sequence[str] | None = None,
     ) -> list[dict]:
         with cls._connection() as connection, connection.cursor() as cursor:
             resolved = cls._resolve_run_id(cursor, project, run, run_id)
             if resolved is None:
                 return []
-            cursor.execute(
-                """
+            query = """
                 SELECT timestamp, step, metrics FROM metrics
                 WHERE project_id = %s AND run_id = %s
                 ORDER BY timestamp, event_id
-                """,
-                (project, resolved),
-            )
-            rows = cls._subsample(list(cursor.fetchall()), max_points)
+            """
+            params: list[Any] = [project, resolved]
+            if limit is not None:
+                query += " LIMIT %s"
+                params.append(max(0, int(limit)))
+            if offset:
+                if limit is None:
+                    query += " LIMIT 1000000000"
+                query += " OFFSET %s"
+                params.append(max(0, int(offset)))
+            cursor.execute(query, params)
+            rows = list(cursor.fetchall())
+            if limit is None and offset == 0:
+                rows = cls._subsample(rows, max_points)
         result = []
         for row in rows:
             metrics = orjson.loads(row["metrics"])
@@ -1163,6 +1186,9 @@ class DorisStorage:
                 }
             else:
                 metrics = deserialize_values(metrics)
+            if keys is not None:
+                selected = set(keys)
+                metrics = {key: value for key, value in metrics.items() if key in selected}
             metrics["timestamp"] = str(row["timestamp"])
             metrics["step"] = int(row["step"])
             result.append(metrics)
@@ -1198,6 +1224,9 @@ class DorisStorage:
         run: str | None = None,
         run_id: str | None = None,
         max_points: int | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+        keys: Sequence[str] | None = None,
     ) -> list[dict]:
         with cls._connection() as connection, connection.cursor() as cursor:
             resolved = cls._resolve_run_id(
@@ -1205,18 +1234,30 @@ class DorisStorage:
             )
             if resolved is None:
                 return []
-            cursor.execute(
-                """
+            query = """
                 SELECT timestamp, metrics FROM system_metrics
                 WHERE project_id = %s AND run_id = %s
                 ORDER BY timestamp, event_id
-                """,
-                (project, resolved),
-            )
-            rows = cls._subsample(list(cursor.fetchall()), max_points)
+            """
+            params: list[Any] = [project, resolved]
+            if limit is not None:
+                query += " LIMIT %s"
+                params.append(max(0, int(limit)))
+            if offset:
+                if limit is None:
+                    query += " LIMIT 1000000000"
+                query += " OFFSET %s"
+                params.append(max(0, int(offset)))
+            cursor.execute(query, params)
+            rows = list(cursor.fetchall())
+            if limit is None and offset == 0:
+                rows = cls._subsample(rows, max_points)
         result = []
         for row in rows:
             metrics = _decode(row["metrics"])
+            if keys is not None:
+                selected = set(keys)
+                metrics = {key: value for key, value in metrics.items() if key in selected}
             metrics["timestamp"] = str(row["timestamp"])
             result.append(metrics)
         return result
@@ -1406,6 +1447,7 @@ class DorisStorage:
         run_id: str | None = None,
         step: int | None = None,
         trace_type: str | None = None,
+        include_payload: bool = True,
     ) -> list[dict[str, Any]]:
         with cls._connection() as connection, connection.cursor() as cursor:
             resolved = cls._resolve_run_id(cursor, project, run, run_id, table="traces")
@@ -1454,17 +1496,43 @@ class DorisStorage:
                 "run_id": row["run_id"],
                 "step": row["step"],
                 "timestamp": row["timestamp"],
-                "messages": _decode(row["messages"]),
+                "messages": SQLiteStorage._trace_messages_for_read(row["messages"], include_payload),
                 "metadata": _decode(row["metadata"]),
                 "trace_type": row["trace_type"],
                 "external_id": row["external_id"],
                 "schema_version": row["schema_version"],
-                "payload": _decode(row["payload"])
-                if row["payload"] is not None
-                else None,
+                "payload": (
+                    SQLiteStorage._trace_payload_for_read(row["payload"], include_payload)
+                    if row["payload"] is not None
+                    else None
+                ),
             }
             for row in rows
         ]
+
+    @classmethod
+    def get_trace_count(
+        cls,
+        project: str,
+        run: str | None = None,
+        run_id: str | None = None,
+        trace_type: str | None = None,
+    ) -> int:
+        with cls._connection() as connection, connection.cursor() as cursor:
+            resolved = cls._resolve_run_id(cursor, project, run, run_id, table="traces")
+            if resolved is None:
+                return 0
+            conditions = ["project_id = %s", "run_id = %s"]
+            params: list[Any] = [project, resolved]
+            if trace_type:
+                conditions.append("trace_type = %s")
+                params.append(trace_type)
+            cursor.execute(
+                f"SELECT COUNT(*) AS count FROM traces WHERE {' AND '.join(conditions)}",
+                params,
+            )
+            row = cursor.fetchone()
+            return int(row["count"]) if row is not None else 0
 
     @classmethod
     def get_trace_steps(
@@ -2287,7 +2355,7 @@ class DorisStorage:
                 retained_digests.update(manifest_blob_digests(_decode(row["manifest"])))
 
         for digest in deleted_digests - retained_digests:
-            cas.blob_path(project, digest).unlink(missing_ok=True)
+            get_artifact_store().delete(project, digest)
 
     @classmethod
     def force_sync(cls) -> bool:
@@ -2308,9 +2376,7 @@ class DorisStorage:
 
     @classmethod
     def list_artifact_blobs_present(cls, project: str, digests: list[str]) -> list[str]:
-        return [
-            digest for digest in digests if cas.blob_path(project, digest).is_file()
-        ]
+        return [digest for digest in digests if get_artifact_store().has(project, digest)]
 
     @classmethod
     def _unsupported(cls, *args: Any, **kwargs: Any) -> Any:

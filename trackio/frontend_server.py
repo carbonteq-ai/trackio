@@ -111,6 +111,7 @@ class FrontendMiddleware(BaseHTTPMiddleware):
             "/oauth/",
             "/login/",
             "/mcp",
+            "/artifact_blob_url/",
         )
         self.reserved_exact = {
             "/api",

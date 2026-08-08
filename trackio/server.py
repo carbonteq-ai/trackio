@@ -3,6 +3,7 @@
 import base64
 import logging
 import os
+import queue
 import re
 import secrets
 import shutil
@@ -23,8 +24,10 @@ from starlette.responses import RedirectResponse
 from starlette.routing import Route
 
 import trackio.cas as cas
+import trackio.fragments as fragments
 import trackio.references as references
 import trackio.utils as utils
+from trackio.artifact_storage import get_artifact_store
 from trackio.asgi_app import (
     cleanup_uploaded_temp_file,
     consume_uploaded_temp_file,
@@ -39,6 +42,7 @@ from trackio.storage import (
     Storage,
     StorageOperationalError,
     is_retryable_storage_error,
+    selected_engine,
 )
 from trackio.typehints import (
     AlertEntry,
@@ -76,16 +80,124 @@ _MAX_RETRIES = 30
 
 _LOGS_BATCH_MAX_RUNS = 64
 _LOGS_BATCH_MAX_POINTS = 10_000
+_server_fragment_writer = fragments.FragmentWriter()
+
+
+def _use_async_doris_writes() -> bool:
+    """Use the durable inbox for the synchronous Doris write path."""
+
+    value = os.environ.get("TRACKIO_ASYNC_DORIS_WRITES", "true").strip().lower()
+    return selected_engine() == "doris" and value not in {"0", "false", "no", "off"}
+
+
+def _enqueue_metric_fragment(
+    *,
+    project: str,
+    run: str,
+    run_id: str | None,
+    metrics_list: list[dict],
+    steps: list[int | None],
+    config: dict | None,
+    log_ids: list[str | None] | None,
+) -> None:
+    records = []
+    for index, metrics in enumerate(metrics_list):
+        records.append(
+            fragments.metric_record(
+                {
+                    "project": project,
+                    "run": run,
+                    "run_id": run_id,
+                    "metrics": metrics,
+                    "step": steps[index],
+                    "config": config if index == 0 else None,
+                    "log_id": log_ids[index] if log_ids else None,
+                }
+            )
+        )
+    _server_fragment_writer.write_local(records)
+
+
+def _enqueue_system_fragment(
+    *,
+    project: str,
+    run: str,
+    run_id: str | None,
+    metrics_list: list[dict],
+    timestamps: list[str | None],
+    log_ids: list[str | None] | None,
+) -> None:
+    records = []
+    for index, metrics in enumerate(metrics_list):
+        records.append(
+            fragments.system_metric_record(
+                {
+                    "project": project,
+                    "run": run,
+                    "run_id": run_id,
+                    "metrics": metrics,
+                    "timestamp": timestamps[index],
+                    "log_id": log_ids[index] if log_ids else None,
+                }
+            )
+        )
+    _server_fragment_writer.write_local(records)
+
+
+def _enqueue_alert_fragment(
+    *,
+    project: str,
+    run: str,
+    run_id: str | None,
+    titles: list[str],
+    texts: list[str | None],
+    levels: list[str],
+    steps: list[int | None],
+    timestamps: list[str | None],
+    alert_ids: list[str | None] | None,
+) -> None:
+    records = []
+    for index, title in enumerate(titles):
+        records.append(
+            fragments.alert_record(
+                {
+                    "project": project,
+                    "run": run,
+                    "run_id": run_id,
+                    "title": title,
+                    "text": texts[index],
+                    "level": levels[index],
+                    "step": steps[index],
+                    "timestamp": timestamps[index],
+                    "alert_id": alert_ids[index] if alert_ids else None,
+                }
+            )
+        )
+    _server_fragment_writer.write_local(records)
+
 
 _inbox_poller_thread: threading.Thread | None = None
 _inbox_poller_lock = threading.Lock()
+_inbox_poller_threads: list[threading.Thread] = []
+# Keep parsed fragments bounded. A rollout trace can be megabytes, so metrics
+# and traces have independent queues and the scalar lane is always available.
+_inbox_metric_queue: queue.Queue = queue.Queue(maxsize=48)
+_inbox_trace_queue: queue.Queue = queue.Queue(maxsize=16)
 
 
-def import_inbox_once() -> int:
-    from trackio import fragments  # noqa: PLC0415
+def _inbox_int_setting(name: str, default: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return max(1, min(value, maximum))
 
-    imported = fragments.import_inbox_dir()
-    bucket_id = os.environ.get("TRACKIO_BUCKET_ID")
+
+def import_inbox_once(
+    *, max_files: int | None = None, include_bucket: bool = True
+) -> int:
+    imported = fragments.import_inbox_dir(max_files=max_files)
+    bucket_id = os.environ.get("TRACKIO_BUCKET_ID") if include_bucket else None
     if bucket_id:
         imported += fragments.import_inbox_from_bucket(bucket_id)
     return imported
@@ -94,28 +206,82 @@ def import_inbox_once() -> int:
 def _inbox_poll_loop() -> None:
     while True:
         try:
-            imported = import_inbox_once()
+            batch_size = _inbox_int_setting("TRACKIO_INBOX_BATCH_FILES", 128, 2048)
+            claimed = fragments.claim_inbox_batch(max_files=batch_size)
+            if not claimed:
+                time.sleep(utils.get_inbox_poll_interval())
+                continue
+            metric_fragments = [
+                fragment for fragment in claimed if not fragment.contains_trace
+            ]
+            trace_fragments = [
+                fragment for fragment in claimed if fragment.contains_trace
+            ]
+            for fragment in metric_fragments:
+                _inbox_metric_queue.put(fragment)
+            for fragment in trace_fragments:
+                _inbox_trace_queue.put(fragment)
+        except Exception as e:
+            logger.warning("inbox fragment import failed: %s", e)
+
+
+def _inbox_import_worker(work_queue: queue.Queue) -> None:
+    batch_size = _inbox_int_setting("TRACKIO_INBOX_BATCH_FILES", 128, 2048)
+    while True:
+        first = work_queue.get()
+        items = [first]
+        try:
+            while len(items) < batch_size:
+                item = work_queue.get_nowait()
+                items.append(item)
+        except queue.Empty:
+            pass
+        try:
+            imported = fragments.import_claimed_fragments(items)
             if imported:
                 logger.info("imported %d records from inbox fragments", imported)
         except Exception as e:
-            logger.warning("inbox fragment import failed: %s", e)
-        interval = utils.get_inbox_poll_interval()
-        time.sleep(interval)
+            logger.warning("inbox fragment batch import failed: %s", e)
+        finally:
+            for _ in items:
+                work_queue.task_done()
 
 
 def start_inbox_poller() -> None:
-    global _inbox_poller_thread
-    try:
-        from trackio import fragments  # noqa: PLC0415
-
-        fragments.import_inbox_dir()
-    except Exception as e:
-        logger.warning("inbox fragment import at startup failed: %s", e)
+    global _inbox_poller_thread, _inbox_poller_threads
     with _inbox_poller_lock:
-        if _inbox_poller_thread is not None and _inbox_poller_thread.is_alive():
+        if any(thread.is_alive() for thread in _inbox_poller_threads):
             return
-        _inbox_poller_thread = threading.Thread(target=_inbox_poll_loop, daemon=True)
-        _inbox_poller_thread.start()
+        default_workers = "8" if selected_engine() == "doris" else "1"
+        worker_count = _inbox_int_setting(
+            "TRACKIO_WRITE_WORKERS", int(default_workers), 64
+        )
+        try:
+            fragments.recover_processing_fragments()
+        except Exception as e:
+            logger.warning("inbox fragment recovery failed: %s", e)
+        scanner = threading.Thread(target=_inbox_poll_loop, daemon=True)
+        trace_workers = max(1, worker_count - 1)
+        workers = [
+            threading.Thread(
+                target=_inbox_import_worker,
+                args=(_inbox_metric_queue,),
+                daemon=True,
+            ),
+            *[
+                threading.Thread(
+                    target=_inbox_import_worker,
+                    args=(_inbox_trace_queue,),
+                    daemon=True,
+                )
+                for _ in range(trace_workers)
+            ],
+        ]
+        _inbox_poller_thread = scanner
+        _inbox_poller_threads = [scanner, *workers]
+        scanner.start()
+        for thread in workers:
+            thread.start()
 
 
 def _normalize_logs_batch_runs(runs: Any) -> list[dict[str, Any]]:
@@ -147,6 +313,32 @@ def _normalize_logs_batch_max_points(max_points: Any) -> int:
     if max_points < 1:
         return 3000
     return min(max_points, _LOGS_BATCH_MAX_POINTS)
+
+
+def _normalize_read_page(value: Any, name: str, *, default: int | None = None) -> int | None:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise TrackioAPIError(f"{name} must be an integer or null")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise TrackioAPIError(f"{name} must be a whole number")
+        value = int(value)
+    if not isinstance(value, int):
+        raise TrackioAPIError(f"{name} must be an integer or null")
+    if value < 0:
+        raise TrackioAPIError(f"{name} cannot be negative")
+    if name == "limit" and value > 10_000:
+        raise TrackioAPIError("limit cannot exceed 10000")
+    return value
+
+
+def _normalize_read_keys(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or not all(isinstance(item, str) for item in value):
+        raise TrackioAPIError("keys must be a list of strings or null")
+    return list(dict.fromkeys(item for item in value if item))
 
 
 def _normalize_bool_param(value: Any, name: str) -> bool:
@@ -634,7 +826,7 @@ def check_artifact_blobs(
     assert_can_write_metrics(request, hf_token)
     project = _validate_project_name(project)
     validated = [_validate_sha256_digest(d) for d in digests]
-    present = Storage.list_artifact_blobs_present(project, validated)
+    present = [digest for digest in validated if get_artifact_store().has(project, digest)]
     return {"present": [d for d in validated if d in present]}
 
 
@@ -646,13 +838,13 @@ def bulk_upload_artifact_blob(
 ) -> None:
     assert_can_write_metrics(request, hf_token)
     project = _validate_project_name(project)
+    store = get_artifact_store()
 
     def _write(upload: ArtifactBlobUploadEntry, src: Path) -> None:
         digest = _validate_sha256_digest(upload["digest"])
-        target = cas.blob_path(project, digest)
         try:
-            cas.stage_blob_from_file(src, digest, target)
-        except ValueError as e:
+            store.put_file(project, digest, src)
+        except (ValueError, RuntimeError) as e:
             raise TrackioAPIError(str(e)) from e
 
     _bulk_upload(request, uploads, _write)
@@ -802,6 +994,17 @@ def log(
     run_id: str | None = None,
 ) -> None:
     assert_can_write_metrics(request, hf_token)
+    if _use_async_doris_writes():
+        _enqueue_metric_fragment(
+            project=project,
+            run=run,
+            run_id=run_id,
+            metrics_list=[metrics],
+            steps=[step],
+            config=None,
+            log_ids=None,
+        )
+        return
     Storage.log(project=project, run=run, run_id=run_id, metrics=metrics, step=step)
 
 
@@ -839,6 +1042,9 @@ def bulk_log(
             config=data["config"],
             log_ids=data["log_ids"] if has_log_ids else None,
         )
+        if _use_async_doris_writes():
+            _enqueue_metric_fragment(**payload)
+            continue
         try:
             Storage.bulk_log(**payload)
         except StorageOperationalError as error:
@@ -873,6 +1079,9 @@ def bulk_log_system(
             timestamps=data["timestamps"],
             log_ids=data["log_ids"] if has_log_ids else None,
         )
+        if _use_async_doris_writes():
+            _enqueue_system_fragment(**payload)
+            continue
         try:
             Storage.bulk_log_system(**payload)
         except StorageOperationalError as error:
@@ -920,6 +1129,9 @@ def bulk_alert(
             timestamps=data["timestamps"],
             alert_ids=data["alert_ids"] if has_alert_ids else None,
         )
+        if _use_async_doris_writes():
+            _enqueue_alert_fragment(**payload)
+            continue
         try:
             Storage.bulk_alert(**payload)
         except StorageOperationalError as error:
@@ -1061,9 +1273,22 @@ def get_system_metrics_for_run(
 
 
 def get_system_logs(
-    project: str, run: str | None = None, run_id: str | None = None
+    project: str,
+    run: str | None = None,
+    run_id: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    keys: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    return Storage.get_system_logs(project, run, run_id=run_id, max_points=3000)
+    return Storage.get_system_logs(
+        project,
+        run,
+        run_id=run_id,
+        max_points=None if limit is not None or offset else 3000,
+        limit=_normalize_read_page(limit, "limit"),
+        offset=_normalize_read_page(offset, "offset", default=0) or 0,
+        keys=_normalize_read_keys(keys),
+    )
 
 
 def get_system_logs_batch(
@@ -1116,6 +1341,9 @@ def get_run_history(
     run: str | None = None,
     run_id: str | None = None,
     scalar_only: bool = False,
+    limit: int | None = None,
+    offset: int = 0,
+    keys: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Return unsampled run history for provider-neutral API consumers."""
 
@@ -1125,6 +1353,9 @@ def get_run_history(
         max_points=None,
         run_id=run_id,
         scalar_only=_normalize_bool_param(scalar_only, "scalar_only"),
+        limit=_normalize_read_page(limit, "limit"),
+        offset=_normalize_read_page(offset, "offset", default=0) or 0,
+        keys=_normalize_read_keys(keys),
     )
 
 
@@ -1162,6 +1393,7 @@ def get_traces(
     offset: int | None = 0,
     step: int | None = None,
     trace_type: str | None = None,
+    include_payload: bool = True,
 ) -> list[dict[str, Any]]:
     try:
         normalized_offset = max(0, int(offset)) if offset is not None else 0
@@ -1194,6 +1426,7 @@ def get_traces(
         run_id=run_id,
         step=normalized_step,
         trace_type=trace_type,
+        include_payload=_normalize_bool_param(include_payload, "include_payload"),
     )
 
 
@@ -1204,6 +1437,15 @@ def get_trace_steps(
     trace_type: str | None = None,
 ) -> dict[str, Any]:
     return Storage.get_trace_steps(project, run, run_id=run_id, trace_type=trace_type)
+
+
+def get_trace_count(
+    project: str,
+    run: str | None = None,
+    run_id: str | None = None,
+    trace_type: str | None = None,
+) -> int:
+    return Storage.get_trace_count(project, run, run_id=run_id, trace_type=trace_type)
 
 
 def query_project(project: str, query: str) -> dict[str, Any]:
@@ -1409,6 +1651,7 @@ def _api_registry() -> dict[str, Any]:
         "get_run_lifecycles": get_run_lifecycles,
         "get_traces": get_traces,
         "get_trace_steps": get_trace_steps,
+        "get_trace_count": get_trace_count,
         "query_project": query_project,
         "get_settings": get_settings,
         "get_project_files": get_project_files,

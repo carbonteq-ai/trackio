@@ -104,6 +104,8 @@ class Run:
         keys: Sequence[str] | None = None,
         *,
         scalar_only: bool = False,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         """Return unsampled run history in occurrence order.
 
@@ -119,6 +121,9 @@ class Run:
                 run=self.name,
                 run_id=self.id,
                 scalar_only=scalar_only,
+                limit=limit,
+                offset=offset,
+                keys=list(keys) if keys is not None else None,
             )
         else:
             rows = SQLiteStorage.get_logs(
@@ -127,6 +132,9 @@ class Run:
                 max_points=None,
                 run_id=self.id,
                 scalar_only=scalar_only,
+                limit=limit,
+                offset=offset,
+                keys=keys,
             )
         if keys is None:
             return rows
@@ -185,7 +193,13 @@ class Run:
             run_id=self.id,
         )
 
-    def system_history(self) -> list[dict[str, Any]]:
+    def system_history(
+        self,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+        keys: Sequence[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Return provider-bounded host telemetry in timestamp order."""
 
         if self._remote_client is not None:
@@ -194,12 +208,18 @@ class Run:
                 project=self.project,
                 run=self.name,
                 run_id=self.id,
+                limit=limit,
+                offset=offset,
+                keys=list(keys) if keys is not None else None,
             )
         return SQLiteStorage.get_system_logs(
             self.project,
             self.name,
             run_id=self.id,
             max_points=None,
+            limit=limit,
+            offset=offset,
+            keys=keys,
         )
 
     def traces(
@@ -211,6 +231,7 @@ class Run:
         offset: int = 0,
         step: int | None = None,
         trace_type: str | None = None,
+        include_payload: bool = True,
     ) -> list[dict[str, Any]]:
         """Return standard or Verifiers traces for this run."""
 
@@ -224,6 +245,7 @@ class Run:
             "run_id": self.id,
             "step": step,
             "trace_type": trace_type,
+            "include_payload": include_payload,
         }
         if self._remote_client is not None:
             return self._remote("/get_traces", **kwargs)
@@ -236,6 +258,27 @@ class Run:
             offset=offset,
             run_id=self.id,
             step=step,
+            trace_type=trace_type,
+            include_payload=include_payload,
+        )
+
+    def trace_count(self, *, trace_type: str | None = None) -> int:
+        """Return a trace count without materializing trace payloads."""
+
+        if self._remote_client is not None:
+            return int(
+                self._remote(
+                    "/get_trace_count",
+                    project=self.project,
+                    run=self.name,
+                    run_id=self.id,
+                    trace_type=trace_type,
+                )
+            )
+        return SQLiteStorage.get_trace_count(
+            self.project,
+            self.name,
+            run_id=self.id,
             trace_type=trace_type,
         )
 
