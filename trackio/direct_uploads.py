@@ -12,6 +12,7 @@ from typing import Any, Mapping, Sequence
 
 from trackio import cas, utils
 from trackio.artifact_storage import (
+    ArtifactNotFoundError,
     S3ArtifactStore,
     get_artifact_store,
 )
@@ -124,7 +125,25 @@ def create_or_resume_session(
     upload_id = _upload_id(project, idempotency_key)
     metadata = _metadata_path(project, upload_id)
     if metadata.is_file():
-        return _public_session(_read_session(project, upload_id), store)
+        session = _read_session(project, upload_id)
+        if session.get("state") != "completed":
+            return _public_session(session, store)
+
+        # A completed session is only an upload receipt, not the blob
+        # authority. Retention, migration, or operator cleanup may remove the
+        # provider object while leaving the restart metadata behind. Reusing
+        # that stale receipt makes the client skip the upload and causes the
+        # later artifact-manifest commit to fail with a missing blob.
+        try:
+            existing = store.stat(project, digest)
+        except ArtifactNotFoundError:
+            metadata.unlink()
+        else:
+            if existing.size_bytes != size_bytes:
+                raise UploadSessionError(
+                    "A completed direct upload session points to an object with a different size."
+                )
+            return _public_session(session, store)
 
     if store.has(project, digest):
         existing = store.stat(project, digest)

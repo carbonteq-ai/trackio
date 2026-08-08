@@ -186,3 +186,41 @@ def test_direct_upload_session_completes_and_verifies_object(monkeypatch, temp_d
     assert completed.status_code == 200, completed.text
     assert completed.json()["digest"] == digest
     assert store.open("project", digest).read() == payload
+
+
+def test_direct_upload_restarts_when_completed_session_blob_is_missing(monkeypatch, temp_dir):
+    import trackio.direct_uploads as direct_uploads
+
+    payload = b"recreated-direct-model-weights"
+    digest = hashlib.sha256(payload).hexdigest()
+    fake = _FakeS3()
+    store = S3ArtifactStore(
+        endpoint_url="http://rustfs.invalid:9000",
+        bucket="bucket",
+        prefix="test",
+        client=fake,
+    )
+    monkeypatch.setenv("TRACKIO_ARTIFACT_STORAGE_BACKEND", "s3")
+    monkeypatch.setattr(direct_uploads, "get_artifact_store", lambda: store)
+    client = TestClient(create_trackio_starlette_app([], {}))
+    request = {
+        "digest": digest,
+        "size_bytes": len(payload),
+        "idempotency_key": "direct-client-key-stale-completed",
+    }
+
+    first = client.post("/api/artifact-upload/direct/project", json=request).json()
+    fake.uploads["upload-1"]["parts"][1] = payload
+    completed = client.post(
+        f"/api/artifact-upload/direct/project/{first['upload_id']}",
+        json={"parts": [{"PartNumber": 1, "ETag": "etag-1"}]},
+    )
+    assert completed.status_code == 200, completed.text
+    store.delete("project", digest)
+
+    restarted = client.post("/api/artifact-upload/direct/project", json=request)
+
+    assert restarted.status_code == 200, restarted.text
+    assert restarted.json()["state"] == "uploading"
+    assert restarted.json()["already_present"] is False
+    assert fake.counter == 2

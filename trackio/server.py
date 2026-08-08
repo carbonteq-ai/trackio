@@ -315,6 +315,32 @@ def _normalize_logs_batch_max_points(max_points: Any) -> int:
     return min(max_points, _LOGS_BATCH_MAX_POINTS)
 
 
+def _normalize_read_page(value: Any, name: str, *, default: int | None = None) -> int | None:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise TrackioAPIError(f"{name} must be an integer or null")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise TrackioAPIError(f"{name} must be a whole number")
+        value = int(value)
+    if not isinstance(value, int):
+        raise TrackioAPIError(f"{name} must be an integer or null")
+    if value < 0:
+        raise TrackioAPIError(f"{name} cannot be negative")
+    if name == "limit" and value > 10_000:
+        raise TrackioAPIError("limit cannot exceed 10000")
+    return value
+
+
+def _normalize_read_keys(value: Any) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or not all(isinstance(item, str) for item in value):
+        raise TrackioAPIError("keys must be a list of strings or null")
+    return list(dict.fromkeys(item for item in value if item))
+
+
 def _normalize_bool_param(value: Any, name: str) -> bool:
     if value is None:
         return False
@@ -1247,9 +1273,22 @@ def get_system_metrics_for_run(
 
 
 def get_system_logs(
-    project: str, run: str | None = None, run_id: str | None = None
+    project: str,
+    run: str | None = None,
+    run_id: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    keys: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    return Storage.get_system_logs(project, run, run_id=run_id, max_points=3000)
+    return Storage.get_system_logs(
+        project,
+        run,
+        run_id=run_id,
+        max_points=None if limit is not None or offset else 3000,
+        limit=_normalize_read_page(limit, "limit"),
+        offset=_normalize_read_page(offset, "offset", default=0) or 0,
+        keys=_normalize_read_keys(keys),
+    )
 
 
 def get_system_logs_batch(
@@ -1302,6 +1341,9 @@ def get_run_history(
     run: str | None = None,
     run_id: str | None = None,
     scalar_only: bool = False,
+    limit: int | None = None,
+    offset: int = 0,
+    keys: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Return unsampled run history for provider-neutral API consumers."""
 
@@ -1311,6 +1353,9 @@ def get_run_history(
         max_points=None,
         run_id=run_id,
         scalar_only=_normalize_bool_param(scalar_only, "scalar_only"),
+        limit=_normalize_read_page(limit, "limit"),
+        offset=_normalize_read_page(offset, "offset", default=0) or 0,
+        keys=_normalize_read_keys(keys),
     )
 
 
@@ -1348,6 +1393,7 @@ def get_traces(
     offset: int | None = 0,
     step: int | None = None,
     trace_type: str | None = None,
+    include_payload: bool = True,
 ) -> list[dict[str, Any]]:
     try:
         normalized_offset = max(0, int(offset)) if offset is not None else 0
@@ -1380,6 +1426,7 @@ def get_traces(
         run_id=run_id,
         step=normalized_step,
         trace_type=trace_type,
+        include_payload=_normalize_bool_param(include_payload, "include_payload"),
     )
 
 
@@ -1390,6 +1437,15 @@ def get_trace_steps(
     trace_type: str | None = None,
 ) -> dict[str, Any]:
     return Storage.get_trace_steps(project, run, run_id=run_id, trace_type=trace_type)
+
+
+def get_trace_count(
+    project: str,
+    run: str | None = None,
+    run_id: str | None = None,
+    trace_type: str | None = None,
+) -> int:
+    return Storage.get_trace_count(project, run, run_id=run_id, trace_type=trace_type)
 
 
 def query_project(project: str, query: str) -> dict[str, Any]:
@@ -1595,6 +1651,7 @@ def _api_registry() -> dict[str, Any]:
         "get_run_lifecycles": get_run_lifecycles,
         "get_traces": get_traces,
         "get_trace_steps": get_trace_steps,
+        "get_trace_count": get_trace_count,
         "query_project": query_project,
         "get_settings": get_settings,
         "get_project_files": get_project_files,

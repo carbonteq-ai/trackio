@@ -67,6 +67,26 @@ reclaimable bytes in dry-run mode and expires only incomplete, aged sessions.
 Completed content-addressed blobs and artifact versions are not eligible for
 session cleanup.
 
+The unreleased compatibility repair also routes the older server-side
+resumable completion endpoint through the configured artifact store. This is
+required while post8 clients coexist with an S3-backed post10 server: the
+legacy endpoint must not write a verified blob only to the historical local
+CAS and then let the manifest authority look for it in S3. Completed legacy
+sessions recover an existing verified local-CAS blob into the configured store
+before returning success. Publication and deployment remain open gates.
+
+The same release repairs stale direct-upload receipts. A completed multipart
+session is no longer treated as proof that its content-addressed object still
+exists: Trackio checks the configured store before returning the completed
+receipt and restarts the upload when retention or migration removed the blob.
+This prevents an artifact producer from skipping the upload and then failing
+manifest commit with `Manifest references blobs not on server`.
+
+The intended distribution for these compatibility and importer changes is
+`carbonteq-trackio==0.31.5.post11`. It remains a candidate until the exact
+commit, wheel hashes, deployment, direct-upload canary, and Doris backlog
+readback are recorded.
+
 ## Storage engine
 
 Turso is the default SQL metadata engine through the `pyturso` embedded driver.

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from trackio import cas, utils
+from trackio.artifact_storage import get_artifact_store
 
 DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024
 COMPATIBILITY_MAX_BYTES = 32 * 1024 * 1024
@@ -251,8 +252,20 @@ def complete_session(project: str, upload_id: str) -> dict[str, Any]:
     """Verify and atomically expose a fully acknowledged artifact blob."""
 
     session = _read_session(project, upload_id)
-    target = cas.blob_path(project, session["digest"])
+    store = get_artifact_store()
     if session["state"] == "completed":
+        if not store.has(project, session["digest"]):
+            # Compatibility recovery for sessions completed by Trackio clients
+            # predating provider-backed artifact storage. Those servers placed
+            # the verified blob in the historical local CAS even when the
+            # configured manifest authority is S3.
+            legacy = cas.blob_path(project, session["digest"])
+            if not legacy.is_file():
+                raise UploadSessionError(
+                    "Completed upload session has no blob in the configured artifact store."
+                )
+            store.put_file(project, session["digest"], legacy)
+        store.verify(project, session["digest"], int(session["size_bytes"]))
         return {
             "digest": session["digest"],
             "size_bytes": session["size_bytes"],
@@ -264,14 +277,20 @@ def complete_session(project: str, upload_id: str) -> dict[str, Any]:
     if missing:
         raise UploadSessionError(f"Upload session is missing chunks: {missing[:20]}.")
 
-    already_present = target.is_file()
-    cas.stage_blob_from_chunks(
-        _part_chunks(project, upload_id, int(session["chunk_count"])),
-        claimed_digest=session["digest"],
-        target_path=target,
-    )
-    if target.stat().st_size != session["size_bytes"]:
-        raise UploadSessionError("Completed artifact blob size does not match session.")
+    already_present = store.has(project, session["digest"])
+    staged = _session_dir(project, upload_id) / "completed.blob"
+    try:
+        cas.stage_blob_from_chunks(
+            _part_chunks(project, upload_id, int(session["chunk_count"])),
+            claimed_digest=session["digest"],
+            target_path=staged,
+        )
+        if staged.stat().st_size != session["size_bytes"]:
+            raise UploadSessionError("Completed artifact blob size does not match session.")
+        store.put_file(project, session["digest"], staged)
+        store.verify(project, session["digest"], int(session["size_bytes"]))
+    finally:
+        staged.unlink(missing_ok=True)
 
     session["state"] = "completed"
     session["completed_at"] = _now().isoformat()
