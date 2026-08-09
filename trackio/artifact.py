@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import os
 import shutil
+from concurrent.futures import Future
 from pathlib import Path
 
 import httpx
@@ -166,6 +169,8 @@ class Artifact:
         self._manifest_digest: Sha256Digest | None = None
         self._project: str | None = None
         self._remote_source: dict | None = None
+        self._background_future: Future[Artifact] | None = None
+        self._background_submission_id: str | None = None
 
     @property
     def name(self) -> str:
@@ -249,14 +254,38 @@ class Artifact:
         return self._project
 
     def wait(self, timeout: int | None = None) -> "Artifact":
-        """No-op: trackio logs artifacts synchronously, so the artifact is
-        already committed by the time `log_artifact` returns."""
+        """Wait for a synchronous or explicitly background artifact commit."""
         if not self._logged:
-            raise RuntimeError(
-                "Cannot wait on an Artifact that has not been logged; "
-                "call log_artifact first."
-            )
+            if self._background_future is None:
+                raise RuntimeError(
+                    "Cannot wait on an Artifact that has not been logged; "
+                    "call log_artifact first."
+                )
+            self._background_future.result(timeout=timeout)
+            return self
         return self
+
+    @property
+    def submission_id(self) -> str | None:
+        """Stable identifier for an explicitly queued publication."""
+        return self._background_submission_id
+
+    @property
+    def state(self) -> str:
+        """Publication state without exposing worker exceptions or credentials."""
+        if self._background_future is None:
+            return "committed" if self._logged else "pending"
+        if not self._background_future.done():
+            return "uploading"
+        if self._background_future.cancelled():
+            return "aborted"
+        if self._background_future.exception() is not None:
+            return "failed"
+        return "committed"
+
+    def _attach_background_future(self, future: Future[Artifact], submission_id: str) -> None:
+        self._background_future = future
+        self._background_submission_id = submission_id
 
     def add_file(self, local_path: str | Path, name: str | None = None) -> None:
         """Stage a single file for inclusion in the artifact.

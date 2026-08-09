@@ -3,6 +3,8 @@ import shutil
 import threading
 import time
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -61,6 +63,8 @@ class Run:
         cpu_log_interval: float = 10.0,
         webhook_url: str | None = None,
         webhook_min_level: AlertLevel | str | None = None,
+        artifact_workers: int = 2,
+        artifact_queue_limit: int = 4,
     ):
         """
         Initialize a Run for logging metrics to Trackio.
@@ -122,6 +126,15 @@ class Run:
         self._last_bucket_flush: float | None = None
         self._spilled_metric_ids: set[int] = set()
         self._spilled_system_ids: set[int] = set()
+        if artifact_workers < 1 or artifact_queue_limit < 1:
+            raise ValueError("artifact_workers and artifact_queue_limit must be positive")
+        self._artifact_executor = ThreadPoolExecutor(
+            max_workers=artifact_workers,
+            thread_name_prefix="trackio-artifact",
+        )
+        self._artifact_queue_limit = artifact_queue_limit
+        self._artifact_futures: dict[str, Future[Artifact]] = {}
+        self._artifact_lock = threading.Lock()
         self.id = run_id or uuid.uuid4().hex
         self._existing_runs = existing_runs
         self._initial_last_step = initial_last_step
@@ -1265,6 +1278,49 @@ class Run:
         name: str | None = None,
         type: str | None = None,
         aliases: list[str] | None = None,
+        *,
+        background: bool = False,
+    ) -> Artifact:
+        """Log an artifact, optionally queueing the commit in a bounded pool."""
+        if not background:
+            return self._log_artifact_sync(artifact_or_path, name, type, aliases)
+
+        if isinstance(artifact_or_path, Artifact):
+            if name is not None or type is not None:
+                raise ValueError(
+                    "name/type can only be passed when logging a path; "
+                    "set them on the Artifact instead."
+                )
+            artifact = artifact_or_path
+        else:
+            path = Path(artifact_or_path)
+            artifact = Artifact(name=name or path.name, type=type or "unspecified")
+            if path.is_dir():
+                artifact.add_dir(path)
+            else:
+                artifact.add_file(path)
+        with self._artifact_lock:
+            active = sum(not future.done() for future in self._artifact_futures.values())
+            if active >= self._artifact_queue_limit:
+                raise RuntimeError("Trackio artifact publication queue is full")
+            submission_id = uuid.uuid4().hex
+            future = self._artifact_executor.submit(
+                self._log_artifact_sync,
+                artifact,
+                None,
+                None,
+                aliases,
+            )
+            self._artifact_futures[submission_id] = future
+            artifact._attach_background_future(future, submission_id)
+        return artifact
+
+    def _log_artifact_sync(
+        self,
+        artifact_or_path: Artifact | str | Path,
+        name: str | None = None,
+        type: str | None = None,
+        aliases: list[str] | None = None,
     ) -> Artifact:
         if isinstance(artifact_or_path, Artifact):
             if name is not None or type is not None:
@@ -1550,8 +1606,31 @@ class Run:
         except Exception as e:
             _emit_nonfatal_warning(f"trackio.log_system() failed: {e}")
 
+    def flush_artifacts(self, timeout: float | None = None) -> tuple[Artifact, ...]:
+        """Wait for every queued artifact and propagate publication failures."""
+        with self._artifact_lock:
+            futures = tuple(self._artifact_futures.values())
+        if not futures:
+            return ()
+        deadline = None if timeout is None else time.monotonic() + timeout
+        committed: list[Artifact] = []
+        for future in futures:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            try:
+                committed.append(future.result(timeout=remaining))
+            except FutureTimeoutError:
+                raise TimeoutError("Trackio artifact publication drain timed out") from None
+        with self._artifact_lock:
+            self._artifact_futures = {
+                submission_id: future
+                for submission_id, future in self._artifact_futures.items()
+                if not future.done() or future.exception() is not None
+            }
+        return tuple(committed)
+
     def finish(self):
         try:
+            self.flush_artifacts(timeout=30)
             if self._gpu_monitor is not None:
                 try:
                     self._gpu_monitor.stop()
@@ -1571,6 +1650,7 @@ class Run:
                     )
 
             self._stop_flag.set()
+            self._artifact_executor.shutdown(wait=True, cancel_futures=False)
 
             if self._is_local:
                 if self._local_sender_thread is not None:

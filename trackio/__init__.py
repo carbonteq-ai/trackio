@@ -713,6 +713,8 @@ def log_artifact(
     name: str | None = None,
     type: str | None = None,
     aliases: list[str] | None = None,
+    *,
+    background: bool = False,
 ) -> Artifact:
     """
     Logs an artifact as an output of the current run.
@@ -734,6 +736,9 @@ def log_artifact(
             (assigned automatically whenever a new version is created). Your
             aliases rotate onto the version even when identical content is
             de-duplicated.
+        background (`bool`, *optional*):
+            Queue publication on the run's bounded artifact pool. Call
+            ``wait()`` on the returned artifact before consuming its identity.
 
     Returns:
         The logged `Artifact` instance, hydrated with `version`, `aliases`,
@@ -742,7 +747,13 @@ def log_artifact(
     run = context_vars.current_run.get()
     if run is None:
         raise RuntimeError("Call trackio.init() before trackio.log_artifact().")
-    return run.log_artifact(artifact_or_path, name=name, type=type, aliases=aliases)
+    return run.log_artifact(
+        artifact_or_path,
+        name=name,
+        type=type,
+        aliases=aliases,
+        background=background,
+    )
 
 
 def use_artifact(

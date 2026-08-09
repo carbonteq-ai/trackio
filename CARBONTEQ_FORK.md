@@ -87,6 +87,14 @@ The intended distribution for these compatibility and importer changes is
 commit, wheel hashes, deployment, direct-upload canary, and Doris backlog
 readback are recorded.
 
+`0.31.5.post12` adds an opt-in bounded background artifact publication path to
+the client. `Run.log_artifact(..., background=True)` queues work on a per-run
+executor, returns an artifact with a stable submission id and explicit state,
+and `Run.flush_artifacts()` drains committed identities before run finalization.
+The synchronous API remains the default and old callers continue to work.
+The Posttrain adapter uses this option only when the installed client exposes
+it, preserving a short compatibility window for older images.
+
 ## Storage engine
 
 Turso is the default SQL metadata engine through the `pyturso` embedded driver.
@@ -148,6 +156,7 @@ added later without changing the Trackio SDK contract.
 | `0.31.5.post6` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post7` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post8` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
+| `0.31.5.post12` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 
 `0.31.5.post4` adds project-scoped bulk read APIs so a client can describe every
 run without one configuration request and one history request per run:

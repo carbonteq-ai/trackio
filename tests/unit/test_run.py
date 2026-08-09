@@ -1,4 +1,5 @@
 import sqlite3
+import threading
 import time
 from unittest.mock import MagicMock
 
@@ -27,6 +28,44 @@ def test_run_log_writes_to_sqlite_locally(temp_dir):
     config = SQLiteStorage.get_run_config("proj", "run1")
     assert config is not None
     assert run.id is not None
+
+
+def test_background_artifact_wait_and_finish_drain(temp_dir, tmp_path):
+    payload = tmp_path / "checkpoint.bin"
+    payload.write_bytes(b"checkpoint")
+    run = Run(url=None, project="proj", client=None, name="artifact-run", space_id=None)
+
+    queued = run.log_artifact(payload, name="checkpoint", type="training-checkpoint", background=True)
+
+    assert queued.submission_id
+    assert queued.state in {"uploading", "committed"}
+    assert queued.wait().version is not None
+    assert queued.state == "committed"
+    assert run.flush_artifacts(timeout=5)[0].version is not None
+    run.finish()
+
+
+def test_background_artifact_queue_is_bounded(temp_dir, tmp_path, monkeypatch):
+    payload = tmp_path / "checkpoint.bin"
+    payload.write_bytes(b"checkpoint")
+    run = Run(url=None, project="proj", client=None, name="bounded-run", space_id=None, artifact_queue_limit=1)
+    started = threading.Event()
+    release = threading.Event()
+    original = run._log_artifact_sync
+
+    def blocked(*args, **kwargs):
+        started.set()
+        release.wait(timeout=5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(run, "_log_artifact_sync", blocked)
+    run.log_artifact(payload, name="first", background=True)
+    assert started.wait(timeout=5)
+    with pytest.raises(RuntimeError, match="queue is full"):
+        run.log_artifact(payload, name="second", background=True)
+    release.set()
+    run.flush_artifacts(timeout=5)
+    run.finish()
 
 
 def test_markdown_logging(temp_dir):
