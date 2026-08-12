@@ -2850,6 +2850,8 @@ class SQLiteStorage:
                 "completion_tokens",
                 "thinking_tokens",
                 "tool_calls",
+                "num_tool_calls",
+                "num_model_calls",
                 "usage",
                 "latency_ms",
                 "ttft_seconds",
@@ -2866,6 +2868,59 @@ class SQLiteStorage:
             )
             if key in payload
         }
+        calls = payload.get("calls")
+        if isinstance(calls, list):
+            retained.setdefault("num_model_calls", len(calls))
+            prompt_tokens = []
+            completion_tokens = []
+            thinking_tokens = []
+            starts = []
+            ends = []
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                usage = call.get("usage")
+                if isinstance(usage, dict):
+                    for values, key in (
+                        (prompt_tokens, "prompt_tokens"),
+                        (completion_tokens, "completion_tokens"),
+                        (thinking_tokens, "reasoning_tokens"),
+                    ):
+                        value = usage.get(key)
+                        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                            values.append(value)
+                clock = call.get("time")
+                if isinstance(clock, dict):
+                    start = clock.get("start")
+                    end = clock.get("end")
+                    if (
+                        isinstance(start, (int, float))
+                        and not isinstance(start, bool)
+                        and isinstance(end, (int, float))
+                        and not isinstance(end, bool)
+                        and end >= start
+                    ):
+                        starts.append(float(start))
+                        ends.append(float(end))
+            if prompt_tokens:
+                retained.setdefault("input_tokens", sum(prompt_tokens))
+            if completion_tokens:
+                retained.setdefault("completion_tokens", sum(completion_tokens))
+            if thinking_tokens:
+                retained.setdefault("thinking_tokens", sum(thinking_tokens))
+            if starts and ends:
+                retained.setdefault("latency_ms", (max(ends) - min(starts)) * 1_000)
+
+        if "num_tool_calls" not in retained:
+            nodes = payload.get("nodes")
+            if isinstance(nodes, list):
+                retained["num_tool_calls"] = sum(
+                    len(tool_calls)
+                    for node in nodes
+                    if isinstance(node, dict)
+                    and isinstance((message := node.get("message")), dict)
+                    and isinstance((tool_calls := message.get("tool_calls")), list)
+                )
         return retained
 
     @staticmethod

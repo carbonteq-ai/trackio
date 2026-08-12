@@ -10,7 +10,7 @@ integrations.
 
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current fork release
-is `0.31.5.post8`, derived from upstream Trackio `0.31.5`.
+is `0.31.5.post13`, derived from upstream Trackio `0.31.5`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -95,6 +95,14 @@ The synchronous API remains the default and old callers continue to work.
 The Posttrain adapter uses this option only when the installed client exposes
 it, preserving a short compatibility window for older images.
 
+`0.31.5.post13` also keeps bounded trace listings analytically useful without
+returning transcript or tool-call bodies. For native Verifiers records,
+`include_payload=false` derives latency, prompt/completion/reasoning usage,
+model-call count, and tool-call count from the complete stored record, then
+returns only those safe scalar summaries. This repairs historical Observatory
+rows whose full detail had timing and token evidence while their paged summary
+showed it as missing.
+
 ## Storage engine
 
 Turso is the default SQL metadata engine through the `pyturso` embedded driver.
@@ -157,6 +165,7 @@ added later without changing the Trackio SDK contract.
 | `0.31.5.post7` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post8` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post12` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
+| `0.31.5.post13` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 
 `0.31.5.post4` adds project-scoped bulk read APIs so a client can describe every
 run without one configuration request and one history request per run:

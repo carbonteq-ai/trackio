@@ -21,7 +21,12 @@ def _verifiers_record() -> dict:
                 "message": {"role": "assistant", "content": "answer"},
             },
         ],
-        "calls": [],
+        "calls": [
+            {
+                "time": {"start": 10.0, "end": 10.25},
+                "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+            }
+        ],
         "rewards": {"correct": 1.0},
         "metrics": {},
         "errors": [],
@@ -128,6 +133,12 @@ def test_api_exposes_stable_run_reads(temp_dir):
     summary_trace = run.traces(trace_type="verifiers", include_payload=False)[0]
     assert len(summary_trace["messages"]) <= 2
     assert "nodes" not in summary_trace["payload"]
+    assert "calls" not in summary_trace["payload"]
+    assert summary_trace["payload"]["latency_ms"] == 250.0
+    assert summary_trace["payload"]["input_tokens"] == 11
+    assert summary_trace["payload"]["completion_tokens"] == 7
+    assert summary_trace["payload"]["num_model_calls"] == 1
+    assert summary_trace["payload"]["num_tool_calls"] == 0
     assert run.trace_count() == 2
     assert run.trace_count(trace_type="verifiers") == 1
     output_link = run.artifacts()["output"][0]
