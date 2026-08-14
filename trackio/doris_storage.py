@@ -1628,7 +1628,7 @@ class DorisStorage:
                 update
                 for update in updates
                 if update.replace_reward_components
-                and traces[(update.trace_type, update.external_id)].get("fact_projection_id") is None
+                and not traces[(update.trace_type, update.external_id)].get("fact_projection_id")
             ]
             if fresh:
                 component_rows = [
