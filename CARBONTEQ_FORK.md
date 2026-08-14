@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev5`.
+working candidate is `0.31.5.post14.dev6`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -104,7 +104,7 @@ returns only those safe scalar summaries. This repairs historical Observatory
 rows whose full detail had timing and token evidence while their paged summary
 showed it as missing.
 
-## Trace-facts candidate (`0.31.5.post14.dev5`)
+## Trace-facts candidate (`0.31.5.post14.dev6`)
 
 This candidate adds a generic, typed trace-facts projection for native
 Verifiers traces. The full native record remains in `traces.payload` as replay
