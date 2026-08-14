@@ -119,6 +119,22 @@ def _enqueue_metric_fragment(
     _server_fragment_writer.write_local(records)
 
 
+def _contains_trace_metrics(metrics_list: list[dict]) -> bool:
+    """Whether a metric batch contains a native trace requiring read-after-write.
+
+    Doris normally acknowledges metric fragments before its inbox importer has
+    made them queryable.  A later trace-fact upsert is dependent on the native
+    trace row, so those batches must use the synchronous storage path.  Ordinary
+    scalar metrics retain the durable asynchronous fast path.
+    """
+
+    return any(
+        isinstance(metrics, dict)
+        and any(str(key).startswith("traces/") for key in metrics)
+        for metrics in metrics_list
+    )
+
+
 def _enqueue_system_fragment(
     *,
     project: str,
@@ -1043,7 +1059,9 @@ def bulk_log(
             config=data["config"],
             log_ids=data["log_ids"] if has_log_ids else None,
         )
-        if _use_async_doris_writes():
+        if _use_async_doris_writes() and not _contains_trace_metrics(
+            data["metrics"]
+        ):
             _enqueue_metric_fragment(**payload)
             continue
         try:

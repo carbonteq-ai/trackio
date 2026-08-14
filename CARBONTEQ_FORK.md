@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev8`.
+working candidate is `0.31.5.post14.dev9`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -104,7 +104,7 @@ returns only those safe scalar summaries. This repairs historical Observatory
 rows whose full detail had timing and token evidence while their paged summary
 showed it as missing.
 
-## Trace-facts candidate (`0.31.5.post14.dev8`)
+## Trace-facts candidate (`0.31.5.post14.dev9`)
 
 This candidate adds a generic, typed trace-facts projection for native
 Verifiers traces. The full native record remains in `traces.payload` as replay
@@ -126,11 +126,17 @@ as the read-side API. A remote run can therefore write its native trace and
 then verify aggregate availability without constructing an internal read
 object or reaching into storage.
 
-`0.31.5.post14.dev8` also establishes the causal write boundary for a source
+`0.31.5.post14.dev8` establishes the client-side causal write boundary for a source
 trace followed immediately by fact enrichment: it synchronously sends queued
 native log records before the dependent upsert, under the same client lock.
 This retains asynchronous logging for ordinary observations while preventing a
 fact update from arriving before its parent trace.
+
+`0.31.5.post14.dev9` completes that boundary for the Doris service. Native
+trace batches bypass the asynchronous inbox acknowledgement and are committed
+before the request returns; scalar-only metric batches retain the durable inbox
+throughput path. This gives trace facts the read-after-write guarantee their
+foreign-key-like parent relation requires.
 
 The contract is implemented in `trackio/trace_facts.py`, accepted on an
 initial `VerifiersTrace` write or through `Run.upsert_trace_facts`, persisted by
