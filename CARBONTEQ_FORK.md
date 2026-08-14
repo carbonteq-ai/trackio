@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev3`.
+working candidate is `0.31.5.post14.dev4`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -104,7 +104,7 @@ returns only those safe scalar summaries. This repairs historical Observatory
 rows whose full detail had timing and token evidence while their paged summary
 showed it as missing.
 
-## Trace-facts candidate (`0.31.5.post14.dev3`)
+## Trace-facts candidate (`0.31.5.post14.dev4`)
 
 This candidate adds a generic, typed trace-facts projection for native
 Verifiers traces. The full native record remains in `traces.payload` as replay
@@ -120,6 +120,11 @@ all-component query by component name and source kind; component coverage is
 reported independently from the matching trace count. Scalar and component
 aggregates are intentionally separate requests so a multi-component trace
 cannot silently multiply scalar coverage.
+
+The producer-facing `trackio.Run` exposes the same bounded aggregation method
+as the read-side API. A remote run can therefore write its native trace and
+then verify aggregate availability without constructing an internal read
+object or reaching into storage.
 
 The contract is implemented in `trackio/trace_facts.py`, accepted on an
 initial `VerifiersTrace` write or through `Run.upsert_trace_facts`, persisted by

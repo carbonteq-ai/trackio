@@ -32,7 +32,13 @@ from trackio.remote_client import RemoteClient, is_transient_remote_error
 from trackio.sqlite_storage import SQLiteStorage
 from trackio.table import Table
 from trackio.trace import Trace
-from trackio.trace_facts import TraceFactUpdate, TraceFactWriteReceipt
+from trackio.trace_facts import (
+    TraceAggregateBucket,
+    TraceAggregateResult,
+    TraceFactsQuery,
+    TraceFactUpdate,
+    TraceFactWriteReceipt,
+)
 from trackio.typehints import AlertEntry, LogEntry, SystemLogEntry, UploadEntry
 from trackio.utils import MEDIA_DIR, _emit_nonfatal_warning, _get_default_namespace
 
@@ -128,7 +134,9 @@ class Run:
         self._spilled_metric_ids: set[int] = set()
         self._spilled_system_ids: set[int] = set()
         if artifact_workers < 1 or artifact_queue_limit < 1:
-            raise ValueError("artifact_workers and artifact_queue_limit must be positive")
+            raise ValueError(
+                "artifact_workers and artifact_queue_limit must be positive"
+            )
         self._artifact_executor = ThreadPoolExecutor(
             max_workers=artifact_workers,
             thread_name_prefix="trackio-artifact",
@@ -1221,7 +1229,9 @@ class Run:
         """Persist a fact projection after its native trace has been logged."""
 
         if self._is_local:
-            return SQLiteStorage.upsert_trace_facts(self.project, self.name, update, run_id=self.id)
+            return SQLiteStorage.upsert_trace_facts(
+                self.project, self.name, update, run_id=self.id
+            )
         self._wait_for_client_ready()
         with self._client_lock:
             if self._client is None:
@@ -1234,6 +1244,38 @@ class Run:
                 update=update.payload(),
             )
         return TraceFactWriteReceipt(**response)
+
+    def aggregate_trace_facts(self, query: TraceFactsQuery) -> TraceAggregateResult:
+        """Return bounded fact aggregates without reading native trace payloads."""
+
+        if self._is_local:
+            return SQLiteStorage.aggregate_trace_facts(
+                self.project, self.name, query, run_id=self.id
+            )
+        self._wait_for_client_ready()
+        with self._client_lock:
+            if self._client is None:
+                raise RuntimeError("trackio remote client is not available")
+            response = self._client.predict(
+                api_name="/get_trace_facts",
+                project=self.project,
+                run=self.name,
+                run_id=self.id,
+                trace_type=query.trace_type,
+                group_by=list(query.group_by),
+                aggregates=[
+                    {
+                        "measure": aggregate.measure,
+                        "operation": aggregate.operation,
+                        "component_name": aggregate.component_name,
+                    }
+                    for aggregate in query.aggregates
+                ],
+                dimensions=dict(query.dimensions),
+            )
+        return TraceAggregateResult(
+            tuple(TraceAggregateBucket(**bucket) for bucket in response["buckets"])
+        )
 
     def flush(self) -> None:
         """Synchronously persist queued observation fragments before a dependent write."""
@@ -1324,7 +1366,9 @@ class Run:
             else:
                 artifact.add_file(path)
         with self._artifact_lock:
-            active = sum(not future.done() for future in self._artifact_futures.values())
+            active = sum(
+                not future.done() for future in self._artifact_futures.values()
+            )
             if active >= self._artifact_queue_limit:
                 raise RuntimeError("Trackio artifact publication queue is full")
             submission_id = uuid.uuid4().hex
@@ -1639,11 +1683,15 @@ class Run:
         deadline = None if timeout is None else time.monotonic() + timeout
         committed: list[Artifact] = []
         for future in futures:
-            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
             try:
                 committed.append(future.result(timeout=remaining))
             except FutureTimeoutError:
-                raise TimeoutError("Trackio artifact publication drain timed out") from None
+                raise TimeoutError(
+                    "Trackio artifact publication drain timed out"
+                ) from None
         with self._artifact_lock:
             self._artifact_futures = {
                 submission_id: future

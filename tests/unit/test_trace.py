@@ -227,14 +227,11 @@ def test_initial_verifiers_trace_facts_are_persisted_with_the_native_trace(temp_
     )
     run._flush_queues_inline()
 
-    result = SQLiteStorage.aggregate_trace_facts(
-        "proj",
-        "initial-facts-run",
+    result = run.aggregate_trace_facts(
         TraceFactsQuery(
             group_by=("rollout_step",),
             aggregates=(TraceAggregate("model_output_tokens"),),
-        ),
-        run_id=run.id,
+        )
     )
 
     assert result.buckets[0].values == {"mean_model_output_tokens": 17.0}
