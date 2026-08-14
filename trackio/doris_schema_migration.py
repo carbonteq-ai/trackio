@@ -43,6 +43,12 @@ def apply(target: int, backup_receipt: Path) -> dict[str, object]:
         current = _current_version(cursor)
         statements = migration_statements(current, target)
         for statement in statements:
+            if statement.lstrip().upper().startswith("ALTER TABLE TRACES ADD COLUMN"):
+                column = statement.split()[5]
+                cursor.execute("DESCRIBE traces")
+                existing = {str(row["Field"]) for row in cursor.fetchall()}
+                if column in existing:
+                    continue
             cursor.execute(statement)
         cursor.execute("SELECT TABLE_NAME AS table_name FROM information_schema.tables WHERE table_schema = DATABASE()")
         tables = {str(row["table_name"]) for row in cursor.fetchall()}

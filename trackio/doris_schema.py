@@ -98,9 +98,9 @@ def migration_statements(from_version: int, to_version: int, replication_num: in
         CREATE TABLE IF NOT EXISTS trace_reward_components (
             project_id VARCHAR(255) NOT NULL,
             trace_id VARCHAR(768) NOT NULL,
-            run_id VARCHAR(255) NOT NULL,
             projection_id VARCHAR(64) NOT NULL,
             name VARCHAR(256) NOT NULL,
+            run_id VARCHAR(255) NOT NULL,
             contribution DOUBLE NULL,
             score DOUBLE NULL,
             weight DOUBLE NULL,
@@ -224,9 +224,9 @@ def schema_statements(replication_num: int = 1) -> tuple[str, ...]:
         CREATE TABLE IF NOT EXISTS trace_reward_components (
             project_id VARCHAR(255) NOT NULL,
             trace_id VARCHAR(768) NOT NULL,
-            run_id VARCHAR(255) NOT NULL,
             projection_id VARCHAR(64) NOT NULL,
             name VARCHAR(256) NOT NULL,
+            run_id VARCHAR(255) NOT NULL,
             contribution DOUBLE NULL,
             score DOUBLE NULL,
             weight DOUBLE NULL,
