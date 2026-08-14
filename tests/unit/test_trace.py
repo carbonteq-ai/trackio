@@ -322,6 +322,71 @@ def test_remote_trace_fact_upsert_sends_queued_parent_before_enrichment():
     assert native["external_id"] == "queued-parent"
 
 
+def test_remote_flush_delivers_parent_before_trace_fact_enrichment():
+    """An explicit flush must not only checkpoint a trace locally."""
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def predict(self, *, api_name, **kwargs):
+            self.calls.append((api_name, kwargs))
+            if api_name == "/bulk_log":
+                return None
+            assert api_name == "/upsert_trace_facts"
+            return {
+                "trace_id": "parent",
+                "projection_id": kwargs["update"]["projection_id"],
+                "applied": True,
+            }
+
+    client = Client()
+    run = Run(
+        url="https://trackio.invalid",
+        project="proj",
+        client=client,
+        name="remote-buffered-facts-run",
+        server_base_url="https://trackio.invalid",
+    )
+    native = VerifiersTrace(verifiers_record("buffered-parent"))._to_dict(
+        "proj", "remote-buffered-facts-run", 1
+    )
+    run._queued_logs.append(
+        {
+            "project": "proj",
+            "run": "remote-buffered-facts-run",
+            "run_id": run.id,
+            "metrics": {"traces/verifiers": native},
+            "step": 1,
+            "config": None,
+            "log_id": "buffered-parent-log",
+        }
+    )
+    update = TraceFactUpdate(
+        trace_type="verifiers",
+        external_id="buffered-parent",
+        namespace="posttrain.train.reward",
+        calculator_version="test.v1",
+        projection_id=_projection_id(
+            "posttrain.train.reward", "test.v1", {}, {"algorithm_reward": 0.5}
+        ),
+        measures={"algorithm_reward": 0.5},
+    )
+
+    run.flush()
+    receipt = run.upsert_trace_facts(update)
+    run.finish()
+
+    assert receipt.applied is True
+    assert [api_name for api_name, _ in client.calls[:2]] == [
+        "/bulk_log",
+        "/upsert_trace_facts",
+    ]
+    assert client.calls[0][1]["logs"][0]["metrics"]["traces/verifiers"][
+        "external_id"
+    ] == "buffered-parent"
+
+
 def test_reward_component_aggregates_preserve_name_source_and_coverage(temp_dir):
     run = Run(
         url=None, project="proj", client=None, name="component-facts-run", space_id=None

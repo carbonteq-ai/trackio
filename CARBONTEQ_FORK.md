@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev9`.
+working candidate is `0.31.5.post14.dev10`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -104,7 +104,7 @@ returns only those safe scalar summaries. This repairs historical Observatory
 rows whose full detail had timing and token evidence while their paged summary
 showed it as missing.
 
-## Trace-facts candidate (`0.31.5.post14.dev9`)
+## Trace-facts candidate (`0.31.5.post14.dev10`)
 
 This candidate adds a generic, typed trace-facts projection for native
 Verifiers traces. The full native record remains in `traces.payload` as replay
@@ -137,6 +137,12 @@ trace batches bypass the asynchronous inbox acknowledgement and are committed
 before the request returns; scalar-only metric batches retain the durable inbox
 throughput path. This gives trace facts the read-after-write guarantee their
 foreign-key-like parent relation requires.
+
+`0.31.5.post14.dev10` completes the client half of that boundary when a caller
+explicitly flushes before enrichment. Remote `Run.flush()` now delivers queued
+metric records to the service instead of only checkpointing them in the local
+retry buffer, so an immediate trace-fact upsert cannot overtake a source trace
+that was flushed by a bridge.
 
 The contract is implemented in `trackio/trace_facts.py`, accepted on an
 initial `VerifiersTrace` write or through `Run.upsert_trace_facts`, persisted by

@@ -1312,9 +1312,35 @@ class Run:
         )
 
     def flush(self) -> None:
-        """Synchronously persist queued observation fragments before a dependent write."""
+        """Synchronously deliver queued metric observations before a dependent write.
 
-        self._flush_queues_inline()
+        Remote retries may checkpoint failed observations in local SQLite.  That
+        is appropriate for ordinary telemetry, but a caller that immediately
+        writes a fact keyed to a native trace needs the parent trace to be
+        visible at the server, not merely durable on the producer host.
+        """
+
+        if self._is_local:
+            self._flush_queues_inline()
+            return
+        self._wait_for_client_ready()
+        with self._client_lock:
+            if self._client is None:
+                raise RuntimeError("trackio remote client is not available")
+            if self._queued_logs:
+                logs_to_send = self._queued_logs.copy()
+                self._queued_logs.clear()
+                try:
+                    self._client.predict(
+                        api_name="/bulk_log",
+                        logs=logs_to_send,
+                        hf_token=self._hf_token_for_remote(),
+                    )
+                except Exception:
+                    self._queued_logs[0:0] = logs_to_send
+                    raise
+            if self._has_local_buffer and not self._flush_local_buffer():
+                raise RuntimeError("Trackio buffered observations could not be delivered")
 
     def _artifact_log_with_retry(self, **kwargs) -> dict:
         manifest = kwargs.get("manifest", [])
