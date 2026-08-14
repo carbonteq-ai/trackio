@@ -7,6 +7,7 @@ import pytest
 from trackio.doris_migration import (
     AUTHORITATIVE_TABLES,
     _records_evidence,
+    _source_inclusion_evidence,
     _target_evidence,
     inspect_sqlite_project,
     migrate_sqlite_to_doris,
@@ -159,6 +160,37 @@ def test_canonical_evidence_detects_same_count_different_content():
 
     assert first_evidence["metrics"]["count"] == second_evidence["metrics"]["count"]
     assert first_evidence["metrics"]["sha256"] != second_evidence["metrics"]["sha256"]
+
+
+def test_source_inclusion_accepts_target_history_but_rejects_missing_source_rows():
+    source = {
+        table: ([{"run_id": "source-run", "value": 1}] if table == "metrics" else [])
+        for table in AUTHORITATIVE_TABLES
+    }
+    target = {
+        table: (
+            [
+                {"run_id": "source-run", "value": 1},
+                {"run_id": "later-run", "value": 2},
+            ]
+            if table == "metrics"
+            else []
+        )
+        for table in AUTHORITATIVE_TABLES
+    }
+
+    evidence, mismatches = _source_inclusion_evidence(source, target)
+
+    assert evidence["metrics"] == {
+        "source_count": 1,
+        "target_count": 2,
+        "matched_count": 1,
+        "missing_count": 0,
+    }
+    assert mismatches == {}
+
+    _, missing = _source_inclusion_evidence(source, {table: [] for table in AUTHORITATIVE_TABLES})
+    assert missing["metrics"]["missing_count"] == 1
 
 
 def test_target_verification_connection_never_initializes_schema(monkeypatch):

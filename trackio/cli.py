@@ -205,6 +205,7 @@ def _handle_storage_migrate(args) -> None:
             verify_only=args.verify_only,
             projects=tuple(args.project or ()),
             batch_size=args.batch_size,
+            verification_mode=args.verification_mode,
         )
     except (FileNotFoundError, RuntimeError, ValueError) as error:
         error_exit(str(error))
@@ -602,6 +603,16 @@ def main():
         type=int,
         default=500,
         help="Maximum evidence rows per Doris write batch.",
+    )
+    storage_migrate_parser.add_argument(
+        "--verification-mode",
+        choices=("exact", "source-inclusion"),
+        default="exact",
+        help=(
+            "Require exact project equality (default), or prove that every "
+            "SQLite logical record is present when Doris already contains "
+            "additional retained history."
+        ),
     )
     mode = storage_migrate_parser.add_mutually_exclusive_group()
     mode.add_argument(

@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev4`.
+working candidate is `0.31.5.post14.dev5`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -104,7 +104,7 @@ returns only those safe scalar summaries. This repairs historical Observatory
 rows whose full detail had timing and token evidence while their paged summary
 showed it as missing.
 
-## Trace-facts candidate (`0.31.5.post14.dev4`)
+## Trace-facts candidate (`0.31.5.post14.dev5`)
 
 This candidate adds a generic, typed trace-facts projection for native
 Verifiers traces. The full native record remains in `traces.payload` as replay
@@ -140,6 +140,13 @@ candidate includes an explicit backup-gated `trackio storage migrate-doris`
 command and requires coordinated server deployment; an old server is not
 compatible with a migrated database. This deliberately replaces a
 per-capability compatibility layer.
+
+The migration importer defaults to exact logical-project reconciliation for a
+new target. A coordinated recovery cutover may explicitly choose
+`--verification-mode source-inclusion`: it proves every stopped SQLite logical
+record is present while allowing an existing Doris project to retain additional
+valid history. Run-bound tables are queried only for source run IDs in bounded
+chunks, so this verification does not scan unrelated retained runs.
 
 No fork workflow builds or publishes releases. A maintainer builds and checks
 the candidate locally, commits and pushes the exact source, creates an

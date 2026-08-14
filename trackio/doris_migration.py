@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,6 +28,10 @@ AUTHORITATIVE_TABLES = (
     "artifact_versions",
     "artifact_aliases",
     "run_artifact_links",
+)
+
+_RUN_SCOPED_TABLES = frozenset(
+    {"metrics", "configs", "system_metrics", "traces", "alerts"}
 )
 
 
@@ -83,6 +87,41 @@ def _records_evidence(
         table: _canonical_evidence(records.get(table, []))
         for table in AUTHORITATIVE_TABLES
     }
+
+
+def _record_digest(record: dict[str, Any]) -> bytes:
+    """Return a logical-record digest independent of storage-specific ids."""
+
+    return hashlib.sha256(orjson.dumps(record, option=orjson.OPT_SORT_KEYS)).digest()
+
+
+def _source_inclusion_evidence(
+    source: dict[str, list[dict[str, Any]]],
+    target: dict[str, list[dict[str, Any]]],
+) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, Any]]]:
+    """Prove source logical records exist in a target that may be a superset."""
+
+    evidence: dict[str, dict[str, int]] = {}
+    mismatches: dict[str, dict[str, Any]] = {}
+    for table in AUTHORITATIVE_TABLES:
+        source_counter = Counter(_record_digest(record) for record in source.get(table, []))
+        target_counter = Counter(_record_digest(record) for record in target.get(table, []))
+        missing = source_counter - target_counter
+        source_count = sum(source_counter.values())
+        missing_count = sum(missing.values())
+        evidence[table] = {
+            "source_count": source_count,
+            "target_count": sum(target_counter.values()),
+            "matched_count": source_count - missing_count,
+            "missing_count": missing_count,
+        }
+        if missing_count:
+            mismatches[table] = {
+                "source": _canonical_evidence(source.get(table, [])),
+                "target_count": sum(target_counter.values()),
+                "missing_count": missing_count,
+            }
+    return evidence, mismatches
 
 
 @contextmanager
@@ -464,10 +503,26 @@ def _migrate_project(
 def _target_records(
     cursor: Any,
     project: str,
+    *,
+    run_ids: tuple[str, ...] = (),
 ) -> dict[str, list[dict[str, Any]]]:
     def rows(table: str) -> list[dict[str, Any]]:
-        cursor.execute(f"SELECT * FROM {table} WHERE project_id = %s", (project,))
-        return list(cursor.fetchall())
+        if table not in _RUN_SCOPED_TABLES or not run_ids:
+            cursor.execute(f"SELECT * FROM {table} WHERE project_id = %s", (project,))
+            return list(cursor.fetchall())
+        result: list[dict[str, Any]] = []
+        # Keep each request bounded. This avoids scanning an entire populated
+        # project during a recovery cutover while also avoiding oversized IN
+        # clauses for sources with many historical runs.
+        for start in range(0, len(run_ids), 500):
+            batch = run_ids[start : start + 500]
+            placeholders = ", ".join("%s" for _ in batch)
+            cursor.execute(
+                f"SELECT * FROM {table} WHERE project_id = %s AND run_id IN ({placeholders})",
+                (project, *batch),
+            )
+            result.extend(cursor.fetchall())
+        return result
 
     metrics = [
         {
@@ -645,6 +700,42 @@ def _target_evidence(project: str) -> dict[str, dict[str, Any]]:
         return _records_evidence(_target_records(cursor, project))
 
 
+def _target_source_inclusion(
+    project: str,
+    source_records: dict[str, list[dict[str, Any]]],
+) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, Any]]]:
+    run_ids = tuple(
+        sorted(
+            {
+                str(record["run_id"])
+                for table in _RUN_SCOPED_TABLES
+                for record in source_records.get(table, [])
+                if record.get("run_id") is not None
+            }
+        )
+    )
+    # Verification is deliberately non-initializing: a missing database or
+    # schema is a failed verification, not permission to create remote state.
+    with (
+        DorisStorage._connection(initialize=False) as connection,
+        connection.cursor() as cursor,
+    ):
+        target = _target_records(cursor, project, run_ids=run_ids)
+    return _source_inclusion_evidence(source_records, target)
+
+
+def _source_records_from_snapshot(snapshot: Path) -> dict[str, list[dict[str, Any]]]:
+    connection = sqlite3.connect(
+        f"{snapshot.resolve().as_uri()}?mode=ro&immutable=1",
+        uri=True,
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        return _source_records(connection)
+    finally:
+        connection.close()
+
+
 def migrate_sqlite_to_doris(
     source: Path,
     receipt_path: Path,
@@ -653,9 +744,12 @@ def migrate_sqlite_to_doris(
     verify_only: bool = False,
     projects: tuple[str, ...] = (),
     batch_size: int = 500,
+    verification_mode: str = "exact",
 ) -> dict[str, Any]:
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
+    if verification_mode not in {"exact", "source-inclusion"}:
+        raise ValueError("verification_mode must be 'exact' or 'source-inclusion'")
     candidates = (
         [source]
         if source.is_file()
@@ -680,16 +774,24 @@ def migrate_sqlite_to_doris(
             if not dry_run and not verify_only:
                 DorisStorage.initialize()
                 migrated = _migrate_project(snapshot, db_path.stem, batch_size)
-            target = {} if dry_run else _target_evidence(db_path.stem)
-            expected = source_info["evidence"]
-            mismatches = {
-                table: {
-                    "source": expected[table],
-                    "target": target.get(table),
+            if dry_run:
+                target: dict[str, Any] = {}
+                mismatches: dict[str, dict[str, Any]] = {}
+            elif verification_mode == "exact":
+                target = _target_evidence(db_path.stem)
+                expected = source_info["evidence"]
+                mismatches = {
+                    table: {
+                        "source": expected[table],
+                        "target": target.get(table),
+                    }
+                    for table in AUTHORITATIVE_TABLES
+                    if expected[table] != target.get(table)
                 }
-                for table in AUTHORITATIVE_TABLES
-                if not dry_run and expected[table] != target.get(table)
-            }
+            else:
+                target, mismatches = _target_source_inclusion(
+                    db_path.stem, _source_records_from_snapshot(snapshot)
+                )
             results.append(
                 {
                     "source": source_info,
@@ -707,6 +809,7 @@ def migrate_sqlite_to_doris(
         "dry_run": dry_run,
         "verify_only": verify_only,
         "batch_size": batch_size,
+        "verification_mode": verification_mode,
         "projects": results,
         "verified": not dry_run and all(result["verified"] for result in results),
     }
