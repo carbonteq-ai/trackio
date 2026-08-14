@@ -1602,37 +1602,105 @@ class DorisStorage:
                 raise KeyError(f"run {run!r} does not exist")
             placeholders = ", ".join(["%s"] * len(updates))
             cursor.execute(
-                f"""SELECT trace_id, trace_type, external_id FROM traces
+                f"""SELECT trace_id, run_id, trace_type, external_id, fact_projection_id FROM traces
                     WHERE project_id=%s AND run_id=%s AND external_id IN ({placeholders})""",
                 (project, resolved, *(update.external_id for update in updates)),
             )
-            trace_ids = {
-                (str(row["trace_type"]), str(row["external_id"])): str(row["trace_id"])
+            traces = {
+                (str(row["trace_type"]), str(row["external_id"])): row
                 for row in cursor.fetchall()
             }
             missing = next(
                 (
                     update.external_id
                     for update in updates
-                    if (update.trace_type, update.external_id) not in trace_ids
+                    if (update.trace_type, update.external_id) not in traces
                 ),
                 None,
             )
             if missing is not None:
                 raise KeyError(f"trace {missing!r} does not exist")
-            return [
-                TraceFactWriteReceipt(
-                    trace_ids[(update.trace_type, update.external_id)],
-                    update.projection_id,
-                    cls._upsert_trace_facts_cursor(
-                        cursor,
-                        project,
-                        trace_ids[(update.trace_type, update.external_id)],
-                        update,
-                    ),
-                )
+            # Historical source projections have no prior projection.  Apply
+            # those rows with set-oriented statements so a page does not make
+            # a Doris round trip for every trace.  Existing/replaced
+            # projections retain the conservative single-row transition below.
+            fresh = [
+                update
                 for update in updates
+                if update.replace_reward_components
+                and traces[(update.trace_type, update.external_id)].get("fact_projection_id") is None
             ]
+            if fresh:
+                component_rows = [
+                    (
+                        project,
+                        str(traces[(update.trace_type, update.external_id)]["trace_id"]),
+                        str(traces[(update.trace_type, update.external_id)]["run_id"]),
+                        update.projection_id,
+                        component.name,
+                        component.contribution,
+                        component.score,
+                        component.weight,
+                        component.source_kind,
+                        component.source_id,
+                    )
+                    for update in fresh
+                    for component in update.reward_components
+                ]
+                if component_rows:
+                    cursor.executemany(
+                        """INSERT INTO trace_reward_components
+                           (project_id, trace_id, run_id, projection_id, name, contribution, score, weight, source_kind, source_id)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                        component_rows,
+                    )
+                cursor.executemany(
+                    """UPDATE traces SET fact_namespace=%s, fact_calculator_version=%s, fact_projection_id=%s,
+                       fact_state=%s, fact_calculated_at=%s, fact_dimensions=%s, fact_provenance=%s,
+                       fact_model=%s, fact_task_type=%s, fact_rollout_step=%s, fact_is_truncated=%s,
+                       fact_has_error=%s, fact_model_input_tokens=%s, fact_model_output_tokens=%s,
+                       fact_thinking_tokens=%s, fact_tool_calls=%s, fact_model_calls=%s,
+                       fact_trace_latency_ms=%s, fact_task_reward=%s
+                       WHERE project_id=%s AND trace_id=%s""",
+                    [
+                        (
+                            update.namespace,
+                            update.calculator_version,
+                            update.projection_id,
+                            update.state,
+                            update.calculated_at.isoformat(),
+                            _json(dict(update.dimensions)),
+                            _json(dict(update.provenance)),
+                            update.dimensions.get("model"),
+                            update.dimensions.get("task_type"),
+                            update.dimensions.get("rollout_step"),
+                            update.dimensions.get("is_truncated"),
+                            update.dimensions.get("has_error"),
+                            update.measures.get("model_input_tokens"),
+                            update.measures.get("model_output_tokens"),
+                            update.measures.get("thinking_tokens"),
+                            update.measures.get("tool_calls"),
+                            update.measures.get("model_calls"),
+                            update.measures.get("trace_latency_ms"),
+                            update.measures.get("task_reward"),
+                            project,
+                            str(traces[(update.trace_type, update.external_id)]["trace_id"]),
+                        )
+                        for update in fresh
+                    ],
+                )
+            fresh_keys = {(update.trace_type, update.external_id) for update in fresh}
+            receipts = []
+            for update in updates:
+                key = (update.trace_type, update.external_id)
+                trace_id = str(traces[key]["trace_id"])
+                applied = (
+                    True
+                    if key in fresh_keys
+                    else cls._upsert_trace_facts_cursor(cursor, project, trace_id, update)
+                )
+                receipts.append(TraceFactWriteReceipt(trace_id, update.projection_id, applied))
+            return receipts
 
     @classmethod
     def aggregate_trace_facts(
