@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MANAGED_TABLES = (
     "schema_versions",
     "metrics",
     "configs",
     "system_metrics",
     "traces",
+    "trace_reward_components",
     "alerts",
     "project_metadata",
     "artifacts",
@@ -54,6 +55,66 @@ def negotiate_schema(
             f"{recorded_version}; missing: {', '.join(sorted(missing))}"
         )
     return "ready"
+
+
+_TRACE_FACT_COLUMNS = (
+    "fact_namespace VARCHAR(128) NULL",
+    "fact_calculator_version VARCHAR(256) NULL",
+    "fact_projection_id VARCHAR(64) NULL",
+    "fact_state VARCHAR(32) NULL",
+    "fact_calculated_at VARCHAR(64) NULL",
+    "fact_dimensions STRING NULL",
+    "fact_provenance STRING NULL",
+    "fact_model VARCHAR(512) NULL",
+    "fact_task_type VARCHAR(512) NULL",
+    "fact_rollout_step BIGINT NULL",
+    "fact_is_truncated BOOLEAN NULL",
+    "fact_has_error BOOLEAN NULL",
+    "fact_model_input_tokens DOUBLE NULL",
+    "fact_model_output_tokens DOUBLE NULL",
+    "fact_thinking_tokens DOUBLE NULL",
+    "fact_tool_calls DOUBLE NULL",
+    "fact_model_calls DOUBLE NULL",
+    "fact_trace_latency_ms DOUBLE NULL",
+    "fact_task_reward DOUBLE NULL",
+    "fact_algorithm_reward DOUBLE NULL",
+    "fact_algorithm_projection_id VARCHAR(64) NULL",
+    "fact_algorithm_calculator_version VARCHAR(256) NULL",
+    "fact_algorithm_calculated_at VARCHAR(64) NULL",
+)
+
+
+def migration_statements(from_version: int, to_version: int, replication_num: int = 1) -> tuple[str, ...]:
+    """Return the explicit supported Doris database transition.
+
+    Startup deliberately refuses to apply this itself. Operators inspect and
+    apply the ordered statements as part of the coordinated Trackio upgrade.
+    """
+
+    if (from_version, to_version) != (1, 2):
+        raise ValueError(f"unsupported Trackio Doris migration {from_version} -> {to_version}")
+    properties = f'PROPERTIES ("replication_num" = "{replication_num}")'
+    component_table = f"""
+        CREATE TABLE IF NOT EXISTS trace_reward_components (
+            project_id VARCHAR(255) NOT NULL,
+            trace_id VARCHAR(768) NOT NULL,
+            run_id VARCHAR(255) NOT NULL,
+            projection_id VARCHAR(64) NOT NULL,
+            name VARCHAR(256) NOT NULL,
+            contribution DOUBLE NULL,
+            score DOUBLE NULL,
+            weight DOUBLE NULL,
+            source_kind VARCHAR(32) NOT NULL,
+            source_id VARCHAR(256) NULL
+        )
+        UNIQUE KEY(project_id, trace_id, projection_id, name)
+        DISTRIBUTED BY HASH(project_id, trace_id) BUCKETS 1
+        {properties}
+    """
+    return (
+        *(f"ALTER TABLE traces ADD COLUMN IF NOT EXISTS {column}" for column in _TRACE_FACT_COLUMNS),
+        component_table,
+    )
 
 
 def schema_statements(replication_num: int = 1) -> tuple[str, ...]:
@@ -130,9 +191,49 @@ def schema_statements(replication_num: int = 1) -> tuple[str, ...]:
             trace_type VARCHAR(64) NOT NULL,
             external_id VARCHAR(768) NULL,
             schema_version INT NULL,
-            payload STRING NULL
+            payload STRING NULL,
+            fact_namespace VARCHAR(128) NULL,
+            fact_calculator_version VARCHAR(256) NULL,
+            fact_projection_id VARCHAR(64) NULL,
+            fact_state VARCHAR(32) NULL,
+            fact_calculated_at VARCHAR(64) NULL,
+            fact_dimensions STRING NULL,
+            fact_provenance STRING NULL,
+            fact_model VARCHAR(512) NULL,
+            fact_task_type VARCHAR(512) NULL,
+            fact_rollout_step BIGINT NULL,
+            fact_is_truncated BOOLEAN NULL,
+            fact_has_error BOOLEAN NULL,
+            fact_model_input_tokens DOUBLE NULL,
+            fact_model_output_tokens DOUBLE NULL,
+            fact_thinking_tokens DOUBLE NULL,
+            fact_tool_calls DOUBLE NULL,
+            fact_model_calls DOUBLE NULL,
+            fact_trace_latency_ms DOUBLE NULL,
+            fact_task_reward DOUBLE NULL,
+            fact_algorithm_reward DOUBLE NULL,
+            fact_algorithm_projection_id VARCHAR(64) NULL,
+            fact_algorithm_calculator_version VARCHAR(256) NULL,
+            fact_algorithm_calculated_at VARCHAR(64) NULL
         )
         UNIQUE KEY(project_id, trace_id)
+        DISTRIBUTED BY HASH(project_id, trace_id) BUCKETS 1
+        {properties}
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS trace_reward_components (
+            project_id VARCHAR(255) NOT NULL,
+            trace_id VARCHAR(768) NOT NULL,
+            run_id VARCHAR(255) NOT NULL,
+            projection_id VARCHAR(64) NOT NULL,
+            name VARCHAR(256) NOT NULL,
+            contribution DOUBLE NULL,
+            score DOUBLE NULL,
+            weight DOUBLE NULL,
+            source_kind VARCHAR(32) NOT NULL,
+            source_id VARCHAR(256) NULL
+        )
+        UNIQUE KEY(project_id, trace_id, projection_id, name)
         DISTRIBUTED BY HASH(project_id, trace_id) BUCKETS 1
         {properties}
         """,

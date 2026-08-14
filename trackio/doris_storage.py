@@ -29,6 +29,13 @@ from trackio.dummy_commit_scheduler import DummyCommitScheduler
 from trackio.lifecycle import lifecycle_row
 from trackio.purge import manifest_blob_digests
 from trackio.sqlite_storage import SQLiteStorage
+from trackio.trace_facts import (
+    TraceAggregateBucket,
+    TraceAggregateResult,
+    TraceFactsQuery,
+    TraceFactUpdate,
+    TraceFactWriteReceipt,
+)
 from trackio.utils import (
     deserialize_values,
     project_artifacts_dir,
@@ -613,6 +620,15 @@ class DorisStorage:
                         for row in trace_rows
                     ],
                 )
+                for row in trace_rows:
+                    raw_facts = row.get("trace_facts")
+                    if isinstance(raw_facts, dict):
+                        cls._upsert_trace_facts_cursor(
+                            cursor,
+                            project,
+                            row["id"],
+                            TraceFactUpdate.from_payload(raw_facts),
+                        )
             if config:
                 cursor.execute(
                     """
@@ -1434,6 +1450,136 @@ class DorisStorage:
                 }
                 for row in cursor.fetchall()
             ]
+
+    @classmethod
+    def _upsert_trace_facts_cursor(
+        cls,
+        cursor: DictCursor,
+        project: str,
+        trace_id: str,
+        update: TraceFactUpdate,
+    ) -> bool:
+        cursor.execute(
+            """SELECT run_id, fact_projection_id, fact_algorithm_projection_id
+               FROM traces WHERE project_id = %s AND trace_id = %s""",
+            (project, trace_id),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise KeyError(f"trace {trace_id!r} does not exist")
+        projection_column = "fact_projection_id" if update.replace_reward_components else "fact_algorithm_projection_id"
+        dimensions = dict(update.dimensions)
+        measures = dict(update.measures)
+        if not update.replace_reward_components:
+            if row[projection_column] == update.projection_id:
+                return False
+            cursor.execute(
+                """UPDATE traces SET fact_algorithm_reward=%s, fact_algorithm_projection_id=%s,
+                   fact_algorithm_calculator_version=%s, fact_algorithm_calculated_at=%s
+                   WHERE project_id=%s AND trace_id=%s""",
+                (
+                    measures["algorithm_reward"],
+                    update.projection_id,
+                    update.calculator_version,
+                    update.calculated_at.isoformat(),
+                    project,
+                    trace_id,
+                ),
+            )
+            return True
+        if update.reward_components:
+            cursor.executemany(
+                """INSERT INTO trace_reward_components
+                   (project_id, trace_id, run_id, projection_id, name, contribution, score, weight, source_kind, source_id)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                [
+                    (project, trace_id, row["run_id"], update.projection_id, item.name, item.contribution, item.score,
+                     item.weight, item.source_kind, item.source_id)
+                    for item in update.reward_components
+                ],
+            )
+        applied = row[projection_column] != update.projection_id
+        if applied:
+            cursor.execute(
+                """UPDATE traces SET fact_namespace=%s, fact_calculator_version=%s, fact_projection_id=%s,
+               fact_state=%s, fact_calculated_at=%s, fact_dimensions=%s, fact_provenance=%s,
+               fact_model=%s, fact_task_type=%s, fact_rollout_step=%s, fact_is_truncated=%s,
+               fact_has_error=%s, fact_model_input_tokens=%s, fact_model_output_tokens=%s,
+               fact_thinking_tokens=%s, fact_tool_calls=%s, fact_model_calls=%s,
+               fact_trace_latency_ms=%s, fact_task_reward=%s
+               WHERE project_id=%s AND trace_id=%s""",
+                (
+                    update.namespace, update.calculator_version, update.projection_id, update.state,
+                    update.calculated_at.isoformat(), _json(dimensions), _json(dict(update.provenance)),
+                    dimensions.get("model"), dimensions.get("task_type"), dimensions.get("rollout_step"),
+                    dimensions.get("is_truncated"), dimensions.get("has_error"),
+                    measures.get("model_input_tokens"), measures.get("model_output_tokens"),
+                    measures.get("thinking_tokens"), measures.get("tool_calls"), measures.get("model_calls"),
+                    measures.get("trace_latency_ms"), measures.get("task_reward"),
+                    project, trace_id,
+                ),
+            )
+        cursor.execute(
+            """DELETE FROM trace_reward_components
+               WHERE project_id = %s AND trace_id = %s AND projection_id <> %s""",
+            (project, trace_id, update.projection_id),
+        )
+        return applied
+
+    @classmethod
+    def upsert_trace_facts(
+        cls, project: str, run: str, update: TraceFactUpdate, *, run_id: str | None = None
+    ) -> TraceFactWriteReceipt:
+        with cls._connection() as connection, connection.cursor() as cursor:
+            resolved = cls._resolve_run_id(cursor, project, run, run_id, table="traces")
+            if resolved is None:
+                raise KeyError(f"run {run!r} does not exist")
+            cursor.execute(
+                """SELECT trace_id FROM traces WHERE project_id=%s AND run_id=%s
+                   AND trace_type=%s AND external_id=%s""",
+                (project, resolved, update.trace_type, update.external_id),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise KeyError(f"trace {update.external_id!r} does not exist")
+            applied = cls._upsert_trace_facts_cursor(cursor, project, row["trace_id"], update)
+            return TraceFactWriteReceipt(row["trace_id"], update.projection_id, applied)
+
+    @classmethod
+    def aggregate_trace_facts(
+        cls, project: str, run: str, query: TraceFactsQuery, *, run_id: str | None = None
+    ) -> TraceAggregateResult:
+        columns = {
+            "model": "fact_model", "task_type": "fact_task_type", "rollout_step": "fact_rollout_step",
+            "is_truncated": "fact_is_truncated", "has_error": "fact_has_error",
+        }
+        if any(name not in columns for name in (*query.group_by, *query.dimensions)):
+            raise ValueError("requested dimension is not materialized for aggregation")
+        with cls._connection() as connection, connection.cursor() as cursor:
+            resolved = cls._resolve_run_id(cursor, project, run, run_id, table="traces")
+            if resolved is None:
+                return TraceAggregateResult(())
+            where, params = ["project_id=%s", "run_id=%s", "trace_type=%s", "fact_projection_id IS NOT NULL"], [project, resolved, query.trace_type]
+            for name, expected in query.dimensions.items():
+                where.append(f"{columns[name]} <=> %s")
+                params.append(expected)
+            grouped = [columns[name] for name in query.group_by]
+            select = [f"{columns[name]} AS {name}" for name in query.group_by] + ["COUNT(*) AS trace_count"]
+            for item in query.aggregates:
+                key, field = f"{item.operation}_{item.measure}", f"fact_{item.measure}"
+                expression = {"mean": "AVG", "sum": "SUM", "count": "COUNT", "min": "MIN", "max": "MAX"}[item.operation]
+                select.extend((f"{expression}({field}) AS {key}", f"COUNT({field}) AS coverage_{key}"))
+            sql = f"SELECT {', '.join(select)} FROM traces WHERE {' AND '.join(where)}"
+            if grouped:
+                sql += f" GROUP BY {', '.join(grouped)}"
+            cursor.execute(sql, params)
+            return TraceAggregateResult(tuple(
+                TraceAggregateBucket(
+                    {name: row[name] for name in query.group_by}, int(row["trace_count"]),
+                    {f"{item.operation}_{item.measure}": row[f"{item.operation}_{item.measure}"] for item in query.aggregates},
+                    {f"{item.operation}_{item.measure}": row[f"coverage_{item.operation}_{item.measure}"] for item in query.aggregates},
+                ) for row in cursor.fetchall()
+            ))
 
     @classmethod
     def get_traces(

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from trackio.media import TrackioMedia
+from trackio.trace_facts import TraceFactUpdate
 
 
 class Trace:
@@ -65,6 +66,7 @@ class VerifiersTrace(Trace):
         record: Any,
         messages: list[dict[str, Any]] | None = None,
         metadata: dict | None = None,
+        trace_facts: TraceFactUpdate | None = None,
     ):
         native = self._record_mapping(record)
         trace_id = native.get("id")
@@ -80,6 +82,10 @@ class VerifiersTrace(Trace):
         self.record = native
         self.trace_id = trace_id
         self.schema_version = schema_version
+        if trace_facts is not None:
+            if trace_facts.trace_type != "verifiers" or trace_facts.external_id != trace_id:
+                raise TypeError("Verifiers trace facts must target this Verifiers trace identity.")
+        self.trace_facts = trace_facts
 
     @staticmethod
     def _record_mapping(record: Any) -> dict[str, Any]:
@@ -160,7 +166,7 @@ class VerifiersTrace(Trace):
         }
 
     def _to_dict(self, project: str, run: str, step: int = 0) -> dict[str, Any]:
-        return {
+        payload = {
             "_type": self.TYPE,
             "external_id": self.trace_id,
             "schema_version": self.schema_version,
@@ -168,3 +174,6 @@ class VerifiersTrace(Trace):
             "metadata": self._serialize_nested_value(self.metadata, project, run, step),
             "payload": self._serialize_nested_value(self.record, project, run, step),
         }
+        if self.trace_facts is not None:
+            payload["trace_facts"] = self.trace_facts.payload()
+        return payload

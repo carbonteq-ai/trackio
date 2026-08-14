@@ -32,6 +32,13 @@ from trackio.commit_scheduler import CommitScheduler
 from trackio.dummy_commit_scheduler import DummyCommitScheduler
 from trackio.lifecycle import lifecycle_row
 from trackio.purge import manifest_blob_digests
+from trackio.trace_facts import (
+    TraceAggregateBucket,
+    TraceAggregateResult,
+    TraceFactsQuery,
+    TraceFactUpdate,
+    TraceFactWriteReceipt,
+)
 from trackio.typehints import (
     ARTIFACT_BLOB_UPLOAD_KIND,
     MEDIA_UPLOAD_KIND,
@@ -579,7 +586,47 @@ class SQLiteStorage:
                         trace_type TEXT NOT NULL DEFAULT 'trackio',
                         external_id TEXT,
                         schema_version INTEGER,
-                        payload TEXT
+                        payload TEXT,
+                        fact_namespace TEXT,
+                        fact_calculator_version TEXT,
+                        fact_projection_id TEXT,
+                        fact_state TEXT,
+                        fact_calculated_at TEXT,
+                        fact_dimensions TEXT,
+                        fact_provenance TEXT,
+                        fact_model TEXT,
+                        fact_task_type TEXT,
+                        fact_rollout_step INTEGER,
+                        fact_is_truncated INTEGER,
+                        fact_has_error INTEGER,
+                        fact_model_input_tokens REAL,
+                        fact_model_output_tokens REAL,
+                        fact_thinking_tokens REAL,
+                        fact_tool_calls REAL,
+                        fact_model_calls REAL,
+                        fact_trace_latency_ms REAL,
+                        fact_task_reward REAL,
+                        fact_algorithm_reward REAL,
+                        fact_algorithm_projection_id TEXT,
+                        fact_algorithm_calculator_version TEXT,
+                        fact_algorithm_calculated_at TEXT
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS trace_reward_components (
+                        trace_id TEXT NOT NULL,
+                        run_id TEXT NOT NULL,
+                        projection_id TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        contribution REAL,
+                        score REAL,
+                        weight REAL,
+                        source_kind TEXT NOT NULL,
+                        source_id TEXT,
+                        PRIMARY KEY(trace_id, projection_id, name),
+                        FOREIGN KEY(trace_id) REFERENCES traces(id) ON DELETE CASCADE
                     )
                     """
                 )
@@ -757,6 +804,29 @@ class SQLiteStorage:
                     "external_id TEXT",
                     "schema_version INTEGER",
                     "payload TEXT",
+                    "fact_namespace TEXT",
+                    "fact_calculator_version TEXT",
+                    "fact_projection_id TEXT",
+                    "fact_state TEXT",
+                    "fact_calculated_at TEXT",
+                    "fact_dimensions TEXT",
+                    "fact_provenance TEXT",
+                    "fact_model TEXT",
+                    "fact_task_type TEXT",
+                    "fact_rollout_step INTEGER",
+                    "fact_is_truncated INTEGER",
+                    "fact_has_error INTEGER",
+                    "fact_model_input_tokens REAL",
+                    "fact_model_output_tokens REAL",
+                    "fact_thinking_tokens REAL",
+                    "fact_tool_calls REAL",
+                    "fact_model_calls REAL",
+                    "fact_trace_latency_ms REAL",
+                    "fact_task_reward REAL",
+                    "fact_algorithm_reward REAL",
+                    "fact_algorithm_projection_id TEXT",
+                    "fact_algorithm_calculator_version TEXT",
+                    "fact_algorithm_calculated_at TEXT",
                 ):
                     try:
                         cursor.execute(f"ALTER TABLE traces ADD COLUMN {col}")
@@ -766,6 +836,14 @@ class SQLiteStorage:
                     """CREATE UNIQUE INDEX IF NOT EXISTS idx_traces_external_id
                     ON traces(run_id, trace_type, external_id)
                     WHERE external_id IS NOT NULL"""
+                )
+                cursor.execute(
+                    """CREATE INDEX IF NOT EXISTS idx_trace_facts_rollout_step
+                    ON traces(run_id, trace_type, fact_rollout_step)"""
+                )
+                cursor.execute(
+                    """CREATE INDEX IF NOT EXISTS idx_trace_reward_components_current
+                    ON trace_reward_components(trace_id, projection_id)"""
                 )
                 alerts_cols = SQLiteStorage._table_columns(conn, "alerts")
                 alerts_run_key = "run_id" if "run_id" in alerts_cols else "run_name"
@@ -2584,6 +2662,7 @@ class SQLiteStorage:
                     "external_id": external_id,
                     "schema_version": trace.get("schema_version"),
                     "payload": trace.get("payload"),
+                    "trace_facts": trace.get("trace_facts"),
                 }
                 trace_record["search_text"] = (
                     f"{trace_record['id']} {key} "
@@ -2627,6 +2706,12 @@ class SQLiteStorage:
                 for row in trace_rows
             ],
         )
+        for row in trace_rows:
+            raw_facts = row.get("trace_facts")
+            if not isinstance(raw_facts, dict):
+                continue
+            update = TraceFactUpdate.from_payload(raw_facts)
+            SQLiteStorage._upsert_trace_facts_cursor(cursor, row["id"], update)
 
     @staticmethod
     def _flatten_trace_search_text(trace: dict[str, Any]) -> str:
@@ -2717,6 +2802,129 @@ class SQLiteStorage:
         return sorted(
             traces, key=lambda trace: trace.get("timestamp") or "", reverse=True
         )
+
+    @staticmethod
+    def _upsert_trace_facts_cursor(cursor: sqlite3.Cursor, trace_id: str, update: TraceFactUpdate) -> bool:
+        dimensions = dict(update.dimensions)
+        measures = dict(update.measures)
+        cursor.execute(
+            "SELECT run_id, fact_projection_id, fact_algorithm_projection_id FROM traces WHERE id = ?",
+            (trace_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise KeyError(f"trace {trace_id!r} does not exist")
+        projection_column = "fact_projection_id" if update.replace_reward_components else "fact_algorithm_projection_id"
+        if row[projection_column] == update.projection_id:
+            return False
+        if not update.replace_reward_components:
+            cursor.execute(
+                """UPDATE traces SET fact_algorithm_reward=?, fact_algorithm_projection_id=?,
+                   fact_algorithm_calculator_version=?, fact_algorithm_calculated_at=? WHERE id=?""",
+                (
+                    measures["algorithm_reward"],
+                    update.projection_id,
+                    update.calculator_version,
+                    update.calculated_at.isoformat(),
+                    trace_id,
+                ),
+            )
+            return True
+        cursor.execute(
+            """UPDATE traces SET fact_namespace=?, fact_calculator_version=?, fact_projection_id=?,
+               fact_state=?, fact_calculated_at=?, fact_dimensions=?, fact_provenance=?, fact_model=?,
+               fact_task_type=?, fact_rollout_step=?, fact_is_truncated=?, fact_has_error=?,
+               fact_model_input_tokens=?, fact_model_output_tokens=?, fact_thinking_tokens=?,
+               fact_tool_calls=?, fact_model_calls=?, fact_trace_latency_ms=?, fact_task_reward=? WHERE id=?""",
+            (
+                update.namespace, update.calculator_version, update.projection_id, update.state,
+                update.calculated_at.isoformat(), orjson.dumps(dimensions), orjson.dumps(dict(update.provenance)),
+                dimensions.get("model"), dimensions.get("task_type"), dimensions.get("rollout_step"),
+                int(dimensions["is_truncated"]) if dimensions.get("is_truncated") is not None else None,
+                int(dimensions["has_error"]) if dimensions.get("has_error") is not None else None,
+                measures.get("model_input_tokens"), measures.get("model_output_tokens"),
+                measures.get("thinking_tokens"), measures.get("tool_calls"), measures.get("model_calls"),
+                measures.get("trace_latency_ms"), measures.get("task_reward"), trace_id,
+            ),
+        )
+        cursor.execute("DELETE FROM trace_reward_components WHERE trace_id = ?", (trace_id,))
+        cursor.executemany(
+            """INSERT INTO trace_reward_components
+               (trace_id, run_id, projection_id, name, contribution, score, weight, source_kind, source_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (trace_id, row["run_id"], update.projection_id, item.name, item.contribution, item.score, item.weight,
+                 item.source_kind, item.source_id)
+                for item in update.reward_components
+            ],
+        )
+        return True
+
+    @staticmethod
+    def upsert_trace_facts(
+        project: str, run: str, update: TraceFactUpdate, *, run_id: str | None = None
+    ) -> TraceFactWriteReceipt:
+        db_path = SQLiteStorage.init_db(project)
+        with SQLiteStorage._get_process_lock(project), SQLiteStorage._get_connection(db_path) as conn:
+            identity = SQLiteStorage._resolve_run_identity(conn, run_name=run, run_id=run_id, table="traces")
+            if identity is None:
+                raise KeyError(f"run {run!r} does not exist")
+            column, value = identity
+            cursor = conn.cursor()
+            cursor.execute(
+                f"SELECT id FROM traces WHERE {column} = ? AND trace_type = ? AND external_id = ?",
+                (value, update.trace_type, update.external_id),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise KeyError(f"trace {update.external_id!r} does not exist")
+            applied = SQLiteStorage._upsert_trace_facts_cursor(cursor, row["id"], update)
+            conn.commit()
+            return TraceFactWriteReceipt(row["id"], update.projection_id, applied)
+
+    @staticmethod
+    def aggregate_trace_facts(
+        project: str, run: str, query: TraceFactsQuery, *, run_id: str | None = None
+    ) -> TraceAggregateResult:
+        columns = {
+            "model": "fact_model", "task_type": "fact_task_type", "rollout_step": "fact_rollout_step",
+            "is_truncated": "fact_is_truncated", "has_error": "fact_has_error",
+        }
+        if any(name not in columns for name in (*query.group_by, *query.dimensions)):
+            raise ValueError("requested dimension is not materialized for aggregation")
+        db_path = SQLiteStorage.get_project_db_path(project)
+        if not db_path.exists():
+            return TraceAggregateResult(())
+        with SQLiteStorage._get_connection(db_path) as conn:
+            identity = SQLiteStorage._resolve_run_identity(conn, run_name=run, run_id=run_id, table="traces")
+            if identity is None:
+                return TraceAggregateResult(())
+            run_column, run_value = identity
+            where, params = [f"{run_column} = ?", "trace_type = ?", "fact_projection_id IS NOT NULL"], [run_value, query.trace_type]
+            for name, expected in query.dimensions.items():
+                where.append(f"{columns[name]} IS ?")
+                params.append(expected)
+            grouped = [columns[name] for name in query.group_by]
+            select = [f"{columns[name]} AS {name}" for name in query.group_by] + ["COUNT(*) AS trace_count"]
+            for item in query.aggregates:
+                key, field = f"{item.operation}_{item.measure}", f"fact_{item.measure}"
+                select += [
+                    f"{ {'mean': 'AVG', 'sum': 'SUM', 'count': 'COUNT', 'min': 'MIN', 'max': 'MAX'}[item.operation]}({field}) AS {key}",
+                    f"COUNT({field}) AS coverage_{key}",
+                ]
+            sql = f"SELECT {', '.join(select)} FROM traces WHERE {' AND '.join(where)}"
+            if grouped:
+                sql += f" GROUP BY {', '.join(grouped)}"
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
+            return TraceAggregateResult(tuple(
+                TraceAggregateBucket(
+                    {name: row[name] for name in query.group_by}, int(row["trace_count"]),
+                    {f"{item.operation}_{item.measure}": row[f"{item.operation}_{item.measure}"] for item in query.aggregates},
+                    {f"{item.operation}_{item.measure}": row[f"coverage_{item.operation}_{item.measure}"] for item in query.aggregates},
+                )
+                for row in cursor.fetchall()
+            ))
 
     @staticmethod
     def get_traces(

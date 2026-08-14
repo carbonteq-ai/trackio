@@ -47,6 +47,15 @@ from trackio.server import TrackioDashboardApp, build_starlette_app_only
 from trackio.sqlite_storage import SQLiteStorage
 from trackio.table import Table
 from trackio.trace import Trace, VerifiersTrace
+from trackio.trace_facts import (
+    TraceAggregate,
+    TraceAggregateBucket,
+    TraceAggregateResult,
+    TraceFactsQuery,
+    TraceFactUpdate,
+    TraceFactWriteReceipt,
+    TraceRewardComponent,
+)
 from trackio.typehints import UploadEntry
 from trackio.utils import TRACKIO_DIR, TRACKIO_LOGO_DIR, _emit_nonfatal_warning
 
@@ -86,6 +95,13 @@ __all__ = [
     "Table",
     "Trace",
     "VerifiersTrace",
+    "TraceFactUpdate",
+    "TraceFactWriteReceipt",
+    "TraceFactsQuery",
+    "TraceAggregate",
+    "TraceAggregateBucket",
+    "TraceAggregateResult",
+    "TraceRewardComponent",
     "Histogram",
     "Markdown",
     "Api",

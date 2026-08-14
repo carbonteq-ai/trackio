@@ -2,6 +2,13 @@ from typing import Any, Iterator, Sequence
 
 from trackio.remote_client import RemoteClient
 from trackio.sqlite_storage import SQLiteStorage
+from trackio.trace_facts import (
+    TraceAggregateBucket,
+    TraceAggregateResult,
+    TraceFactsQuery,
+    TraceFactUpdate,
+    TraceFactWriteReceipt,
+)
 
 
 class Run:
@@ -281,6 +288,37 @@ class Run:
             run_id=self.id,
             trace_type=trace_type,
         )
+
+    def upsert_trace_facts(self, update: TraceFactUpdate) -> TraceFactWriteReceipt:
+        """Persist a producer-calculated fact projection for one retained trace."""
+
+        if self._remote_client is not None:
+            response = self._remote(
+                "/upsert_trace_facts",
+                project=self.project,
+                run=self.name,
+                run_id=self.id,
+                update=update.payload(),
+            )
+            return TraceFactWriteReceipt(**response)
+        return SQLiteStorage.upsert_trace_facts(self.project, self.name, update, run_id=self.id)
+
+    def aggregate_trace_facts(self, query: TraceFactsQuery) -> TraceAggregateResult:
+        """Return bounded fact aggregates without reading trace payloads."""
+
+        if self._remote_client is not None:
+            response = self._remote(
+                "/get_trace_facts",
+                project=self.project,
+                run=self.name,
+                run_id=self.id,
+                trace_type=query.trace_type,
+                group_by=list(query.group_by),
+                aggregates=[{"measure": item.measure, "operation": item.operation} for item in query.aggregates],
+                dimensions=dict(query.dimensions),
+            )
+            return TraceAggregateResult(tuple(TraceAggregateBucket(**item) for item in response["buckets"]))
+        return SQLiteStorage.aggregate_trace_facts(self.project, self.name, query, run_id=self.id)
 
     def artifacts(self) -> dict[str, list[dict[str, Any]]]:
         """Return this run's input and output artifact edges."""

@@ -44,6 +44,7 @@ from trackio.storage import (
     is_retryable_storage_error,
     selected_engine,
 )
+from trackio.trace_facts import TraceAggregate, TraceFactsQuery, TraceFactUpdate
 from trackio.typehints import (
     AlertEntry,
     ArtifactBlobUploadEntry,
@@ -1448,6 +1449,49 @@ def get_trace_count(
     return Storage.get_trace_count(project, run, run_id=run_id, trace_type=trace_type)
 
 
+def upsert_trace_facts(
+    project: str,
+    run: str,
+    update: dict[str, Any],
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Persist a producer-supplied scalar projection for one existing trace."""
+
+    receipt = Storage.upsert_trace_facts(project, run, TraceFactUpdate.from_payload(update), run_id=run_id)
+    return {"trace_id": receipt.trace_id, "projection_id": receipt.projection_id, "applied": receipt.applied}
+
+
+def get_trace_facts(
+    project: str,
+    run: str,
+    aggregates: list[dict[str, Any]],
+    trace_type: str = "verifiers",
+    group_by: list[str] | None = None,
+    dimensions: dict[str, Any] | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Return bounded current-projection aggregates without opening payload JSON."""
+
+    query = TraceFactsQuery(
+        trace_type=trace_type,
+        group_by=tuple(group_by or ()),
+        aggregates=tuple(TraceAggregate(**item) for item in aggregates),
+        dimensions=dimensions or {},
+    )
+    result = Storage.aggregate_trace_facts(project, run, query, run_id=run_id)
+    return {
+        "buckets": [
+            {
+                "dimensions": dict(bucket.dimensions),
+                "trace_count": bucket.trace_count,
+                "values": dict(bucket.values),
+                "coverage": dict(bucket.coverage),
+            }
+            for bucket in result.buckets
+        ]
+    }
+
+
 def query_project(project: str, query: str) -> dict[str, Any]:
     return Storage.query_project(project, query)
 
@@ -1652,6 +1696,8 @@ def _api_registry() -> dict[str, Any]:
         "get_traces": get_traces,
         "get_trace_steps": get_trace_steps,
         "get_trace_count": get_trace_count,
+        "upsert_trace_facts": upsert_trace_facts,
+        "get_trace_facts": get_trace_facts,
         "query_project": query_project,
         "get_settings": get_settings,
         "get_project_files": get_project_files,

@@ -32,6 +32,7 @@ from trackio.remote_client import RemoteClient, is_transient_remote_error
 from trackio.sqlite_storage import SQLiteStorage
 from trackio.table import Table
 from trackio.trace import Trace
+from trackio.trace_facts import TraceFactUpdate, TraceFactWriteReceipt
 from trackio.typehints import AlertEntry, LogEntry, SystemLogEntry, UploadEntry
 from trackio.utils import MEDIA_DIR, _emit_nonfatal_warning, _get_default_namespace
 
@@ -1215,6 +1216,29 @@ class Run:
                     self._flush_queues_inline()
         except Exception as e:
             _emit_nonfatal_warning(f"trackio.log() failed to process metrics: {e}")
+
+    def upsert_trace_facts(self, update: TraceFactUpdate) -> TraceFactWriteReceipt:
+        """Persist a fact projection after its native trace has been logged."""
+
+        if self._is_local:
+            return SQLiteStorage.upsert_trace_facts(self.project, self.name, update, run_id=self.id)
+        self._wait_for_client_ready()
+        with self._client_lock:
+            if self._client is None:
+                raise RuntimeError("trackio remote client is not available")
+            response = self._client.predict(
+                api_name="/upsert_trace_facts",
+                project=self.project,
+                run=self.name,
+                run_id=self.id,
+                update=update.payload(),
+            )
+        return TraceFactWriteReceipt(**response)
+
+    def flush(self) -> None:
+        """Synchronously persist queued observation fragments before a dependent write."""
+
+        self._flush_queues_inline()
 
     def _artifact_log_with_retry(self, **kwargs) -> dict:
         manifest = kwargs.get("manifest", [])

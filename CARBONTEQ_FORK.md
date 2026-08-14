@@ -9,8 +9,9 @@ integrations.
 ## Python distribution
 
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
-`trackio` import package and `trackio` console command. The current fork release
-is `0.31.5.post13`, derived from upstream Trackio `0.31.5`.
+`trackio` import package and `trackio` console command. The current published
+fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
+working candidate is `0.31.5.post14.dev0`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -102,6 +103,39 @@ model-call count, and tool-call count from the complete stored record, then
 returns only those safe scalar summaries. This repairs historical Observatory
 rows whose full detail had timing and token evidence while their paged summary
 showed it as missing.
+
+## Trace-facts candidate (`0.31.5.post14.dev0`)
+
+This candidate adds a generic, typed trace-facts projection for native
+Verifiers traces. The full native record remains in `traces.payload` as replay
+authority. The current projection is stored as nullable scalar columns on its
+own `traces` row, while unbounded named reward components live in
+`trace_reward_components`. It provides a narrow aggregation API over approved
+dimensions and numeric measures, without JSON-path queries or Posttrain/model
+semantics in Trackio.
+
+The contract is implemented in `trackio/trace_facts.py`, accepted on an
+initial `VerifiersTrace` write or through `Run.upsert_trace_facts`, persisted by
+both `SQLiteStorage` and `DorisStorage`, and served through
+`/upsert_trace_facts` and `/get_trace_facts`. Projection IDs are verified
+SHA-256 identities, so retries are idempotent and a replacement component set
+cannot leave stale component rows visible. Trackio validates generic shapes
+and accounting invariants; Posttrain's Verifiers projector remains responsible
+for tokens, tools, truncation, reward semantics, and model/template rules.
+
+Apache Doris moves directly from global schema version 1 to version 2. The
+candidate includes an explicit backup-gated `trackio storage migrate-doris`
+command and requires coordinated server deployment; an old server is not
+compatible with a migrated database. This deliberately replaces a
+per-capability compatibility layer.
+
+No fork workflow builds or publishes releases. A maintainer builds and checks
+the candidate locally, commits and pushes the exact source, creates an
+immutable prerelease with its wheel, sdist, and SHA-256 receipt, then manually
+dispatches the Posttrain-owned retained-asset publisher to `carbonteq/dev`.
+Only after clean dev-index install and real-Doris qualification may the same
+bytes be promoted by the repository-owned workflow and selected as a stable
+Posttrain dependency.
 
 ## Storage engine
 

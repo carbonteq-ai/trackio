@@ -220,6 +220,27 @@ def _handle_storage_migrate(args) -> None:
     )
 
 
+def _handle_storage_migrate_doris(args) -> None:
+    from trackio.doris_schema_migration import apply, preview
+
+    try:
+        if args.preview:
+            result = preview(args.to)
+        else:
+            if not args.backup_receipt:
+                raise ValueError("--apply requires --backup-receipt")
+            result = apply(args.to, Path(args.backup_receipt))
+    except (RuntimeError, ValueError) as error:
+        error_exit(str(error))
+    if args.preview:
+        print(format_json(result))
+    else:
+        print(
+            f"Trackio Doris schema migrated {result['current_version']} -> "
+            f"{result['target_version']} using backup receipt {result['backup_receipt']}"
+        )
+
+
 def _handle_storage_artifacts_migrate(args) -> None:
     from trackio.artifact_migration import migrate_local_artifacts
     from trackio.artifact_storage import get_artifact_store, selected_artifact_backend
@@ -587,6 +608,19 @@ def main():
         "--dry-run",
         action="store_true",
         help="Inspect source databases and write a receipt without changing Doris.",
+    )
+
+    storage_migrate_doris_parser = storage_subparsers.add_parser(
+        "migrate-doris",
+        help="Preview or apply the explicit Apache Doris Trackio schema migration.",
+    )
+    storage_migrate_doris_parser.add_argument("--to", type=int, required=True)
+    doris_mode = storage_migrate_doris_parser.add_mutually_exclusive_group(required=True)
+    doris_mode.add_argument("--preview", action="store_true", help="Print ordered DDL without changing Doris.")
+    doris_mode.add_argument("--apply", action="store_true", help="Apply the ordered DDL after a verified backup.")
+    storage_migrate_doris_parser.add_argument(
+        "--backup-receipt",
+        help="Required with --apply: path to the verified pre-migration backup receipt.",
     )
     mode.add_argument(
         "--verify-only",
@@ -1472,6 +1506,8 @@ def main():
     elif args.command == "storage":
         if args.storage_command == "migrate":
             _handle_storage_migrate(args)
+        elif args.storage_command == "migrate-doris":
+            _handle_storage_migrate_doris(args)
         elif (
             args.storage_command == "artifacts"
             and args.artifact_storage_command == "migrate"

@@ -3,6 +3,7 @@ import pytest
 from trackio.doris_schema import (
     MANAGED_TABLES,
     SCHEMA_VERSION,
+    migration_statements,
     negotiate_schema,
     schema_statements,
 )
@@ -45,6 +46,15 @@ def test_schema_version_table_is_created_first_and_recorded_separately():
     assert all(
         "INSERT INTO schema_versions" not in statement for statement in statements
     )
+
+
+def test_version_two_migration_adds_trace_facts_before_recording_the_version():
+    statements = migration_statements(1, 2)
+
+    assert any("ALTER TABLE traces ADD COLUMN IF NOT EXISTS fact_projection_id" in statement for statement in statements)
+    assert any("CREATE TABLE IF NOT EXISTS trace_reward_components" in statement for statement in statements)
+    with pytest.raises(ValueError, match="unsupported"):
+        migration_statements(2, 3)
 
 
 class _SchemaCursor:
