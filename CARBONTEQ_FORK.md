@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev14`.
+working candidate is `0.31.5.post14.dev15`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -104,7 +104,7 @@ returns only those safe scalar summaries. This repairs historical Observatory
 rows whose full detail had timing and token evidence while their paged summary
 showed it as missing.
 
-## Trace-facts candidate (`0.31.5.post14.dev14`)
+## Trace-facts candidate (`0.31.5.post14.dev15`)
 
 This candidate adds a generic, typed trace-facts projection for native
 Verifiers traces. The full native record remains in `traces.payload` as replay
@@ -168,6 +168,11 @@ backfill case.
 absent source projection (the empty identity as well as SQL `NULL`), ensuring
 historical rows take the set-oriented path rather than falling back to
 per-trace writes.
+
+`0.31.5.post14.dev15` writes fresh scalar projections with one bounded Doris
+`UPDATE ... CASE` statement per page. The component relation remains
+append-only and receipt-backed; the trace rows no longer incur an individual
+update RPC for every retained trace.
 
 The contract is implemented in `trackio/trace_facts.py`, accepted on an
 initial `VerifiersTrace` write or through `Run.upsert_trace_facts`, persisted by

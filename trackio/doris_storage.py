@@ -1654,40 +1654,47 @@ class DorisStorage:
                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                         component_rows,
                     )
-                cursor.executemany(
-                    """UPDATE traces SET fact_namespace=%s, fact_calculator_version=%s, fact_projection_id=%s,
-                       fact_state=%s, fact_calculated_at=%s, fact_dimensions=%s, fact_provenance=%s,
-                       fact_model=%s, fact_task_type=%s, fact_rollout_step=%s, fact_is_truncated=%s,
-                       fact_has_error=%s, fact_model_input_tokens=%s, fact_model_output_tokens=%s,
-                       fact_thinking_tokens=%s, fact_tool_calls=%s, fact_model_calls=%s,
-                       fact_trace_latency_ms=%s, fact_task_reward=%s
-                       WHERE project_id=%s AND trace_id=%s""",
-                    [
-                        (
-                            update.namespace,
-                            update.calculator_version,
-                            update.projection_id,
-                            update.state,
-                            update.calculated_at.isoformat(),
-                            _json(dict(update.dimensions)),
-                            _json(dict(update.provenance)),
-                            update.dimensions.get("model"),
-                            update.dimensions.get("task_type"),
-                            update.dimensions.get("rollout_step"),
-                            update.dimensions.get("is_truncated"),
-                            update.dimensions.get("has_error"),
-                            update.measures.get("model_input_tokens"),
-                            update.measures.get("model_output_tokens"),
-                            update.measures.get("thinking_tokens"),
-                            update.measures.get("tool_calls"),
-                            update.measures.get("model_calls"),
-                            update.measures.get("trace_latency_ms"),
-                            update.measures.get("task_reward"),
-                            project,
-                            str(traces[(update.trace_type, update.external_id)]["trace_id"]),
-                        )
-                        for update in fresh
-                    ],
+                columns = (
+                    ("fact_namespace", lambda update: update.namespace),
+                    ("fact_calculator_version", lambda update: update.calculator_version),
+                    ("fact_projection_id", lambda update: update.projection_id),
+                    ("fact_state", lambda update: update.state),
+                    ("fact_calculated_at", lambda update: update.calculated_at.isoformat()),
+                    ("fact_dimensions", lambda update: _json(dict(update.dimensions))),
+                    ("fact_provenance", lambda update: _json(dict(update.provenance))),
+                    ("fact_model", lambda update: update.dimensions.get("model")),
+                    ("fact_task_type", lambda update: update.dimensions.get("task_type")),
+                    ("fact_rollout_step", lambda update: update.dimensions.get("rollout_step")),
+                    ("fact_is_truncated", lambda update: update.dimensions.get("is_truncated")),
+                    ("fact_has_error", lambda update: update.dimensions.get("has_error")),
+                    ("fact_model_input_tokens", lambda update: update.measures.get("model_input_tokens")),
+                    ("fact_model_output_tokens", lambda update: update.measures.get("model_output_tokens")),
+                    ("fact_thinking_tokens", lambda update: update.measures.get("thinking_tokens")),
+                    ("fact_tool_calls", lambda update: update.measures.get("tool_calls")),
+                    ("fact_model_calls", lambda update: update.measures.get("model_calls")),
+                    ("fact_trace_latency_ms", lambda update: update.measures.get("trace_latency_ms")),
+                    ("fact_task_reward", lambda update: update.measures.get("task_reward")),
+                )
+                trace_ids = [
+                    str(traces[(update.trace_type, update.external_id)]["trace_id"])
+                    for update in fresh
+                ]
+                assignments = []
+                parameters: list[Any] = []
+                for column, value_for in columns:
+                    assignments.append(
+                        f"{column}=CASE trace_id "
+                        + " ".join("WHEN %s THEN %s" for _ in fresh)
+                        + f" ELSE {column} END"
+                    )
+                    for trace_id, update in zip(trace_ids, fresh, strict=True):
+                        parameters.extend((trace_id, value_for(update)))
+                placeholders = ", ".join(["%s"] * len(trace_ids))
+                parameters.extend((project, *trace_ids))
+                cursor.execute(
+                    f"UPDATE traces SET {', '.join(assignments)} "
+                    f"WHERE project_id=%s AND trace_id IN ({placeholders})",
+                    parameters,
                 )
             fresh_keys = {(update.trace_type, update.external_id) for update in fresh}
             receipts = []
