@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from trackio import cas, utils
-from trackio.artifact_storage import get_artifact_store
+from trackio.artifact_storage import ArtifactNotFoundError, get_artifact_store
 
 DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024
 COMPATIBILITY_MAX_BYTES = 32 * 1024 * 1024
@@ -142,7 +142,26 @@ def create_or_resume_session(
             raise UploadSessionError(
                 "Idempotency key is already bound to a different artifact blob."
             )
-        return _public_session(session)
+        if session["state"] != "completed":
+            return _public_session(session)
+
+        # Completion metadata is an upload receipt, not the blob authority.
+        # Retention or operator cleanup can remove the content-addressed blob
+        # while leaving the session behind. Reopen that stale session so the
+        # client sends the bytes again instead of skipping every old chunk and
+        # receiving a conflict from completion.
+        store = get_artifact_store()
+        try:
+            existing = store.stat(project, digest)
+        except ArtifactNotFoundError:
+            shutil.rmtree(_session_dir(project, upload_id), ignore_errors=True)
+        else:
+            if existing.size_bytes != size_bytes:
+                raise UploadSessionError(
+                    "A completed upload session points to an object with a different size."
+                )
+            store.verify(project, digest, size_bytes)
+            return _public_session(session)
 
     now = _now()
     session = {

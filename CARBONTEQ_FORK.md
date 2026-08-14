@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev15`.
+working candidate is `0.31.5.post14.dev16`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -76,12 +76,12 @@ CAS and then let the manifest authority look for it in S3. Completed legacy
 sessions recover an existing verified local-CAS blob into the configured store
 before returning success. Publication and deployment remain open gates.
 
-The same release repairs stale direct-upload receipts. A completed multipart
-session is no longer treated as proof that its content-addressed object still
-exists: Trackio checks the configured store before returning the completed
-receipt and restarts the upload when retention or migration removed the blob.
-This prevents an artifact producer from skipping the upload and then failing
-manifest commit with `Manifest references blobs not on server`.
+The same release repairs stale upload receipts in both direct multipart and
+server-side resumable paths. A completed session is no longer treated as proof
+that its content-addressed object still exists: Trackio checks the configured
+store before returning the completed receipt and restarts the upload when
+retention or migration removed the blob. This prevents an artifact producer
+from skipping the upload and then failing completion or manifest commit.
 
 The intended distribution for these compatibility and importer changes is
 `carbonteq-trackio==0.31.5.post11`. It remains a candidate until the exact
@@ -104,7 +104,7 @@ returns only those safe scalar summaries. This repairs historical Observatory
 rows whose full detail had timing and token evidence while their paged summary
 showed it as missing.
 
-## Trace-facts candidate (`0.31.5.post14.dev15`)
+## Trace-facts candidate (`0.31.5.post14.dev16`)
 
 This candidate adds a generic, typed trace-facts projection for native
 Verifiers traces. The full native record remains in `traces.payload` as replay
@@ -173,6 +173,12 @@ per-trace writes.
 `UPDATE ... CASE` statement per page. The component relation remains
 append-only and receipt-backed; the trace rows no longer incur an individual
 update RPC for every retained trace.
+
+`0.31.5.post14.dev16` makes the compatibility resumable artifact path match
+the direct multipart path's stale-receipt behavior. If a completed upload
+session survives after its content-addressed blob is removed, initialization
+reopens the same idempotent session and accepts the bytes again instead of
+skipping deleted chunks and failing completion with HTTP 409.
 
 The contract is implemented in `trackio/trace_facts.py`, accepted on an
 initial `VerifiersTrace` write or through `Run.upsert_trace_facts`, persisted by

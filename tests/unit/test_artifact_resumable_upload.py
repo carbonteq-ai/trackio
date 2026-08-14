@@ -161,6 +161,33 @@ def test_resumable_upload_init_is_idempotent_and_rejects_key_reuse(temp_dir):
     assert "different artifact blob" in conflict.json()["error"]
 
 
+def test_resumable_upload_reopens_completed_session_when_blob_was_removed(temp_dir):
+    client = TestClient(create_trackio_starlette_app([], {}))
+    payload = b"deterministic-model-artifact"
+    digest = _digest(payload)
+
+    first = _init(client, digest=digest, size=len(payload))
+    assert _put(client, first["upload_id"], 0, payload).status_code == 200
+    completed = client.post(
+        f"/api/artifact-upload/resumable-project/{first['upload_id']}"
+    )
+    assert completed.status_code == 200, completed.text
+    cas.blob_path("resumable-project", digest).unlink()
+
+    reopened = _init(client, digest=digest, size=len(payload))
+    assert reopened["upload_id"] == first["upload_id"]
+    assert reopened["state"] == "uploading"
+    assert reopened["acknowledged_chunks"] == []
+    assert _put(client, reopened["upload_id"], 0, payload).status_code == 200
+    retried = client.post(
+        f"/api/artifact-upload/resumable-project/{reopened['upload_id']}"
+    )
+
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["digest"] == digest
+    assert cas.blob_path("resumable-project", digest).read_bytes() == payload
+
+
 def test_resumable_upload_authorizes_every_mutating_and_status_route(temp_dir):
     def authorize(request):
         if request.headers.get("x-trackio-write-token") != "test-token":
