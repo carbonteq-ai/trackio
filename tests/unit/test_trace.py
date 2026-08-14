@@ -274,6 +274,54 @@ def test_remote_trace_fact_upsert_retries_until_queued_parent_arrives(monkeypatc
     assert client.calls == 2
 
 
+def test_remote_trace_fact_upsert_sends_queued_parent_before_enrichment():
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def predict(self, *, api_name, **kwargs):
+            self.calls.append((api_name, kwargs))
+            if api_name == "/bulk_log":
+                return None
+            assert api_name == "/upsert_trace_facts"
+            return {
+                "trace_id": "parent",
+                "projection_id": kwargs["update"]["projection_id"],
+                "applied": True,
+            }
+
+    client = Client()
+    run = Run(
+        url="https://trackio.invalid",
+        project="proj",
+        client=client,
+        name="remote-facts-run",
+        server_base_url="https://trackio.invalid",
+    )
+    run.log({"rollout": VerifiersTrace(verifiers_record("queued-parent"))})
+    update = TraceFactUpdate(
+        trace_type="verifiers",
+        external_id="queued-parent",
+        namespace="posttrain.train.reward",
+        calculator_version="test.v1",
+        projection_id=_projection_id(
+            "posttrain.train.reward", "test.v1", {}, {"algorithm_reward": 0.5}
+        ),
+        measures={"algorithm_reward": 0.5},
+    )
+
+    receipt = run.upsert_trace_facts(update)
+    run.finish()
+
+    assert receipt.applied is True
+    assert [api_name for api_name, _ in client.calls[:2]] == [
+        "/bulk_log",
+        "/upsert_trace_facts",
+    ]
+    native = client.calls[0][1]["logs"][0]["metrics"]["rollout"]
+    assert native["external_id"] == "queued-parent"
+
+
 def test_reward_component_aggregates_preserve_name_source_and_coverage(temp_dir):
     run = Run(
         url=None, project="proj", client=None, name="component-facts-run", space_id=None

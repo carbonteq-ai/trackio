@@ -1246,6 +1246,24 @@ class Run:
                 with self._client_lock:
                     if self._client is None:
                         raise RuntimeError("trackio remote client is not available")
+                    # ``log()`` is intentionally asynchronous, whereas trace-fact
+                    # enrichment is a dependent, synchronous write.  Send the
+                    # queued native trace batch under the same lock before the
+                    # upsert, so an enrichment cannot overtake its parent trace.
+                    if self._queued_logs:
+                        logs_to_send = self._queued_logs.copy()
+                        self._queued_logs.clear()
+                        try:
+                            self._client.predict(
+                                api_name="/bulk_log",
+                                logs=logs_to_send,
+                                hf_token=self._hf_token_for_remote(),
+                            )
+                        except Exception:
+                            # Preserve normal background retry behavior when the
+                            # source batch itself cannot be delivered.
+                            self._queued_logs[0:0] = logs_to_send
+                            raise
                     response = self._client.predict(
                         api_name="/upsert_trace_facts",
                         project=self.project,
