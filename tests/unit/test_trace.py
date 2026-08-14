@@ -12,6 +12,7 @@ from trackio import (
     TraceRewardComponent,
     VerifiersTrace,
 )
+from trackio import server as trackio_server
 from trackio.media import TrackioImage
 from trackio.sqlite_storage import SQLiteStorage
 from trackio.trace_facts import projection_id
@@ -197,6 +198,42 @@ def test_verifiers_trace_facts_are_idempotent_and_aggregate_without_payload_read
     assert row["fact_projection_id"] == update.projection_id
     assert row["fact_task_reward"] == 0.5
     assert row["fact_algorithm_reward"] == 0.75
+
+
+def test_bulk_trace_fact_upsert_validates_a_page_before_writing(monkeypatch):
+    update = TraceFactUpdate(
+        trace_type="verifiers",
+        external_id="batch-trace",
+        namespace="verifiers.trace",
+        calculator_version="test.v1",
+        projection_id=_projection_id(
+            "verifiers.trace", "test.v1", {}, {"model_output_tokens": 12}
+        ),
+        measures={"model_output_tokens": 12},
+        replace_reward_components=True,
+    )
+    writes = []
+
+    def upsert(project, run, parsed, *, run_id=None):
+        writes.append((project, run, parsed.external_id, run_id))
+        return type(
+            "Receipt", (), {"trace_id": "storage-trace", "projection_id": parsed.projection_id, "applied": True}
+        )()
+
+    monkeypatch.setattr(trackio_server.Storage, "upsert_trace_facts", staticmethod(upsert))
+    response = trackio_server.bulk_upsert_trace_facts(
+        "project-a", "run-a", [update.payload()], run_id="provider-run-a"
+    )
+
+    assert writes == [("project-a", "run-a", "batch-trace", "provider-run-a")]
+    assert response == {
+        "receipts": [
+            {"trace_id": "storage-trace", "projection_id": update.projection_id, "applied": True}
+        ]
+    }
+    with pytest.raises(ValueError):
+        trackio_server.bulk_upsert_trace_facts("project-a", "run-a", [{}], run_id="provider-run-a")
+    assert len(writes) == 1
 
 
 def test_initial_verifiers_trace_facts_are_persisted_with_the_native_trace(temp_dir):

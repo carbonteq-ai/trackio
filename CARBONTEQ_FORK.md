@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev10`.
+working candidate is `0.31.5.post14.dev11`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -104,7 +104,7 @@ returns only those safe scalar summaries. This repairs historical Observatory
 rows whose full detail had timing and token evidence while their paged summary
 showed it as missing.
 
-## Trace-facts candidate (`0.31.5.post14.dev10`)
+## Trace-facts candidate (`0.31.5.post14.dev11`)
 
 This candidate adds a generic, typed trace-facts projection for native
 Verifiers traces. The full native record remains in `traces.payload` as replay
@@ -144,10 +144,17 @@ metric records to the service instead of only checkpointing them in the local
 retry buffer, so an immediate trace-fact upsert cannot overtake a source trace
 that was flushed by a bridge.
 
+`0.31.5.post14.dev11` adds `/bulk_upsert_trace_facts`, a bounded generic
+write API for a page of independently idempotent trace-fact projections. It
+validates the entire page before storage changes, returns one receipt per
+trace, and keeps the existing per-trace identity and schema unchanged. This is
+used by Posttrain's historical backfill so retained evidence can be projected
+without one network round trip per trace.
+
 The contract is implemented in `trackio/trace_facts.py`, accepted on an
 initial `VerifiersTrace` write or through `Run.upsert_trace_facts`, persisted by
 both `SQLiteStorage` and `DorisStorage`, and served through
-`/upsert_trace_facts` and `/get_trace_facts`. Projection IDs are verified
+`/upsert_trace_facts`, `/bulk_upsert_trace_facts`, and `/get_trace_facts`. Projection IDs are verified
 SHA-256 identities, so retries are idempotent and a replacement component set
 cannot leave stale component rows visible. Trackio validates generic shapes
 and accounting invariants; Posttrain's Verifiers projector remains responsible

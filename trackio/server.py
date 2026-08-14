@@ -1479,6 +1479,37 @@ def upsert_trace_facts(
     return {"trace_id": receipt.trace_id, "projection_id": receipt.projection_id, "applied": receipt.applied}
 
 
+def bulk_upsert_trace_facts(
+    project: str,
+    run: str,
+    updates: list[dict[str, Any]],
+    run_id: str | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Persist a bounded sequence of independently idempotent trace facts.
+
+    The endpoint deliberately reuses the single-update storage contract: each
+    update keeps its trace-keyed identity and receipt, while callers avoid one
+    HTTP round trip per retained historical trace.  Parse the complete request
+    before changing storage so malformed input cannot produce a partial page.
+    """
+
+    parsed = [TraceFactUpdate.from_payload(update) for update in updates]
+    receipts = [
+        Storage.upsert_trace_facts(project, run, update, run_id=run_id)
+        for update in parsed
+    ]
+    return {
+        "receipts": [
+            {
+                "trace_id": receipt.trace_id,
+                "projection_id": receipt.projection_id,
+                "applied": receipt.applied,
+            }
+            for receipt in receipts
+        ]
+    }
+
+
 def get_trace_facts(
     project: str,
     run: str,
@@ -1715,6 +1746,7 @@ def _api_registry() -> dict[str, Any]:
         "get_trace_steps": get_trace_steps,
         "get_trace_count": get_trace_count,
         "upsert_trace_facts": upsert_trace_facts,
+        "bulk_upsert_trace_facts": bulk_upsert_trace_facts,
         "get_trace_facts": get_trace_facts,
         "query_project": query_project,
         "get_settings": get_settings,
