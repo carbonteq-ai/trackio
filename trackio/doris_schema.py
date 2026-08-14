@@ -112,7 +112,7 @@ def migration_statements(from_version: int, to_version: int, replication_num: in
         {properties}
     """
     return (
-        *(f"ALTER TABLE traces ADD COLUMN IF NOT EXISTS {column}" for column in _TRACE_FACT_COLUMNS),
+        *(f"ALTER TABLE traces ADD COLUMN {column}" for column in _TRACE_FACT_COLUMNS),
         component_table,
     )
 
