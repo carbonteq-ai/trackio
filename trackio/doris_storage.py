@@ -1584,6 +1584,57 @@ class DorisStorage:
             return TraceFactWriteReceipt(row["trace_id"], update.projection_id, applied)
 
     @classmethod
+    def upsert_trace_facts_batch(
+        cls,
+        project: str,
+        run: str,
+        updates: list[TraceFactUpdate],
+        *,
+        run_id: str | None = None,
+    ) -> list[TraceFactWriteReceipt]:
+        """Apply a bounded page with one connection and transaction."""
+
+        if not updates:
+            return []
+        with cls._connection() as connection, connection.cursor() as cursor:
+            resolved = cls._resolve_run_id(cursor, project, run, run_id, table="traces")
+            if resolved is None:
+                raise KeyError(f"run {run!r} does not exist")
+            placeholders = ", ".join(["%s"] * len(updates))
+            cursor.execute(
+                f"""SELECT trace_id, trace_type, external_id FROM traces
+                    WHERE project_id=%s AND run_id=%s AND external_id IN ({placeholders})""",
+                (project, resolved, *(update.external_id for update in updates)),
+            )
+            trace_ids = {
+                (str(row["trace_type"]), str(row["external_id"])): str(row["trace_id"])
+                for row in cursor.fetchall()
+            }
+            missing = next(
+                (
+                    update.external_id
+                    for update in updates
+                    if (update.trace_type, update.external_id) not in trace_ids
+                ),
+                None,
+            )
+            if missing is not None:
+                raise KeyError(f"trace {missing!r} does not exist")
+            return [
+                TraceFactWriteReceipt(
+                    trace_ids[(update.trace_type, update.external_id)],
+                    update.projection_id,
+                    cls._upsert_trace_facts_cursor(
+                        cursor,
+                        project,
+                        trace_ids[(update.trace_type, update.external_id)],
+                        update,
+                    ),
+                )
+                for update in updates
+            ]
+
+    @classmethod
     def aggregate_trace_facts(
         cls,
         project: str,

@@ -2929,6 +2929,63 @@ class SQLiteStorage:
             return TraceFactWriteReceipt(row["id"], update.projection_id, applied)
 
     @staticmethod
+    def upsert_trace_facts_batch(
+        project: str,
+        run: str,
+        updates: list[TraceFactUpdate],
+        *,
+        run_id: str | None = None,
+    ) -> list[TraceFactWriteReceipt]:
+        """Apply a bounded page with one SQLite transaction."""
+
+        if not updates:
+            return []
+        db_path = SQLiteStorage.init_db(project)
+        with (
+            SQLiteStorage._get_process_lock(project),
+            SQLiteStorage._get_connection(db_path) as conn,
+        ):
+            identity = SQLiteStorage._resolve_run_identity(
+                conn, run_name=run, run_id=run_id, table="traces"
+            )
+            if identity is None:
+                raise KeyError(f"run {run!r} does not exist")
+            column, value = identity
+            cursor = conn.cursor()
+            placeholders = ", ".join(["?"] * len(updates))
+            cursor.execute(
+                f"""SELECT id, trace_type, external_id FROM traces
+                    WHERE {column} = ? AND external_id IN ({placeholders})""",
+                (value, *(update.external_id for update in updates)),
+            )
+            trace_ids = {
+                (str(row["trace_type"]), str(row["external_id"])): str(row["id"])
+                for row in cursor.fetchall()
+            }
+            missing = next(
+                (
+                    update.external_id
+                    for update in updates
+                    if (update.trace_type, update.external_id) not in trace_ids
+                ),
+                None,
+            )
+            if missing is not None:
+                raise KeyError(f"trace {missing!r} does not exist")
+            receipts = [
+                TraceFactWriteReceipt(
+                    trace_ids[(update.trace_type, update.external_id)],
+                    update.projection_id,
+                    SQLiteStorage._upsert_trace_facts_cursor(
+                        cursor, trace_ids[(update.trace_type, update.external_id)], update
+                    ),
+                )
+                for update in updates
+            ]
+            conn.commit()
+            return receipts
+
+    @staticmethod
     def aggregate_trace_facts(
         project: str, run: str, query: TraceFactsQuery, *, run_id: str | None = None
     ) -> TraceAggregateResult:

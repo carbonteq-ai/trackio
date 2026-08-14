@@ -150,6 +150,9 @@ def test_verifiers_trace_facts_are_idempotent_and_aggregate_without_payload_read
 
     first = run.upsert_trace_facts(update)
     second = run.upsert_trace_facts(update)
+    batched = SQLiteStorage.upsert_trace_facts_batch(
+        "proj", "facts-run", [update], run_id=run.id
+    )
     enrichment = TraceFactUpdate(
         trace_type="verifiers",
         external_id="facts-trace",
@@ -179,6 +182,7 @@ def test_verifiers_trace_facts_are_idempotent_and_aggregate_without_payload_read
 
     assert first.applied is True
     assert second.applied is False
+    assert batched[0].applied is False
     assert enriched.applied is True
     assert result.buckets[0].dimensions == {"rollout_step": 4}
     assert result.buckets[0].values == {
@@ -214,13 +218,16 @@ def test_bulk_trace_fact_upsert_validates_a_page_before_writing(monkeypatch):
     )
     writes = []
 
-    def upsert(project, run, parsed, *, run_id=None):
-        writes.append((project, run, parsed.external_id, run_id))
-        return type(
-            "Receipt", (), {"trace_id": "storage-trace", "projection_id": parsed.projection_id, "applied": True}
-        )()
+    def upsert_batch(project, run, parsed_updates, *, run_id=None):
+        writes.extend((project, run, parsed.external_id, run_id) for parsed in parsed_updates)
+        return [
+            type(
+                "Receipt", (), {"trace_id": "storage-trace", "projection_id": parsed.projection_id, "applied": True}
+            )()
+            for parsed in parsed_updates
+        ]
 
-    monkeypatch.setattr(trackio_server.Storage, "upsert_trace_facts", staticmethod(upsert))
+    monkeypatch.setattr(trackio_server.Storage, "upsert_trace_facts_batch", staticmethod(upsert_batch))
     response = trackio_server.bulk_upsert_trace_facts(
         "project-a", "run-a", [update.payload()], run_id="provider-run-a"
     )

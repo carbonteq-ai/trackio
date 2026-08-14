@@ -1494,10 +1494,7 @@ def bulk_upsert_trace_facts(
     """
 
     parsed = [TraceFactUpdate.from_payload(update) for update in updates]
-    receipts = [
-        Storage.upsert_trace_facts(project, run, update, run_id=run_id)
-        for update in parsed
-    ]
+    receipts = Storage.upsert_trace_facts_batch(project, run, parsed, run_id=run_id)
     return {
         "receipts": [
             {
