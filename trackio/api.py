@@ -301,7 +301,9 @@ class Run:
                 update=update.payload(),
             )
             return TraceFactWriteReceipt(**response)
-        return SQLiteStorage.upsert_trace_facts(self.project, self.name, update, run_id=self.id)
+        return SQLiteStorage.upsert_trace_facts(
+            self.project, self.name, update, run_id=self.id
+        )
 
     def aggregate_trace_facts(self, query: TraceFactsQuery) -> TraceAggregateResult:
         """Return bounded fact aggregates without reading trace payloads."""
@@ -314,11 +316,22 @@ class Run:
                 run_id=self.id,
                 trace_type=query.trace_type,
                 group_by=list(query.group_by),
-                aggregates=[{"measure": item.measure, "operation": item.operation} for item in query.aggregates],
+                aggregates=[
+                    {
+                        "measure": item.measure,
+                        "operation": item.operation,
+                        "component_name": item.component_name,
+                    }
+                    for item in query.aggregates
+                ],
                 dimensions=dict(query.dimensions),
             )
-            return TraceAggregateResult(tuple(TraceAggregateBucket(**item) for item in response["buckets"]))
-        return SQLiteStorage.aggregate_trace_facts(self.project, self.name, query, run_id=self.id)
+            return TraceAggregateResult(
+                tuple(TraceAggregateBucket(**item) for item in response["buckets"])
+            )
+        return SQLiteStorage.aggregate_trace_facts(
+            self.project, self.name, query, run_id=self.id
+        )
 
     def artifacts(self) -> dict[str, list[dict[str, Any]]]:
         """Return this run's input and output artifact edges."""
@@ -432,7 +445,9 @@ class Api:
         self, server_url: str | None = None, *, hf_token: str | None = None
     ) -> None:
         self._remote_client = (
-            RemoteClient(server_url, hf_token=hf_token) if server_url is not None else None
+            RemoteClient(server_url, hf_token=hf_token)
+            if server_url is not None
+            else None
         )
 
     def capabilities(self) -> dict[str, bool]:

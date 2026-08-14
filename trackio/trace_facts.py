@@ -43,6 +43,8 @@ _DIMENSION_NAMES = frozenset(
         "rollout_step",
         "is_truncated",
         "has_error",
+        "reward_component_name",
+        "reward_component_source_kind",
     }
 )
 _MEASURE_NAMES = frozenset(
@@ -55,7 +57,19 @@ _MEASURE_NAMES = frozenset(
         "trace_latency_ms",
         "task_reward",
         "algorithm_reward",
+        "reward_component_contribution",
+        "reward_component_score",
+        "reward_component_weight",
     }
+)
+
+_COMPONENT_MEASURE_FIELDS = {
+    "reward_component_contribution": "contribution",
+    "reward_component_score": "score",
+    "reward_component_weight": "weight",
+}
+_COMPONENT_DIMENSION_NAMES = frozenset(
+    {"reward_component_name", "reward_component_source_kind"}
 )
 
 
@@ -68,7 +82,11 @@ def _text(value: object, name: str, *, maximum: int = 768) -> str:
 def _number(value: object, name: str) -> int | float | None:
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(value)
+    ):
         raise ValueError(f"{name} must be a finite number or null")
     return value
 
@@ -88,11 +106,21 @@ class TraceRewardComponent:
         score = _number(self.score, "reward component score")
         weight = _number(self.weight, "reward component weight")
         if self.source_kind not in _SOURCE_KINDS:
-            raise ValueError(f"unknown reward component source kind {self.source_kind!r}")
+            raise ValueError(
+                f"unknown reward component source kind {self.source_kind!r}"
+            )
         if self.source_id is not None:
             _text(self.source_id, "reward component source id", maximum=256)
-        if contribution is not None and score is not None and weight is not None and not math.isclose(
-            float(contribution), float(score) * float(weight), rel_tol=1e-9, abs_tol=1e-12
+        if (
+            contribution is not None
+            and score is not None
+            and weight is not None
+            and not math.isclose(
+                float(contribution),
+                float(score) * float(weight),
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
         ):
             raise ValueError("reward component contribution must equal score * weight")
 
@@ -106,7 +134,9 @@ class TraceFactUpdate:
     namespace: str
     calculator_version: str
     projection_id: str
-    dimensions: Mapping[str, str | int | float | bool | None] = field(default_factory=dict)
+    dimensions: Mapping[str, str | int | float | bool | None] = field(
+        default_factory=dict
+    )
     measures: Mapping[str, int | float | None] = field(default_factory=dict)
     reward_components: tuple[TraceRewardComponent, ...] = ()
     provenance: Mapping[str, str] = field(default_factory=dict)
@@ -119,7 +149,9 @@ class TraceFactUpdate:
         _text(self.external_id, "external id")
         _text(self.namespace, "fact namespace", maximum=128)
         _text(self.calculator_version, "calculator version", maximum=256)
-        if len(self.projection_id) != 64 or any(char not in "0123456789abcdef" for char in self.projection_id):
+        if len(self.projection_id) != 64 or any(
+            char not in "0123456789abcdef" for char in self.projection_id
+        ):
             raise ValueError("projection id must be a lowercase SHA-256 digest")
         if self.state not in {"complete", "partial", "unsupported"}:
             raise ValueError("trace fact state is invalid")
@@ -137,12 +169,21 @@ class TraceFactUpdate:
         names = [component.name for component in self.reward_components]
         if len(names) != len(set(names)):
             raise ValueError("reward component names must be unique")
-        if any(not isinstance(component, TraceRewardComponent) for component in self.reward_components):
+        if any(
+            not isinstance(component, TraceRewardComponent)
+            for component in self.reward_components
+        ):
             raise ValueError("reward components must be TraceRewardComponent values")
         if self.replace_reward_components:
             if self.namespace != "verifiers.trace":
-                raise ValueError("only a Verifiers source projection may replace reward components")
-        elif self.reward_components or self.dimensions or set(self.measures) != {"algorithm_reward"}:
+                raise ValueError(
+                    "only a Verifiers source projection may replace reward components"
+                )
+        elif (
+            self.reward_components
+            or self.dimensions
+            or set(self.measures) != {"algorithm_reward"}
+        ):
             raise ValueError("a trace-fact enrichment may only supply algorithm_reward")
         if self.projection_id != projection_id(
             {
@@ -156,24 +197,37 @@ class TraceFactUpdate:
                         "contribution": component.contribution,
                         "score": component.score,
                         "weight": component.weight,
-                        "source": {"kind": component.source_kind, "id": component.source_id},
+                        "source": {
+                            "kind": component.source_kind,
+                            "id": component.source_id,
+                        },
                     }
-                    for component in sorted(self.reward_components, key=lambda item: item.name)
+                    for component in sorted(
+                        self.reward_components, key=lambda item: item.name
+                    )
                 ],
                 "provenance": dict(sorted(self.provenance.items())),
                 "state": self.state,
             }
         ):
-            raise ValueError("projection id does not match the immutable trace fact payload")
+            raise ValueError(
+                "projection id does not match the immutable trace fact payload"
+            )
         object.__setattr__(self, "dimensions", MappingProxyType(dict(self.dimensions)))
         object.__setattr__(self, "measures", MappingProxyType(dict(self.measures)))
-        object.__setattr__(self, "reward_components", tuple(sorted(self.reward_components, key=lambda item: item.name)))
+        object.__setattr__(
+            self,
+            "reward_components",
+            tuple(sorted(self.reward_components, key=lambda item: item.name)),
+        )
         object.__setattr__(self, "provenance", MappingProxyType(dict(self.provenance)))
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> TraceFactUpdate:
         components = tuple(
-            TraceRewardComponent(**dict(item)) for item in payload.get("reward_components", ()) if isinstance(item, Mapping)
+            TraceRewardComponent(**dict(item))
+            for item in payload.get("reward_components", ())
+            if isinstance(item, Mapping)
         )
         calculated_at = payload.get("calculated_at")
         return cls(
@@ -188,7 +242,11 @@ class TraceFactUpdate:
             provenance=payload.get("provenance", {}),  # type: ignore[arg-type]
             state=payload.get("state", "complete"),  # type: ignore[arg-type]
             replace_reward_components=payload.get("replace_reward_components", False),  # type: ignore[arg-type]
-            calculated_at=(datetime.fromisoformat(calculated_at) if isinstance(calculated_at, str) else datetime.now(UTC)),
+            calculated_at=(
+                datetime.fromisoformat(calculated_at)
+                if isinstance(calculated_at, str)
+                else datetime.now(UTC)
+            ),
         )
 
     def payload(self) -> dict[str, object]:
@@ -229,12 +287,31 @@ class TraceFactWriteReceipt:
 class TraceAggregate:
     measure: str
     operation: AggregateOperation = "mean"
+    component_name: str | None = None
 
     def __post_init__(self) -> None:
         if self.measure not in _MEASURE_NAMES:
             raise ValueError(f"unsupported trace aggregate measure {self.measure!r}")
         if self.operation not in {"mean", "sum", "count", "min", "max"}:
-            raise ValueError(f"unsupported trace aggregate operation {self.operation!r}")
+            raise ValueError(
+                f"unsupported trace aggregate operation {self.operation!r}"
+            )
+        if self.component_name is not None:
+            _text(self.component_name, "trace aggregate component name", maximum=256)
+            if self.measure not in _COMPONENT_MEASURE_FIELDS:
+                raise ValueError(
+                    "component_name is only valid for reward-component aggregates"
+                )
+
+    @property
+    def key(self) -> str:
+        """The stable output key for this aggregate request."""
+
+        return f"{self.operation}_{self.measure}"
+
+    @property
+    def component_field(self) -> str | None:
+        return _COMPONENT_MEASURE_FIELDS.get(self.measure)
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,7 +319,9 @@ class TraceFactsQuery:
     trace_type: str = "verifiers"
     group_by: tuple[str, ...] = ()
     aggregates: tuple[TraceAggregate, ...] = ()
-    dimensions: Mapping[str, str | int | float | bool | None] = field(default_factory=dict)
+    dimensions: Mapping[str, str | int | float | bool | None] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self) -> None:
         if any(name not in _DIMENSION_NAMES for name in self.group_by):
@@ -253,6 +332,26 @@ class TraceFactsQuery:
             raise ValueError("trace fact filter includes an unsupported dimension")
         if not self.aggregates:
             raise ValueError("at least one trace aggregate is required")
+        aggregate_keys = [aggregate.key for aggregate in self.aggregates]
+        if len(aggregate_keys) != len(set(aggregate_keys)):
+            raise ValueError("trace fact aggregate output keys must be unique")
+        component_dimensions = set(self.group_by) | set(self.dimensions)
+        has_component_dimensions = bool(
+            component_dimensions & _COMPONENT_DIMENSION_NAMES
+        )
+        has_component_aggregates = any(
+            aggregate.component_field is not None for aggregate in self.aggregates
+        )
+        if has_component_dimensions and not has_component_aggregates:
+            raise ValueError(
+                "reward-component dimensions require reward-component aggregates"
+            )
+        if has_component_aggregates and any(
+            aggregate.component_field is None for aggregate in self.aggregates
+        ):
+            raise ValueError(
+                "scalar and reward-component aggregates must be queried separately"
+            )
         object.__setattr__(self, "dimensions", MappingProxyType(dict(self.dimensions)))
 
 
@@ -272,5 +371,11 @@ class TraceAggregateResult:
 def projection_id(payload: Mapping[str, object]) -> str:
     """Return the contract's deterministic projection digest for a raw payload."""
 
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode()
     return hashlib.sha256(encoded).hexdigest()

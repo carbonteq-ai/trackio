@@ -9,6 +9,7 @@ from trackio import (
     TraceAggregate,
     TraceFactsQuery,
     TraceFactUpdate,
+    TraceRewardComponent,
     VerifiersTrace,
 )
 from trackio.media import TrackioImage
@@ -114,7 +115,9 @@ def test_verifiers_trace_requires_native_identity():
         VerifiersTrace({"id": "trace", "version": "2"})
 
 
-def test_verifiers_trace_facts_are_idempotent_and_aggregate_without_payload_reads(temp_dir):
+def test_verifiers_trace_facts_are_idempotent_and_aggregate_without_payload_reads(
+    temp_dir,
+):
     run = Run(url=None, project="proj", client=None, name="facts-run", space_id=None)
     run.log({"rollout": VerifiersTrace(verifiers_record("facts-trace"))})
     run._flush_queues_inline()
@@ -127,10 +130,20 @@ def test_verifiers_trace_facts_are_idempotent_and_aggregate_without_payload_read
             "verifiers.trace",
             "test.v1",
             {"rollout_step": 4, "is_truncated": True, "model": "org/model"},
-            {"model_output_tokens": 12, "thinking_tokens": 5, "tool_calls": 1, "task_reward": 0.5},
+            {
+                "model_output_tokens": 12,
+                "thinking_tokens": 5,
+                "tool_calls": 1,
+                "task_reward": 0.5,
+            },
         ),
         dimensions={"rollout_step": 4, "is_truncated": True, "model": "org/model"},
-        measures={"model_output_tokens": 12, "thinking_tokens": 5, "tool_calls": 1, "task_reward": 0.5},
+        measures={
+            "model_output_tokens": 12,
+            "thinking_tokens": 5,
+            "tool_calls": 1,
+            "task_reward": 0.5,
+        },
         replace_reward_components=True,
     )
 
@@ -142,7 +155,10 @@ def test_verifiers_trace_facts_are_idempotent_and_aggregate_without_payload_read
         namespace="posttrain.train.reward",
         calculator_version="trl-grpo-reward.v1",
         projection_id=_projection_id(
-            "posttrain.train.reward", "trl-grpo-reward.v1", {}, {"algorithm_reward": 0.75}
+            "posttrain.train.reward",
+            "trl-grpo-reward.v1",
+            {},
+            {"algorithm_reward": 0.75},
         ),
         measures={"algorithm_reward": 0.75},
     )
@@ -152,7 +168,10 @@ def test_verifiers_trace_facts_are_idempotent_and_aggregate_without_payload_read
         "facts-run",
         TraceFactsQuery(
             group_by=("rollout_step",),
-            aggregates=(TraceAggregate("model_output_tokens"), TraceAggregate("tool_calls", "sum")),
+            aggregates=(
+                TraceAggregate("model_output_tokens"),
+                TraceAggregate("tool_calls", "sum"),
+            ),
         ),
         run_id=run.id,
     )
@@ -161,8 +180,14 @@ def test_verifiers_trace_facts_are_idempotent_and_aggregate_without_payload_read
     assert second.applied is False
     assert enriched.applied is True
     assert result.buckets[0].dimensions == {"rollout_step": 4}
-    assert result.buckets[0].values == {"mean_model_output_tokens": 12.0, "sum_tool_calls": 1.0}
-    assert result.buckets[0].coverage == {"mean_model_output_tokens": 1, "sum_tool_calls": 1}
+    assert result.buckets[0].values == {
+        "mean_model_output_tokens": 12.0,
+        "sum_tool_calls": 1.0,
+    }
+    assert result.buckets[0].coverage == {
+        "mean_model_output_tokens": 1,
+        "sum_tool_calls": 1,
+    }
     db_path = SQLiteStorage.get_project_db_path("proj")
     with SQLiteStorage._get_connection(db_path) as conn:
         row = conn.execute(
@@ -175,30 +200,187 @@ def test_verifiers_trace_facts_are_idempotent_and_aggregate_without_payload_read
 
 
 def test_initial_verifiers_trace_facts_are_persisted_with_the_native_trace(temp_dir):
-    run = Run(url=None, project="proj", client=None, name="initial-facts-run", space_id=None)
+    run = Run(
+        url=None, project="proj", client=None, name="initial-facts-run", space_id=None
+    )
     source = TraceFactUpdate(
         trace_type="verifiers",
         external_id="initial-facts-trace",
         namespace="verifiers.trace",
         calculator_version="test.v1",
         projection_id=_projection_id(
-            "verifiers.trace", "test.v1", {"rollout_step": 9}, {"model_output_tokens": 17}
+            "verifiers.trace",
+            "test.v1",
+            {"rollout_step": 9},
+            {"model_output_tokens": 17},
         ),
         dimensions={"rollout_step": 9},
         measures={"model_output_tokens": 17},
         replace_reward_components=True,
     )
-    run.log({"rollout": VerifiersTrace(verifiers_record("initial-facts-trace"), trace_facts=source)})
+    run.log(
+        {
+            "rollout": VerifiersTrace(
+                verifiers_record("initial-facts-trace"), trace_facts=source
+            )
+        }
+    )
     run._flush_queues_inline()
 
     result = SQLiteStorage.aggregate_trace_facts(
         "proj",
         "initial-facts-run",
-        TraceFactsQuery(group_by=("rollout_step",), aggregates=(TraceAggregate("model_output_tokens"),)),
+        TraceFactsQuery(
+            group_by=("rollout_step",),
+            aggregates=(TraceAggregate("model_output_tokens"),),
+        ),
         run_id=run.id,
     )
 
     assert result.buckets[0].values == {"mean_model_output_tokens": 17.0}
+
+
+def test_reward_component_aggregates_preserve_name_source_and_coverage(temp_dir):
+    run = Run(
+        url=None, project="proj", client=None, name="component-facts-run", space_id=None
+    )
+    for trace_id in ("component-trace-1", "component-trace-2"):
+        run.log({"rollout": VerifiersTrace(verifiers_record(trace_id))})
+    run._flush_queues_inline()
+
+    components = (
+        (
+            TraceRewardComponent(
+                "quality",
+                contribution=0.4,
+                score=0.4,
+                weight=1,
+                source_kind="llm_judge",
+            ),
+            TraceRewardComponent(
+                "format", contribution=0.1, source_kind="deterministic"
+            ),
+        ),
+        (
+            TraceRewardComponent(
+                "quality",
+                contribution=0.6,
+                score=0.6,
+                weight=1,
+                source_kind="llm_judge",
+            ),
+        ),
+    )
+    for trace_id, current_components in zip(
+        ("component-trace-1", "component-trace-2"), components, strict=True
+    ):
+        payload = {
+            "namespace": "verifiers.trace",
+            "calculator_version": "test.v1",
+            "dimensions": {"rollout_step": 5},
+            "measures": {
+                "task_reward": sum(
+                    component.contribution or 0 for component in current_components
+                )
+            },
+            "reward_components": [
+                {
+                    "name": component.name,
+                    "contribution": component.contribution,
+                    "score": component.score,
+                    "weight": component.weight,
+                    "source": {
+                        "kind": component.source_kind,
+                        "id": component.source_id,
+                    },
+                }
+                for component in sorted(current_components, key=lambda item: item.name)
+            ],
+            "provenance": {},
+            "state": "complete",
+        }
+        run.upsert_trace_facts(
+            TraceFactUpdate(
+                trace_type="verifiers",
+                external_id=trace_id,
+                namespace="verifiers.trace",
+                calculator_version="test.v1",
+                projection_id=projection_id(payload),
+                dimensions=payload["dimensions"],
+                measures=payload["measures"],
+                reward_components=current_components,
+                replace_reward_components=True,
+            )
+        )
+
+    grouped = SQLiteStorage.aggregate_trace_facts(
+        "proj",
+        "component-facts-run",
+        TraceFactsQuery(
+            group_by=(
+                "rollout_step",
+                "reward_component_name",
+                "reward_component_source_kind",
+            ),
+            aggregates=(TraceAggregate("reward_component_contribution"),),
+        ),
+        run_id=run.id,
+    )
+    exact = SQLiteStorage.aggregate_trace_facts(
+        "proj",
+        "component-facts-run",
+        TraceFactsQuery(
+            group_by=("rollout_step",),
+            aggregates=(
+                TraceAggregate("reward_component_score", component_name="quality"),
+            ),
+        ),
+        run_id=run.id,
+    )
+
+    assert [
+        (bucket.dimensions, bucket.trace_count, bucket.values, bucket.coverage)
+        for bucket in grouped.buckets
+    ] == [
+        (
+            {
+                "rollout_step": 5,
+                "reward_component_name": "format",
+                "reward_component_source_kind": "deterministic",
+            },
+            1,
+            {"mean_reward_component_contribution": 0.1},
+            {"mean_reward_component_contribution": 1},
+        ),
+        (
+            {
+                "rollout_step": 5,
+                "reward_component_name": "quality",
+                "reward_component_source_kind": "llm_judge",
+            },
+            2,
+            {"mean_reward_component_contribution": 0.5},
+            {"mean_reward_component_contribution": 2},
+        ),
+    ]
+    assert exact.buckets[0].trace_count == 2
+    assert exact.buckets[0].values == {"mean_reward_component_score": 0.5}
+    assert exact.buckets[0].coverage == {"mean_reward_component_score": 2}
+
+
+def test_component_aggregate_rejects_ambiguous_scalar_mixing():
+    with pytest.raises(ValueError, match="queried separately"):
+        TraceFactsQuery(
+            aggregates=(
+                TraceAggregate("task_reward"),
+                TraceAggregate("reward_component_contribution"),
+            ),
+        )
+    with pytest.raises(ValueError, match="require reward-component aggregates"):
+        TraceFactsQuery(
+            group_by=("reward_component_name",),
+            aggregates=(TraceAggregate("task_reward"),),
+        )
 
 
 def test_trace_fact_update_rejects_a_projection_id_for_a_different_payload():
@@ -302,19 +484,11 @@ def test_verifiers_trace_logging_is_idempotent_and_filterable(temp_dir):
     native = VerifiersTrace(verifiers_record())
     run.log({"rollout": native})
     run.log({"rollout": native})
-    run.log(
-        {
-            "conversation": Trace(
-                messages=[{"role": "user", "content": "standard"}]
-            )
-        }
-    )
+    run.log({"conversation": Trace(messages=[{"role": "user", "content": "standard"}])})
     run.finish()
 
     all_traces = SQLiteStorage.get_traces("proj", "trace-run")
-    verifiers = SQLiteStorage.get_traces(
-        "proj", "trace-run", trace_type="verifiers"
-    )
+    verifiers = SQLiteStorage.get_traces("proj", "trace-run", trace_type="verifiers")
     standard = SQLiteStorage.get_traces("proj", "trace-run", trace_type="trackio")
 
     assert len(all_traces) == 2
@@ -331,9 +505,7 @@ def test_verifiers_trace_search_does_not_index_native_payload(temp_dir):
     run.log({"rollout": VerifiersTrace(record)})
     run.finish()
 
-    assert SQLiteStorage.get_traces(
-        "proj", "trace-run", search="final branch"
-    )
+    assert SQLiteStorage.get_traces("proj", "trace-run", search="final branch")
     assert not SQLiteStorage.get_traces(
         "proj", "trace-run", search="payload-only-secret"
     )

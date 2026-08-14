@@ -1204,7 +1204,9 @@ class DorisStorage:
                 metrics = deserialize_values(metrics)
             if keys is not None:
                 selected = set(keys)
-                metrics = {key: value for key, value in metrics.items() if key in selected}
+                metrics = {
+                    key: value for key, value in metrics.items() if key in selected
+                }
             metrics["timestamp"] = str(row["timestamp"])
             metrics["step"] = int(row["step"])
             result.append(metrics)
@@ -1273,7 +1275,9 @@ class DorisStorage:
             metrics = _decode(row["metrics"])
             if keys is not None:
                 selected = set(keys)
-                metrics = {key: value for key, value in metrics.items() if key in selected}
+                metrics = {
+                    key: value for key, value in metrics.items() if key in selected
+                }
             metrics["timestamp"] = str(row["timestamp"])
             result.append(metrics)
         return result
@@ -1467,7 +1471,11 @@ class DorisStorage:
         row = cursor.fetchone()
         if row is None:
             raise KeyError(f"trace {trace_id!r} does not exist")
-        projection_column = "fact_projection_id" if update.replace_reward_components else "fact_algorithm_projection_id"
+        projection_column = (
+            "fact_projection_id"
+            if update.replace_reward_components
+            else "fact_algorithm_projection_id"
+        )
         dimensions = dict(update.dimensions)
         measures = dict(update.measures)
         if not update.replace_reward_components:
@@ -1493,8 +1501,18 @@ class DorisStorage:
                    (project_id, trace_id, run_id, projection_id, name, contribution, score, weight, source_kind, source_id)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 [
-                    (project, trace_id, row["run_id"], update.projection_id, item.name, item.contribution, item.score,
-                     item.weight, item.source_kind, item.source_id)
+                    (
+                        project,
+                        trace_id,
+                        row["run_id"],
+                        update.projection_id,
+                        item.name,
+                        item.contribution,
+                        item.score,
+                        item.weight,
+                        item.source_kind,
+                        item.source_id,
+                    )
                     for item in update.reward_components
                 ],
             )
@@ -1509,14 +1527,27 @@ class DorisStorage:
                fact_trace_latency_ms=%s, fact_task_reward=%s
                WHERE project_id=%s AND trace_id=%s""",
                 (
-                    update.namespace, update.calculator_version, update.projection_id, update.state,
-                    update.calculated_at.isoformat(), _json(dimensions), _json(dict(update.provenance)),
-                    dimensions.get("model"), dimensions.get("task_type"), dimensions.get("rollout_step"),
-                    dimensions.get("is_truncated"), dimensions.get("has_error"),
-                    measures.get("model_input_tokens"), measures.get("model_output_tokens"),
-                    measures.get("thinking_tokens"), measures.get("tool_calls"), measures.get("model_calls"),
-                    measures.get("trace_latency_ms"), measures.get("task_reward"),
-                    project, trace_id,
+                    update.namespace,
+                    update.calculator_version,
+                    update.projection_id,
+                    update.state,
+                    update.calculated_at.isoformat(),
+                    _json(dimensions),
+                    _json(dict(update.provenance)),
+                    dimensions.get("model"),
+                    dimensions.get("task_type"),
+                    dimensions.get("rollout_step"),
+                    dimensions.get("is_truncated"),
+                    dimensions.get("has_error"),
+                    measures.get("model_input_tokens"),
+                    measures.get("model_output_tokens"),
+                    measures.get("thinking_tokens"),
+                    measures.get("tool_calls"),
+                    measures.get("model_calls"),
+                    measures.get("trace_latency_ms"),
+                    measures.get("task_reward"),
+                    project,
+                    trace_id,
                 ),
             )
         cursor.execute(
@@ -1528,7 +1559,12 @@ class DorisStorage:
 
     @classmethod
     def upsert_trace_facts(
-        cls, project: str, run: str, update: TraceFactUpdate, *, run_id: str | None = None
+        cls,
+        project: str,
+        run: str,
+        update: TraceFactUpdate,
+        *,
+        run_id: str | None = None,
     ) -> TraceFactWriteReceipt:
         with cls._connection() as connection, connection.cursor() as cursor:
             resolved = cls._resolve_run_id(cursor, project, run, run_id, table="traces")
@@ -1542,16 +1578,28 @@ class DorisStorage:
             row = cursor.fetchone()
             if row is None:
                 raise KeyError(f"trace {update.external_id!r} does not exist")
-            applied = cls._upsert_trace_facts_cursor(cursor, project, row["trace_id"], update)
+            applied = cls._upsert_trace_facts_cursor(
+                cursor, project, row["trace_id"], update
+            )
             return TraceFactWriteReceipt(row["trace_id"], update.projection_id, applied)
 
     @classmethod
     def aggregate_trace_facts(
-        cls, project: str, run: str, query: TraceFactsQuery, *, run_id: str | None = None
+        cls,
+        project: str,
+        run: str,
+        query: TraceFactsQuery,
+        *,
+        run_id: str | None = None,
     ) -> TraceAggregateResult:
         columns = {
-            "model": "fact_model", "task_type": "fact_task_type", "rollout_step": "fact_rollout_step",
-            "is_truncated": "fact_is_truncated", "has_error": "fact_has_error",
+            "model": "traces.fact_model",
+            "task_type": "traces.fact_task_type",
+            "rollout_step": "traces.fact_rollout_step",
+            "is_truncated": "traces.fact_is_truncated",
+            "has_error": "traces.fact_has_error",
+            "reward_component_name": "components.name",
+            "reward_component_source_kind": "components.source_kind",
         }
         if any(name not in columns for name in (*query.group_by, *query.dimensions)):
             raise ValueError("requested dimension is not materialized for aggregation")
@@ -1559,27 +1607,75 @@ class DorisStorage:
             resolved = cls._resolve_run_id(cursor, project, run, run_id, table="traces")
             if resolved is None:
                 return TraceAggregateResult(())
-            where, params = ["project_id=%s", "run_id=%s", "trace_type=%s", "fact_projection_id IS NOT NULL"], [project, resolved, query.trace_type]
+            component_query = any(
+                item.component_field is not None for item in query.aggregates
+            )
+            where, params = (
+                [
+                    "traces.project_id=%s",
+                    "traces.run_id=%s",
+                    "traces.trace_type=%s",
+                    "traces.fact_projection_id IS NOT NULL",
+                ],
+                [project, resolved, query.trace_type],
+            )
             for name, expected in query.dimensions.items():
                 where.append(f"{columns[name]} <=> %s")
                 params.append(expected)
             grouped = [columns[name] for name in query.group_by]
-            select = [f"{columns[name]} AS {name}" for name in query.group_by] + ["COUNT(*) AS trace_count"]
+            select = [f"{columns[name]} AS {name}" for name in query.group_by] + [
+                "COUNT(DISTINCT traces.trace_id) AS trace_count"
+                if component_query
+                else "COUNT(*) AS trace_count"
+            ]
             for item in query.aggregates:
-                key, field = f"{item.operation}_{item.measure}", f"fact_{item.measure}"
-                expression = {"mean": "AVG", "sum": "SUM", "count": "COUNT", "min": "MIN", "max": "MAX"}[item.operation]
-                select.extend((f"{expression}({field}) AS {key}", f"COUNT({field}) AS coverage_{key}"))
-            sql = f"SELECT {', '.join(select)} FROM traces WHERE {' AND '.join(where)}"
+                key = item.key
+                field = (
+                    f"components.{item.component_field}"
+                    if component_query
+                    else f"traces.fact_{item.measure}"
+                )
+                expression = {
+                    "mean": "AVG",
+                    "sum": "SUM",
+                    "count": "COUNT",
+                    "min": "MIN",
+                    "max": "MAX",
+                }[item.operation]
+                select.extend(
+                    (
+                        f"{expression}({field}) AS {key}",
+                        f"COUNT({field}) AS coverage_{key}",
+                    )
+                )
+            source = "traces"
+            if component_query:
+                source += " JOIN trace_reward_components AS components ON components.project_id = traces.project_id AND components.trace_id = traces.trace_id AND components.projection_id = traces.fact_projection_id"
+                for item in query.aggregates:
+                    if item.component_name is not None:
+                        where.append("components.name=%s")
+                        params.append(item.component_name)
+            sql = (
+                f"SELECT {', '.join(select)} FROM {source} WHERE {' AND '.join(where)}"
+            )
             if grouped:
                 sql += f" GROUP BY {', '.join(grouped)}"
+                sql += f" ORDER BY {', '.join(grouped)}"
             cursor.execute(sql, params)
-            return TraceAggregateResult(tuple(
-                TraceAggregateBucket(
-                    {name: row[name] for name in query.group_by}, int(row["trace_count"]),
-                    {f"{item.operation}_{item.measure}": row[f"{item.operation}_{item.measure}"] for item in query.aggregates},
-                    {f"{item.operation}_{item.measure}": row[f"coverage_{item.operation}_{item.measure}"] for item in query.aggregates},
-                ) for row in cursor.fetchall()
-            ))
+            return TraceAggregateResult(
+                tuple(
+                    TraceAggregateBucket(
+                        {name: row[name] for name in query.group_by},
+                        int(row["trace_count"]),
+                        {item.key: row[item.key] for item in query.aggregates},
+                        {
+                            item.key: row[f"coverage_{item.key}"]
+                            for item in query.aggregates
+                        },
+                    )
+                    for row in cursor.fetchall()
+                )
+            )
 
     @classmethod
     def get_traces(
@@ -1642,13 +1738,17 @@ class DorisStorage:
                 "run_id": row["run_id"],
                 "step": row["step"],
                 "timestamp": row["timestamp"],
-                "messages": SQLiteStorage._trace_messages_for_read(row["messages"], include_payload),
+                "messages": SQLiteStorage._trace_messages_for_read(
+                    row["messages"], include_payload
+                ),
                 "metadata": _decode(row["metadata"]),
                 "trace_type": row["trace_type"],
                 "external_id": row["external_id"],
                 "schema_version": row["schema_version"],
                 "payload": (
-                    SQLiteStorage._trace_payload_for_read(row["payload"], include_payload)
+                    SQLiteStorage._trace_payload_for_read(
+                        row["payload"], include_payload
+                    )
                     if row["payload"] is not None
                     else None
                 ),
@@ -2470,7 +2570,9 @@ class DorisStorage:
                 )
                 rows = list(cursor.fetchall())
                 if len(rows) != len(set(artifact_version_ids)):
-                    raise ValueError("Trackio artifact purge set changed; obtain a new preview")
+                    raise ValueError(
+                        "Trackio artifact purge set changed; obtain a new preview"
+                    )
                 cursor.execute(
                     f"SELECT version_id FROM run_artifact_links "
                     f"WHERE project_id = %s AND version_id IN ({placeholders}) LIMIT 1",
@@ -2479,7 +2581,9 @@ class DorisStorage:
                 if cursor.fetchone() is not None:
                     raise ValueError("Trackio artifact purge set still has consumers")
                 for row in rows:
-                    deleted_digests.update(manifest_blob_digests(_decode(row["manifest"])))
+                    deleted_digests.update(
+                        manifest_blob_digests(_decode(row["manifest"]))
+                    )
                 cursor.execute(
                     f"DELETE FROM artifact_aliases WHERE project_id = %s AND version_id IN ({placeholders})",
                     params,
@@ -2495,7 +2599,10 @@ class DorisStorage:
                     (project,),
                 )
 
-            cursor.execute("SELECT manifest FROM artifact_versions WHERE project_id = %s", (project,))
+            cursor.execute(
+                "SELECT manifest FROM artifact_versions WHERE project_id = %s",
+                (project,),
+            )
             retained_digests: set[str] = set()
             for row in cursor.fetchall():
                 retained_digests.update(manifest_blob_digests(_decode(row["manifest"])))
@@ -2522,7 +2629,9 @@ class DorisStorage:
 
     @classmethod
     def list_artifact_blobs_present(cls, project: str, digests: list[str]) -> list[str]:
-        return [digest for digest in digests if get_artifact_store().has(project, digest)]
+        return [
+            digest for digest in digests if get_artifact_store().has(project, digest)
+        ]
 
     @classmethod
     def _unsupported(cls, *args: Any, **kwargs: Any) -> Any:

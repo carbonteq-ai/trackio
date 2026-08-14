@@ -2135,7 +2135,9 @@ class SQLiteStorage:
             metrics = orjson.loads(row["metrics"])
             if keys is not None:
                 selected = set(keys)
-                metrics = {key: value for key, value in metrics.items() if key in selected}
+                metrics = {
+                    key: value for key, value in metrics.items() if key in selected
+                }
             metrics = deserialize_values(metrics)
             metrics["timestamp"] = row["timestamp"]
             results.append(metrics)
@@ -2431,7 +2433,9 @@ class SQLiteStorage:
                 metrics = deserialize_values(metrics)
             if keys is not None:
                 selected = set(keys)
-                metrics = {key: value for key, value in metrics.items() if key in selected}
+                metrics = {
+                    key: value for key, value in metrics.items() if key in selected
+                }
             metrics["timestamp"] = row["timestamp"]
             metrics["step"] = row["step"]
             results.append(metrics)
@@ -2467,7 +2471,9 @@ class SQLiteStorage:
         rows = cursor.fetchall()
         if limit is None and offset == 0 and keys is None:
             rows = SQLiteStorage._subsample_metric_rows(rows, max_points)
-        return SQLiteStorage._metric_rows_to_log_dicts(rows, scalar_only=scalar_only, keys=keys)
+        return SQLiteStorage._metric_rows_to_log_dicts(
+            rows, scalar_only=scalar_only, keys=keys
+        )
 
     @staticmethod
     def get_logs(
@@ -2804,7 +2810,9 @@ class SQLiteStorage:
         )
 
     @staticmethod
-    def _upsert_trace_facts_cursor(cursor: sqlite3.Cursor, trace_id: str, update: TraceFactUpdate) -> bool:
+    def _upsert_trace_facts_cursor(
+        cursor: sqlite3.Cursor, trace_id: str, update: TraceFactUpdate
+    ) -> bool:
         dimensions = dict(update.dimensions)
         measures = dict(update.measures)
         cursor.execute(
@@ -2814,7 +2822,11 @@ class SQLiteStorage:
         row = cursor.fetchone()
         if row is None:
             raise KeyError(f"trace {trace_id!r} does not exist")
-        projection_column = "fact_projection_id" if update.replace_reward_components else "fact_algorithm_projection_id"
+        projection_column = (
+            "fact_projection_id"
+            if update.replace_reward_components
+            else "fact_algorithm_projection_id"
+        )
         if row[projection_column] == update.projection_id:
             return False
         if not update.replace_reward_components:
@@ -2837,24 +2849,51 @@ class SQLiteStorage:
                fact_model_input_tokens=?, fact_model_output_tokens=?, fact_thinking_tokens=?,
                fact_tool_calls=?, fact_model_calls=?, fact_trace_latency_ms=?, fact_task_reward=? WHERE id=?""",
             (
-                update.namespace, update.calculator_version, update.projection_id, update.state,
-                update.calculated_at.isoformat(), orjson.dumps(dimensions), orjson.dumps(dict(update.provenance)),
-                dimensions.get("model"), dimensions.get("task_type"), dimensions.get("rollout_step"),
-                int(dimensions["is_truncated"]) if dimensions.get("is_truncated") is not None else None,
-                int(dimensions["has_error"]) if dimensions.get("has_error") is not None else None,
-                measures.get("model_input_tokens"), measures.get("model_output_tokens"),
-                measures.get("thinking_tokens"), measures.get("tool_calls"), measures.get("model_calls"),
-                measures.get("trace_latency_ms"), measures.get("task_reward"), trace_id,
+                update.namespace,
+                update.calculator_version,
+                update.projection_id,
+                update.state,
+                update.calculated_at.isoformat(),
+                orjson.dumps(dimensions),
+                orjson.dumps(dict(update.provenance)),
+                dimensions.get("model"),
+                dimensions.get("task_type"),
+                dimensions.get("rollout_step"),
+                int(dimensions["is_truncated"])
+                if dimensions.get("is_truncated") is not None
+                else None,
+                int(dimensions["has_error"])
+                if dimensions.get("has_error") is not None
+                else None,
+                measures.get("model_input_tokens"),
+                measures.get("model_output_tokens"),
+                measures.get("thinking_tokens"),
+                measures.get("tool_calls"),
+                measures.get("model_calls"),
+                measures.get("trace_latency_ms"),
+                measures.get("task_reward"),
+                trace_id,
             ),
         )
-        cursor.execute("DELETE FROM trace_reward_components WHERE trace_id = ?", (trace_id,))
+        cursor.execute(
+            "DELETE FROM trace_reward_components WHERE trace_id = ?", (trace_id,)
+        )
         cursor.executemany(
             """INSERT INTO trace_reward_components
                (trace_id, run_id, projection_id, name, contribution, score, weight, source_kind, source_id)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
-                (trace_id, row["run_id"], update.projection_id, item.name, item.contribution, item.score, item.weight,
-                 item.source_kind, item.source_id)
+                (
+                    trace_id,
+                    row["run_id"],
+                    update.projection_id,
+                    item.name,
+                    item.contribution,
+                    item.score,
+                    item.weight,
+                    item.source_kind,
+                    item.source_id,
+                )
                 for item in update.reward_components
             ],
         )
@@ -2865,8 +2904,13 @@ class SQLiteStorage:
         project: str, run: str, update: TraceFactUpdate, *, run_id: str | None = None
     ) -> TraceFactWriteReceipt:
         db_path = SQLiteStorage.init_db(project)
-        with SQLiteStorage._get_process_lock(project), SQLiteStorage._get_connection(db_path) as conn:
-            identity = SQLiteStorage._resolve_run_identity(conn, run_name=run, run_id=run_id, table="traces")
+        with (
+            SQLiteStorage._get_process_lock(project),
+            SQLiteStorage._get_connection(db_path) as conn,
+        ):
+            identity = SQLiteStorage._resolve_run_identity(
+                conn, run_name=run, run_id=run_id, table="traces"
+            )
             if identity is None:
                 raise KeyError(f"run {run!r} does not exist")
             column, value = identity
@@ -2878,7 +2922,9 @@ class SQLiteStorage:
             row = cursor.fetchone()
             if row is None:
                 raise KeyError(f"trace {update.external_id!r} does not exist")
-            applied = SQLiteStorage._upsert_trace_facts_cursor(cursor, row["id"], update)
+            applied = SQLiteStorage._upsert_trace_facts_cursor(
+                cursor, row["id"], update
+            )
             conn.commit()
             return TraceFactWriteReceipt(row["id"], update.projection_id, applied)
 
@@ -2887,8 +2933,13 @@ class SQLiteStorage:
         project: str, run: str, query: TraceFactsQuery, *, run_id: str | None = None
     ) -> TraceAggregateResult:
         columns = {
-            "model": "fact_model", "task_type": "fact_task_type", "rollout_step": "fact_rollout_step",
-            "is_truncated": "fact_is_truncated", "has_error": "fact_has_error",
+            "model": "traces.fact_model",
+            "task_type": "traces.fact_task_type",
+            "rollout_step": "traces.fact_rollout_step",
+            "is_truncated": "traces.fact_is_truncated",
+            "has_error": "traces.fact_has_error",
+            "reward_component_name": "components.name",
+            "reward_component_source_kind": "components.source_kind",
         }
         if any(name not in columns for name in (*query.group_by, *query.dimensions)):
             raise ValueError("requested dimension is not materialized for aggregation")
@@ -2896,35 +2947,72 @@ class SQLiteStorage:
         if not db_path.exists():
             return TraceAggregateResult(())
         with SQLiteStorage._get_connection(db_path) as conn:
-            identity = SQLiteStorage._resolve_run_identity(conn, run_name=run, run_id=run_id, table="traces")
+            identity = SQLiteStorage._resolve_run_identity(
+                conn, run_name=run, run_id=run_id, table="traces"
+            )
             if identity is None:
                 return TraceAggregateResult(())
             run_column, run_value = identity
-            where, params = [f"{run_column} = ?", "trace_type = ?", "fact_projection_id IS NOT NULL"], [run_value, query.trace_type]
+            component_query = any(
+                item.component_field is not None for item in query.aggregates
+            )
+            where, params = (
+                [
+                    f"traces.{run_column} = ?",
+                    "traces.trace_type = ?",
+                    "traces.fact_projection_id IS NOT NULL",
+                ],
+                [run_value, query.trace_type],
+            )
             for name, expected in query.dimensions.items():
                 where.append(f"{columns[name]} IS ?")
                 params.append(expected)
             grouped = [columns[name] for name in query.group_by]
-            select = [f"{columns[name]} AS {name}" for name in query.group_by] + ["COUNT(*) AS trace_count"]
+            select = [f"{columns[name]} AS {name}" for name in query.group_by] + [
+                "COUNT(DISTINCT traces.id) AS trace_count"
+                if component_query
+                else "COUNT(*) AS trace_count"
+            ]
             for item in query.aggregates:
-                key, field = f"{item.operation}_{item.measure}", f"fact_{item.measure}"
+                key = item.key
+                field = (
+                    f"components.{item.component_field}"
+                    if component_query
+                    else f"traces.fact_{item.measure}"
+                )
                 select += [
-                    f"{ {'mean': 'AVG', 'sum': 'SUM', 'count': 'COUNT', 'min': 'MIN', 'max': 'MAX'}[item.operation]}({field}) AS {key}",
+                    f"{ {'mean': 'AVG', 'sum': 'SUM', 'count': 'COUNT', 'min': 'MIN', 'max': 'MAX'}[item.operation] }({field}) AS {key}",
                     f"COUNT({field}) AS coverage_{key}",
                 ]
-            sql = f"SELECT {', '.join(select)} FROM traces WHERE {' AND '.join(where)}"
+            source = "traces"
+            if component_query:
+                source += " JOIN trace_reward_components AS components ON components.trace_id = traces.id AND components.projection_id = traces.fact_projection_id"
+                for item in query.aggregates:
+                    if item.component_name is not None:
+                        where.append("components.name = ?")
+                        params.append(item.component_name)
+            sql = (
+                f"SELECT {', '.join(select)} FROM {source} WHERE {' AND '.join(where)}"
+            )
             if grouped:
                 sql += f" GROUP BY {', '.join(grouped)}"
+                sql += f" ORDER BY {', '.join(grouped)}"
             cursor = conn.cursor()
             cursor.execute(sql, params)
-            return TraceAggregateResult(tuple(
-                TraceAggregateBucket(
-                    {name: row[name] for name in query.group_by}, int(row["trace_count"]),
-                    {f"{item.operation}_{item.measure}": row[f"{item.operation}_{item.measure}"] for item in query.aggregates},
-                    {f"{item.operation}_{item.measure}": row[f"coverage_{item.operation}_{item.measure}"] for item in query.aggregates},
+            return TraceAggregateResult(
+                tuple(
+                    TraceAggregateBucket(
+                        {name: row[name] for name in query.group_by},
+                        int(row["trace_count"]),
+                        {item.key: row[item.key] for item in query.aggregates},
+                        {
+                            item.key: row[f"coverage_{item.key}"]
+                            for item in query.aggregates
+                        },
+                    )
+                    for row in cursor.fetchall()
                 )
-                for row in cursor.fetchall()
-            ))
+            )
 
     @staticmethod
     def get_traces(
@@ -3016,13 +3104,17 @@ class SQLiteStorage:
                 "run_id": row["run_id"],
                 "step": row["step"],
                 "timestamp": row["timestamp"],
-                "messages": SQLiteStorage._trace_messages_for_read(row["messages"], include_payload),
+                "messages": SQLiteStorage._trace_messages_for_read(
+                    row["messages"], include_payload
+                ),
                 "metadata": deserialize_values(orjson.loads(row["metadata"])),
                 "trace_type": row["trace_type"],
                 "external_id": row["external_id"],
                 "schema_version": row["schema_version"],
                 "payload": (
-                    SQLiteStorage._trace_payload_for_read(row["payload"], include_payload)
+                    SQLiteStorage._trace_payload_for_read(
+                        row["payload"], include_payload
+                    )
                     if row["payload"] is not None
                     else None
                 ),
@@ -3031,7 +3123,9 @@ class SQLiteStorage:
         ]
 
     @staticmethod
-    def _trace_payload_for_read(raw: Any, include_payload: bool) -> dict[str, Any] | None:
+    def _trace_payload_for_read(
+        raw: Any, include_payload: bool
+    ) -> dict[str, Any] | None:
         payload = deserialize_values(orjson.loads(raw))
         if include_payload or not isinstance(payload, dict):
             return payload
@@ -3095,7 +3189,11 @@ class SQLiteStorage:
                         (thinking_tokens, "reasoning_tokens"),
                     ):
                         value = usage.get(key)
-                        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        if (
+                            isinstance(value, int)
+                            and not isinstance(value, bool)
+                            and value >= 0
+                        ):
                             values.append(value)
                 clock = call.get("time")
                 if isinstance(clock, dict):
@@ -3141,7 +3239,9 @@ class SQLiteStorage:
         for item in messages:
             if not isinstance(item, dict):
                 continue
-            message = item.get("message") if isinstance(item.get("message"), dict) else item
+            message = (
+                item.get("message") if isinstance(item.get("message"), dict) else item
+            )
             role = str(message.get("role", "")).lower()
             if role == "user" and not selected:
                 selected.append(item)
@@ -3149,7 +3249,9 @@ class SQLiteStorage:
         for item in reversed(messages):
             if not isinstance(item, dict):
                 continue
-            message = item.get("message") if isinstance(item.get("message"), dict) else item
+            message = (
+                item.get("message") if isinstance(item.get("message"), dict) else item
+            )
             if str(message.get("role", "")).lower() == "assistant":
                 selected.append(item)
                 break
@@ -3414,7 +3516,9 @@ class SQLiteStorage:
         if db_path.exists():
             try:
                 with SQLiteStorage._get_connection(db_path) as conn:
-                    rows = conn.execute("SELECT manifest FROM artifact_versions").fetchall()
+                    rows = conn.execute(
+                        "SELECT manifest FROM artifact_versions"
+                    ).fetchall()
                     for row in rows:
                         try:
                             artifact_digests.update(
@@ -3811,7 +3915,9 @@ class SQLiteStorage:
         db_path = SQLiteStorage.get_project_db_path(project)
         if not db_path.exists():
             raise ValueError(f"Trackio project {project!r} does not exist")
-        records = {record["id"]: record for record in SQLiteStorage.get_run_records(project)}
+        records = {
+            record["id"]: record for record in SQLiteStorage.get_run_records(project)
+        }
         missing = [run_id for run_id in run_ids if run_id not in records]
         if missing:
             raise ValueError(f"Trackio runs do not exist: {missing!r}")
@@ -3829,7 +3935,13 @@ class SQLiteStorage:
                     )
                     if identity is None:
                         raise ValueError(f"Trackio run {run_id!r} disappeared")
-                    for table in ("metrics", "configs", "system_metrics", "alerts", "traces"):
+                    for table in (
+                        "metrics",
+                        "configs",
+                        "system_metrics",
+                        "alerts",
+                        "traces",
+                    ):
                         try:
                             cursor.execute(
                                 f"DELETE FROM {table} WHERE {identity[0]} = ?",
@@ -3848,13 +3960,17 @@ class SQLiteStorage:
                         artifact_version_ids,
                     ).fetchall()
                     if len(rows) != len(set(artifact_version_ids)):
-                        raise ValueError("Trackio artifact purge set changed; obtain a new preview")
+                        raise ValueError(
+                            "Trackio artifact purge set changed; obtain a new preview"
+                        )
                     linked = cursor.execute(
                         f"SELECT DISTINCT artifact_version_id FROM run_artifact_links WHERE artifact_version_id IN ({placeholders})",
                         artifact_version_ids,
                     ).fetchall()
                     if linked:
-                        raise ValueError("Trackio artifact purge set still has consumers")
+                        raise ValueError(
+                            "Trackio artifact purge set still has consumers"
+                        )
                     for row in rows:
                         try:
                             deleted_digests.update(
@@ -3876,7 +3992,9 @@ class SQLiteStorage:
                 conn.commit()
 
                 retained_digests: set[str] = set()
-                for row in cursor.execute("SELECT manifest FROM artifact_versions").fetchall():
+                for row in cursor.execute(
+                    "SELECT manifest FROM artifact_versions"
+                ).fetchall():
                     try:
                         retained_digests.update(
                             manifest_blob_digests(json_mod.loads(row["manifest"]))
