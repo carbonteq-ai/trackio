@@ -237,6 +237,43 @@ def test_initial_verifiers_trace_facts_are_persisted_with_the_native_trace(temp_
     assert result.buckets[0].values == {"mean_model_output_tokens": 17.0}
 
 
+def test_remote_trace_fact_upsert_retries_until_queued_parent_arrives(monkeypatch):
+    class Client:
+        def __init__(self):
+            self.calls = 0
+
+        def predict(self, *, api_name, **kwargs):
+            assert api_name == "/upsert_trace_facts"
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("trace 'queued-parent' does not exist")
+            return {"trace_id": "parent", "projection_id": kwargs["update"]["projection_id"], "applied": True}
+
+    monkeypatch.setattr("trackio.run.time.sleep", lambda _: None)
+    client = Client()
+    run = Run(
+        url="https://trackio.invalid",
+        project="proj",
+        client=client,
+        name="remote-facts-run",
+        server_base_url="https://trackio.invalid",
+    )
+    update = TraceFactUpdate(
+        trace_type="verifiers",
+        external_id="queued-parent",
+        namespace="posttrain.train.reward",
+        calculator_version="test.v1",
+        projection_id=_projection_id("posttrain.train.reward", "test.v1", {}, {"algorithm_reward": 0.5}),
+        measures={"algorithm_reward": 0.5},
+    )
+
+    receipt = run.upsert_trace_facts(update)
+    run.finish()
+
+    assert receipt.applied is True
+    assert client.calls == 2
+
+
 def test_reward_component_aggregates_preserve_name_source_and_coverage(temp_dir):
     run = Run(
         url=None, project="proj", client=None, name="component-facts-run", space_id=None

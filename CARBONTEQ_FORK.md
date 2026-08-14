@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev6`.
+working candidate is `0.31.5.post14.dev7`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -104,7 +104,7 @@ returns only those safe scalar summaries. This repairs historical Observatory
 rows whose full detail had timing and token evidence while their paged summary
 showed it as missing.
 
-## Trace-facts candidate (`0.31.5.post14.dev6`)
+## Trace-facts candidate (`0.31.5.post14.dev7`)
 
 This candidate adds a generic, typed trace-facts projection for native
 Verifiers traces. The full native record remains in `traces.payload` as replay
@@ -147,6 +147,12 @@ new target. A coordinated recovery cutover may explicitly choose
 record is present while allowing an existing Doris project to retain additional
 valid history. Run-bound tables are queried only for source run IDs in bounded
 chunks, so this verification does not scan unrelated retained runs.
+
+Remote trace-fact enrichment has a bounded causal-readiness retry. A native
+trace is sent by Trackio's normal asynchronous log batch, while a later
+trace-keyed enrichment may immediately follow. The SDK retries only the
+specific missing-parent response long enough for that queued trace to arrive;
+other errors are not retried or hidden.
 
 No fork workflow builds or publishes releases. A maintainer builds and checks
 the candidate locally, commits and pushes the exact source, creates an

@@ -46,6 +46,14 @@ BATCH_SEND_INTERVAL = 0.5
 MAX_BACKOFF = 30
 BUCKET_FLUSH_INTERVAL = 30
 ARTIFACT_LOG_RETRY_BACKOFFS = (0.5, 1.0, 2.0)
+TRACE_FACT_PARENT_READY_BACKOFFS = (0.1, 0.2, 0.5)
+
+
+def _is_missing_trace_error(error: RuntimeError) -> bool:
+    """Recognize only the causal race between queued trace logging and an upsert."""
+
+    message = str(error).lower()
+    return "trace" in message and "does not exist" in message
 
 
 class Run:
@@ -1233,16 +1241,24 @@ class Run:
                 self.project, self.name, update, run_id=self.id
             )
         self._wait_for_client_ready()
-        with self._client_lock:
-            if self._client is None:
-                raise RuntimeError("trackio remote client is not available")
-            response = self._client.predict(
-                api_name="/upsert_trace_facts",
-                project=self.project,
-                run=self.name,
-                run_id=self.id,
-                update=update.payload(),
-            )
+        for attempt in range(len(TRACE_FACT_PARENT_READY_BACKOFFS) + 1):
+            try:
+                with self._client_lock:
+                    if self._client is None:
+                        raise RuntimeError("trackio remote client is not available")
+                    response = self._client.predict(
+                        api_name="/upsert_trace_facts",
+                        project=self.project,
+                        run=self.name,
+                        run_id=self.id,
+                        update=update.payload(),
+                    )
+            except RuntimeError as error:
+                if attempt == len(TRACE_FACT_PARENT_READY_BACKOFFS) or not _is_missing_trace_error(error):
+                    raise
+                time.sleep(TRACE_FACT_PARENT_READY_BACKOFFS[attempt])
+            else:
+                break
         return TraceFactWriteReceipt(**response)
 
     def aggregate_trace_facts(self, query: TraceFactsQuery) -> TraceAggregateResult:
