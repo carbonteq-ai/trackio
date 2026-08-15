@@ -654,6 +654,26 @@ class SQLiteStorage:
                     )
                     """
                 )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS pending_trace_facts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        space_id TEXT NOT NULL,
+                        run_id TEXT NOT NULL,
+                        run_name TEXT NOT NULL,
+                        projection_id TEXT NOT NULL,
+                        update_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        UNIQUE(space_id, run_id, projection_id)
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_pending_trace_facts_space
+                    ON pending_trace_facts(space_id, id)
+                    """
+                )
 
                 cursor.execute(
                     """
@@ -5096,6 +5116,12 @@ class SQLiteStorage:
                     return True
             except sqlite3.OperationalError:
                 pass
+            try:
+                cursor.execute("SELECT EXISTS(SELECT 1 FROM pending_trace_facts LIMIT 1)")
+                if cursor.fetchone()[0]:
+                    return True
+            except sqlite3.OperationalError:
+                pass
             return False
 
     @staticmethod
@@ -5163,6 +5189,91 @@ class SQLiteStorage:
     @staticmethod
     def clear_pending_system_logs(project: str, metric_ids: list[int]) -> None:
         SQLiteStorage._clear_pending(project, "system_metrics", metric_ids)
+
+    @staticmethod
+    def add_pending_trace_facts(
+        project: str,
+        space_id: str,
+        entries: list[dict],
+    ) -> None:
+        """Durably retain remote fact updates until the server acknowledges them."""
+
+        if not entries:
+            return
+        db_path = SQLiteStorage.init_db(project)
+        created_at = datetime.now(timezone.utc).isoformat()
+        rows = []
+        for entry in entries:
+            update = TraceFactUpdate.from_payload(entry["update"])
+            rows.append(
+                (
+                    space_id,
+                    str(entry["run_id"]),
+                    str(entry["run"]),
+                    update.projection_id,
+                    orjson.dumps(update.payload()).decode("utf-8"),
+                    created_at,
+                )
+            )
+        with SQLiteStorage._get_process_lock(project):
+            with SQLiteStorage._get_connection(db_path) as conn:
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO pending_trace_facts
+                        (space_id, run_id, run_name, projection_id, update_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+                conn.commit()
+
+    @staticmethod
+    def get_pending_trace_facts(project: str) -> dict | None:
+        db_path = SQLiteStorage.get_project_db_path(project)
+        if not db_path.exists():
+            return None
+        with SQLiteStorage._get_connection(db_path) as conn:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT id, space_id, run_id, run_name, update_json
+                    FROM pending_trace_facts
+                    ORDER BY id
+                    """
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return None
+        if not rows:
+            return None
+        return {
+            "entries": [
+                {
+                    "project": project,
+                    "run": row["run_name"],
+                    "run_id": row["run_id"],
+                    "update": orjson.loads(row["update_json"]),
+                }
+                for row in rows
+            ],
+            "ids": [row["id"] for row in rows],
+            "space_id": rows[0]["space_id"],
+        }
+
+    @staticmethod
+    def clear_pending_trace_facts(project: str, ids: list[int]) -> None:
+        if not ids:
+            return
+        db_path = SQLiteStorage.get_project_db_path(project)
+        if not db_path.exists():
+            return
+        with SQLiteStorage._get_process_lock(project):
+            with SQLiteStorage._get_connection(db_path) as conn:
+                placeholders = ",".join("?" * len(ids))
+                conn.execute(
+                    f"DELETE FROM pending_trace_facts WHERE id IN ({placeholders})",
+                    ids,
+                )
+                conn.commit()
 
     @staticmethod
     def _clear_pending(project: str, table: str, ids: list[int]) -> None:

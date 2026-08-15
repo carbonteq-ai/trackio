@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev16`.
+working candidate is `0.31.5.post14.dev17`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -104,7 +104,7 @@ returns only those safe scalar summaries. This repairs historical Observatory
 rows whose full detail had timing and token evidence while their paged summary
 showed it as missing.
 
-## Trace-facts candidate (`0.31.5.post14.dev16`)
+## Trace-facts candidate (`0.31.5.post14.dev17`)
 
 This candidate adds a generic, typed trace-facts projection for native
 Verifiers traces. The full native record remains in `traces.payload` as replay
@@ -180,14 +180,28 @@ session survives after its content-addressed blob is removed, initialization
 reopens the same idempotent session and accepts the bytes again instead of
 skipping deleted chunks and failing completion with HTTP 409.
 
+`0.31.5.post14.dev17` restores the durable inbox as the normal path for native
+trace metrics. The prior dev8--dev10 causal workaround made a training process
+wait for synchronous Doris writes before every later reward fact, which could
+exhaust the HTTP client timeout. Remote `Run.enqueue_trace_facts()` now sends
+the idempotent fact update to `/enqueue_trace_facts`; the server durably writes
+both native trace metrics and later facts to its mounted inbox, then imports
+metrics before facts. A missing parent returns the fact fragment to the inbox
+for retry. `Run.upsert_trace_facts()` and `Run.flush()` remain the explicit
+synchronous read-after-write APIs for callers that truly require an immediate
+receipt. The post-training adapter uses the new enqueue API, so ordinary
+training never waits for Doris trace persistence.
+
 The contract is implemented in `trackio/trace_facts.py`, accepted on an
-initial `VerifiersTrace` write or through `Run.upsert_trace_facts`, persisted by
+initial `VerifiersTrace` write or through `Run.enqueue_trace_facts` /
+`Run.upsert_trace_facts`, persisted by
 both `SQLiteStorage` and `DorisStorage`, and served through
-`/upsert_trace_facts`, `/bulk_upsert_trace_facts`, and `/get_trace_facts`. Projection IDs are verified
-SHA-256 identities, so retries are idempotent and a replacement component set
-cannot leave stale component rows visible. Trackio validates generic shapes
-and accounting invariants; Posttrain's Verifiers projector remains responsible
-for tokens, tools, truncation, reward semantics, and model/template rules.
+`/enqueue_trace_facts`, `/upsert_trace_facts`, `/bulk_upsert_trace_facts`, and
+`/get_trace_facts`. Projection IDs are verified SHA-256 identities, so retries
+are idempotent and a replacement component set cannot leave stale component
+rows visible. Trackio validates generic shapes and accounting invariants;
+Posttrain's Verifiers projector remains responsible for tokens, tools,
+truncation, reward semantics, and model/template rules.
 
 Apache Doris moves directly from global schema version 1 to version 2. The
 candidate includes an explicit backup-gated `trackio storage migrate-doris`
@@ -202,11 +216,11 @@ record is present while allowing an existing Doris project to retain additional
 valid history. Run-bound tables are queried only for source run IDs in bounded
 chunks, so this verification does not scan unrelated retained runs.
 
-Remote trace-fact enrichment has a bounded causal-readiness retry. A native
-trace is sent by Trackio's normal asynchronous log batch, while a later
-trace-keyed enrichment may immediately follow. The SDK retries only the
-specific missing-parent response long enough for that queued trace to arrive;
-other errors are not retried or hidden.
+Normal remote trace-fact enrichment is queued into the same durable importer
+pipeline as its native parent. The importer writes source metrics before facts
+in one claimed batch and retries a fact fragment that arrives before its
+parent. The old bounded causal-readiness retry remains only on the explicit
+synchronous `Run.upsert_trace_facts()` API; it is not a training hot path.
 
 No fork workflow builds or publishes releases. A maintainer builds and checks
 the candidate locally, commits and pushes the exact source, creates an

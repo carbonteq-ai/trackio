@@ -47,6 +47,7 @@ MAX_BACKOFF = 30
 BUCKET_FLUSH_INTERVAL = 30
 ARTIFACT_LOG_RETRY_BACKOFFS = (0.5, 1.0, 2.0)
 TRACE_FACT_PARENT_READY_BACKOFFS = (0.1, 0.2, 0.5)
+TRACE_FACT_DELIVERY_BATCH_SIZE = 1_000
 
 
 def _is_missing_trace_error(error: RuntimeError) -> bool:
@@ -193,6 +194,7 @@ class Run:
         self._queued_system_logs: list[SystemLogEntry] = []
         self._queued_uploads: list[UploadEntry] = []
         self._queued_alerts: list[AlertEntry] = []
+        self._queued_trace_facts: list[dict[str, Any]] = []
         self._stop_flag = threading.Event()
         self._config_logged = False
         max_step = self._safe_get_max_step_for_run()
@@ -361,6 +363,11 @@ class Run:
             alerts_to_send = self._queued_alerts.copy()
             self._queued_alerts.clear()
             self._write_alerts_to_sqlite(alerts_to_send)
+
+        if self._queued_trace_facts:
+            trace_facts_to_send = self._queued_trace_facts.copy()
+            self._queued_trace_facts.clear()
+            self._persist_trace_facts_locally(trace_facts_to_send)
 
     def _local_batch_sender(self):
         while (
@@ -555,6 +562,7 @@ class Run:
             or len(self._queued_system_logs) > 0
             or len(self._queued_uploads) > 0
             or len(self._queued_alerts) > 0
+            or len(self._queued_trace_facts) > 0
             or self._has_local_buffer
         ):
             if not self._stop_flag.is_set():
@@ -586,6 +594,11 @@ class Run:
                             if self._queued_alerts:
                                 self._write_alerts_to_sqlite(self._queued_alerts)
                                 self._queued_alerts.clear()
+                            if self._queued_trace_facts:
+                                self._persist_trace_facts_locally(
+                                    self._queued_trace_facts
+                                )
+                                self._queued_trace_facts.clear()
                         return
 
                     failed = False
@@ -640,6 +653,15 @@ class Run:
                             )
                         except Exception:
                             self._write_alerts_to_sqlite(alerts_to_send)
+                            failed = True
+
+                    if self._queued_trace_facts:
+                        facts_to_send = self._queued_trace_facts.copy()
+                        self._queued_trace_facts.clear()
+                        try:
+                            self._send_trace_facts(facts_to_send)
+                        except Exception:
+                            self._persist_trace_facts_locally(facts_to_send)
                             failed = True
 
                     if failed:
@@ -753,6 +775,31 @@ class Run:
                 f"trackio could not persist failed remote system logs locally for run '{self.name}': {e}. User code will continue, but this batch could be lost.",
             )
 
+    def _persist_trace_facts_locally(self, entries: list[dict[str, Any]]) -> None:
+        if not self._remote_storage_key:
+            return
+        try:
+            SQLiteStorage.add_pending_trace_facts(
+                self.project, self._remote_storage_key, entries
+            )
+            self._has_local_buffer = True
+        except Exception as e:
+            self._warn_once(
+                "persist-trace-facts-locally",
+                f"trackio could not persist failed remote trace facts for run '{self.name}': {e}. User code will continue, but this batch could be lost.",
+            )
+
+    def _send_trace_facts(self, entries: list[dict[str, Any]]) -> None:
+        for start in range(0, len(entries), TRACE_FACT_DELIVERY_BATCH_SIZE):
+            batch = entries[start : start + TRACE_FACT_DELIVERY_BATCH_SIZE]
+            response = self._client.predict(
+                api_name="/enqueue_trace_facts",
+                entries=batch,
+                hf_token=self._hf_token_for_remote(),
+            )
+            if response != {"accepted": len(batch)}:
+                raise RuntimeError("Trackio did not acknowledge queued trace facts")
+
     @staticmethod
     def _upload_entry_file_path(entry: UploadEntry) -> str:
         file_data = entry.get("uploaded_file")
@@ -828,13 +875,14 @@ class Run:
             warn_missing=self._warn_missing_uploads,
         )
 
-    def _flush_local_buffer(self) -> bool:
+    def _flush_local_buffer(self, *, synchronous: bool = False) -> bool:
         try:
             buffered_logs = SQLiteStorage.get_pending_logs(self.project)
             if buffered_logs:
                 self._client.predict(
                     api_name="/bulk_log",
                     logs=buffered_logs["logs"],
+                    synchronous=synchronous,
                     hf_token=self._hf_token_for_remote(),
                 )
                 SQLiteStorage.clear_pending_logs(self.project, buffered_logs["ids"])
@@ -853,6 +901,17 @@ class Run:
             buffered_uploads = SQLiteStorage.get_pending_uploads(self.project)
             if buffered_uploads:
                 self._send_pending_uploads_to_server(buffered_uploads)
+
+            buffered_trace_facts = SQLiteStorage.get_pending_trace_facts(self.project)
+            if buffered_trace_facts:
+                entries = buffered_trace_facts["entries"]
+                ids = buffered_trace_facts["ids"]
+                for start in range(0, len(entries), TRACE_FACT_DELIVERY_BATCH_SIZE):
+                    end = start + TRACE_FACT_DELIVERY_BATCH_SIZE
+                    self._send_trace_facts(entries[start:end])
+                    SQLiteStorage.clear_pending_trace_facts(
+                        self.project, ids[start:end]
+                    )
 
             self._has_local_buffer = False
             return True
@@ -1257,6 +1316,7 @@ class Run:
                             self._client.predict(
                                 api_name="/bulk_log",
                                 logs=logs_to_send,
+                                synchronous=True,
                                 hf_token=self._hf_token_for_remote(),
                             )
                         except Exception:
@@ -1278,6 +1338,29 @@ class Run:
             else:
                 break
         return TraceFactWriteReceipt(**response)
+
+    def enqueue_trace_facts(self, update: TraceFactUpdate) -> TraceFactWriteReceipt | None:
+        """Queue an idempotent fact enrichment without blocking on Doris.
+
+        Remote callers receive only durable-inbox acknowledgement in the
+        background; use :meth:`upsert_trace_facts` when immediate storage
+        visibility and a receipt are explicitly required.
+        """
+
+        if self._is_local:
+            return SQLiteStorage.upsert_trace_facts(
+                self.project, self.name, update, run_id=self.id
+            )
+        entry = {
+            "project": self.project,
+            "run": self.name,
+            "run_id": self.id,
+            "update": update.payload(),
+        }
+        with self._client_lock:
+            self._queued_trace_facts.append(entry)
+            self._ensure_sender_alive()
+        return None
 
     def aggregate_trace_facts(self, query: TraceFactsQuery) -> TraceAggregateResult:
         """Return bounded fact aggregates without reading native trace payloads."""
@@ -1334,12 +1417,15 @@ class Run:
                     self._client.predict(
                         api_name="/bulk_log",
                         logs=logs_to_send,
+                        synchronous=True,
                         hf_token=self._hf_token_for_remote(),
                     )
                 except Exception:
                     self._queued_logs[0:0] = logs_to_send
                     raise
-            if self._has_local_buffer and not self._flush_local_buffer():
+            if self._has_local_buffer and not self._flush_local_buffer(
+                synchronous=True
+            ):
                 raise RuntimeError("Trackio buffered observations could not be delivered")
 
     def _artifact_log_with_retry(self, **kwargs) -> dict:

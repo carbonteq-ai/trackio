@@ -318,6 +318,44 @@ def test_remote_trace_fact_upsert_retries_until_queued_parent_arrives(monkeypatc
     assert client.calls == 2
 
 
+def test_remote_trace_fact_enqueue_uses_durable_async_route(monkeypatch):
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def predict(self, *, api_name, **kwargs):
+            self.calls.append((api_name, kwargs))
+            assert api_name == "/enqueue_trace_facts"
+            return {"accepted": len(kwargs["entries"])}
+
+    client = Client()
+    run = Run(
+        url="https://trackio.invalid",
+        project="proj",
+        client=client,
+        name="remote-facts-run",
+        server_base_url="https://trackio.invalid",
+    )
+    monkeypatch.setattr(run, "_ensure_sender_alive", lambda: None)
+    update = TraceFactUpdate(
+        trace_type="verifiers",
+        external_id="queued-parent",
+        namespace="posttrain.train.reward",
+        calculator_version="test.v1",
+        projection_id=_projection_id(
+            "posttrain.train.reward", "test.v1", {}, {"algorithm_reward": 0.5}
+        ),
+        measures={"algorithm_reward": 0.5},
+    )
+
+    assert run.enqueue_trace_facts(update) is None
+    run._stop_flag.set()
+    run._batch_sender()
+
+    assert [api_name for api_name, _ in client.calls] == ["/enqueue_trace_facts"]
+    assert client.calls[0][1]["entries"][0]["update"]["external_id"] == "queued-parent"
+
+
 def test_remote_trace_fact_upsert_sends_queued_parent_before_enrichment():
     class Client:
         def __init__(self):

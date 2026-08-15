@@ -81,6 +81,7 @@ _MAX_RETRIES = 30
 
 _LOGS_BATCH_MAX_RUNS = 64
 _LOGS_BATCH_MAX_POINTS = 10_000
+_TRACE_FACT_BATCH_MAX_UPDATES = 1_000
 _server_fragment_writer = fragments.FragmentWriter()
 
 
@@ -119,22 +120,6 @@ def _enqueue_metric_fragment(
     _server_fragment_writer.write_local(records)
 
 
-def _contains_trace_metrics(metrics_list: list[dict]) -> bool:
-    """Whether a metric batch contains a native trace requiring read-after-write.
-
-    Doris normally acknowledges metric fragments before its inbox importer has
-    made them queryable.  A later trace-fact upsert is dependent on the native
-    trace row, so those batches must use the synchronous storage path.  Ordinary
-    scalar metrics retain the durable asynchronous fast path.
-    """
-
-    return any(
-        isinstance(metrics, dict)
-        and any(str(key).startswith("traces/") for key in metrics)
-        for metrics in metrics_list
-    )
-
-
 def _enqueue_system_fragment(
     *,
     project: str,
@@ -159,6 +144,19 @@ def _enqueue_system_fragment(
             )
         )
     _server_fragment_writer.write_local(records)
+
+
+def _enqueue_trace_fact_fragments(entries: list[dict[str, Any]]) -> None:
+    """Durably accept fact enrichments without waiting for Doris.
+
+    Trace facts refer to native traces that may still be in the same inbox.  The
+    importer applies the native trace records first and retains a fact fragment
+    for retry when its parent has not arrived yet.
+    """
+
+    _server_fragment_writer.write_local(
+        [fragments.trace_fact_record(entry) for entry in entries]
+    )
 
 
 def _enqueue_alert_fragment(
@@ -1029,6 +1027,7 @@ def bulk_log(
     request: Request,
     logs: list[LogEntry],
     hf_token: str | None,
+    synchronous: bool = False,
 ) -> None:
     assert_can_write_metrics(request, hf_token)
 
@@ -1059,9 +1058,7 @@ def bulk_log(
             config=data["config"],
             log_ids=data["log_ids"] if has_log_ids else None,
         )
-        if _use_async_doris_writes() and not _contains_trace_metrics(
-            data["metrics"]
-        ):
+        if _use_async_doris_writes() and not synchronous:
             _enqueue_metric_fragment(**payload)
             continue
         try:
@@ -1479,6 +1476,50 @@ def upsert_trace_facts(
     return {"trace_id": receipt.trace_id, "projection_id": receipt.projection_id, "applied": receipt.applied}
 
 
+def enqueue_trace_facts(
+    request: Request,
+    entries: list[dict[str, Any]],
+    hf_token: str | None,
+) -> dict[str, int]:
+    """Durably queue bounded trace-fact enrichments for asynchronous import.
+
+    This intentionally does not report a storage receipt.  It acknowledges that
+    the idempotent update is present in the server inbox; an explicit caller
+    needing read-after-write must continue to use :func:`upsert_trace_facts`.
+    """
+
+    assert_can_write_metrics(request, hf_token)
+    if len(entries) > _TRACE_FACT_BATCH_MAX_UPDATES:
+        raise TrackioAPIError(
+            f"trace fact entries cannot contain more than {_TRACE_FACT_BATCH_MAX_UPDATES} updates"
+        )
+    normalized: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise TrackioAPIError("trace fact entry must be an object")
+        project = _validate_project_name(entry.get("project"))
+        run = entry.get("run")
+        if not isinstance(run, str) or not run:
+            raise TrackioAPIError("trace fact entry run must be non-empty text")
+        run_id = entry.get("run_id")
+        if run_id is not None and not isinstance(run_id, str):
+            raise TrackioAPIError("trace fact entry run_id must be text or null")
+        update = entry.get("update")
+        if not isinstance(update, dict):
+            raise TrackioAPIError("trace fact entry update must be an object")
+        parsed = TraceFactUpdate.from_payload(update)
+        normalized.append(
+            {
+                "project": project,
+                "run": run,
+                "run_id": run_id,
+                "update": parsed.payload(),
+            }
+        )
+    _enqueue_trace_fact_fragments(normalized)
+    return {"accepted": len(normalized)}
+
+
 def bulk_upsert_trace_facts(
     project: str,
     run: str,
@@ -1743,6 +1784,7 @@ def _api_registry() -> dict[str, Any]:
         "get_trace_steps": get_trace_steps,
         "get_trace_count": get_trace_count,
         "upsert_trace_facts": upsert_trace_facts,
+        "enqueue_trace_facts": enqueue_trace_facts,
         "bulk_upsert_trace_facts": bulk_upsert_trace_facts,
         "get_trace_facts": get_trace_facts,
         "query_project": query_project,

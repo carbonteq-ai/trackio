@@ -1,10 +1,13 @@
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 import trackio
 from trackio import Run, fragments, utils
 from trackio.remote_client import RemoteClient as Client
 from trackio.sqlite_storage import SQLiteStorage
+from trackio.trace_facts import TraceFactUpdate, projection_id
 
 
 def make_metric_entries(project="proj", run="run1", run_id="rid1", n=3):
@@ -39,6 +42,128 @@ def test_metric_fragment_roundtrip_and_idempotent_import(temp_dir):
 
     fragments.import_records(parsed)
     assert len(SQLiteStorage.get_logs("proj", "run1")) == 3
+
+
+def test_native_trace_and_later_fact_fragment_import_in_causal_order(temp_dir):
+    source_payload = {
+        "namespace": "verifiers.trace",
+        "calculator_version": "test.v1",
+        "dimensions": {},
+        "measures": {"task_reward": 0.25},
+        "reward_components": [],
+        "provenance": {},
+        "state": "complete",
+    }
+    source = TraceFactUpdate(
+        trace_type="verifiers",
+        external_id="trace-1",
+        projection_id=projection_id(source_payload),
+        replace_reward_components=True,
+        **source_payload,
+    )
+    native = trackio.VerifiersTrace(
+        {"id": "trace-1", "version": 2, "nodes": []}, trace_facts=source
+    )._to_dict("proj", "run", 1)
+    payload = {
+        "namespace": "posttrain.train.reward",
+        "calculator_version": "test.v1",
+        "dimensions": {},
+        "measures": {"algorithm_reward": 0.5},
+        "reward_components": [],
+        "provenance": {},
+        "state": "complete",
+    }
+    update = TraceFactUpdate(
+        trace_type="verifiers",
+        external_id="trace-1",
+        projection_id=projection_id(payload),
+        **payload,
+    )
+    records = [
+        fragments.trace_fact_record(
+            {
+                "project": "proj",
+                "run": "run",
+                "run_id": "run-id",
+                "update": update.payload(),
+            }
+        ),
+        fragments.metric_record(
+            {
+                "project": "proj",
+                "run": "run",
+                "run_id": "run-id",
+                "metrics": {"traces/verifiers": native},
+                "step": 1,
+                "log_id": "trace-log",
+            }
+        ),
+    ]
+
+    assert fragments.import_records(records) == 2
+    facts = SQLiteStorage.aggregate_trace_facts(
+        "proj",
+        "run",
+        trackio.TraceFactsQuery(
+            trace_type="verifiers",
+            aggregates=(trackio.TraceAggregate("algorithm_reward"),),
+        ),
+        run_id="run-id",
+    )
+    assert facts.buckets[0].values["mean_algorithm_reward"] == 0.5
+
+
+def test_trace_fact_fragment_is_requeued_until_its_parent_is_ready(
+    temp_dir, monkeypatch
+):
+    update = TraceFactUpdate(
+        trace_type="verifiers",
+        external_id="delayed-parent",
+        namespace="posttrain.train.reward",
+        calculator_version="test.v1",
+        projection_id=projection_id(
+            {
+                "namespace": "posttrain.train.reward",
+                "calculator_version": "test.v1",
+                "dimensions": {},
+                "measures": {"algorithm_reward": 0.5},
+                "reward_components": [],
+                "provenance": {},
+                "state": "complete",
+            }
+        ),
+        measures={"algorithm_reward": 0.5},
+    )
+    writer = fragments.FragmentWriter(writer_id="fact-before-parent")
+    path = writer.write_local(
+        [
+            fragments.trace_fact_record(
+                {
+                    "project": "proj",
+                    "run": "run",
+                    "run_id": "run-id",
+                    "update": update.payload(),
+                }
+            )
+        ]
+    )
+    assert path is not None
+
+    def parent_not_ready(**kwargs):
+        del kwargs
+        raise KeyError("trace 'delayed-parent' does not exist")
+
+    monkeypatch.setattr(
+        "trackio.storage.Storage.upsert_trace_facts_batch", parent_not_ready
+    )
+    claimed = fragments.claim_inbox_batch(max_files=1)
+    with pytest.raises(KeyError, match="delayed-parent"):
+        fragments.import_claimed_fragments(claimed)
+
+    # The failed claim is returned unchanged to the durable inbox for a later
+    # scanner pass, rather than silently losing a reward enrichment.
+    assert path.exists()
+    assert not list(fragments.local_inbox_dir().rglob("*.processing"))
 
 
 def test_parse_tolerates_corrupt_and_unknown_lines():

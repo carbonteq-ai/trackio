@@ -1,4 +1,4 @@
-"""Append-only JSONL fragments used as a durable fallback for metric logging.
+"""Append-only JSONL fragments used as a durable inbox for Trackio writes.
 
 Fragments are immutable JSONL files, one writer (process) per subdirectory, so
 concurrent training processes never contend on a shared file. They are written
@@ -34,7 +34,8 @@ BUCKET_MEDIA_PREFIX = "trackio/media"
 METRIC_KIND = "metric"
 SYSTEM_METRIC_KIND = "system_metric"
 ALERT_KIND = "alert"
-KINDS = {METRIC_KIND, SYSTEM_METRIC_KIND, ALERT_KIND}
+TRACE_FACT_KIND = "trace_fact"
+KINDS = {METRIC_KIND, SYSTEM_METRIC_KIND, ALERT_KIND, TRACE_FACT_KIND}
 
 
 def local_inbox_dir() -> Path:
@@ -84,6 +85,24 @@ def alert_record(entry: AlertEntry | dict) -> dict:
         "step": entry.get("step"),
         "timestamp": entry.get("timestamp"),
         "alert_id": entry.get("alert_id"),
+    }
+
+
+def trace_fact_record(entry: dict) -> dict:
+    """Return one idempotent trace-fact update for the durable inbox.
+
+    The update is deliberately separate from the native trace payload.  A
+    trainer can calculate its algorithm reward later, while the importer keeps
+    retrying this record until the trace it references is visible.
+    """
+
+    return {
+        "v": FRAGMENT_VERSION,
+        "kind": TRACE_FACT_KIND,
+        "project": entry["project"],
+        "run": entry["run"],
+        "run_id": entry.get("run_id"),
+        "update": utils.serialize_values(entry["update"]),
     }
 
 
@@ -195,6 +214,8 @@ class ClaimedFragment:
 
 
 def _record_contains_trace(record: dict) -> bool:
+    if record.get("kind") == TRACE_FACT_KIND:
+        return True
     if record.get("kind") != METRIC_KIND:
         return False
     metrics = record.get("metrics") or {}
@@ -203,10 +224,12 @@ def _record_contains_trace(record: dict) -> bool:
 
 def import_records(records: list[dict]) -> int:
     from trackio.storage import Storage  # noqa: PLC0415
+    from trackio.trace_facts import TraceFactUpdate  # noqa: PLC0415
 
     metric_records = [r for r in records if r.get("kind") == METRIC_KIND]
     system_records = [r for r in records if r.get("kind") == SYSTEM_METRIC_KIND]
     alert_records = [r for r in records if r.get("kind") == ALERT_KIND]
+    trace_fact_records = [r for r in records if r.get("kind") == TRACE_FACT_KIND]
     imported = 0
 
     for (project, run, run_id), group in _group_by_run(metric_records).items():
@@ -237,6 +260,21 @@ def import_records(records: list[dict]) -> int:
             metrics_list=[r.get("metrics") or {} for r in group],
             timestamps=[r["timestamp"] for r in group] if has_timestamps else None,
             log_ids=[r.get("log_id") for r in group],
+        )
+        imported += len(group)
+
+    # Import source metric records before fact records.  A fact fragment that
+    # arrives in an earlier scanner batch is left intact on a missing-parent
+    # error and retried after the source trace is imported.
+    for (project, run, run_id), group in _group_by_run(trace_fact_records).items():
+        if not project or not run:
+            continue
+        updates = [TraceFactUpdate.from_payload(record["update"]) for record in group]
+        Storage.upsert_trace_facts_batch(
+            project=project,
+            run=run,
+            run_id=run_id,
+            updates=updates,
         )
         imported += len(group)
 
