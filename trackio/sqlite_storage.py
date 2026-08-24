@@ -98,6 +98,13 @@ def _read_only() -> bool:
     }
 
 
+def _json_path(key: str) -> str:
+    """Return one bound SQLite JSON path for an exact top-level metric key."""
+
+    escaped = key.replace("\\", "\\\\").replace('"', '\\"')
+    return f'$."{escaped}"'
+
+
 def _configure_read_only_pragmas(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA query_only = ON")
     conn.execute("PRAGMA temp_store = MEMORY")
@@ -2471,14 +2478,29 @@ class SQLiteStorage:
         limit: int | None = None,
         offset: int = 0,
         keys: Sequence[str] | None = None,
+        start_step: int | None = None,
+        end_step: int | None = None,
+        drop_empty: bool = False,
     ) -> list[dict[str, Any]]:
         query = f"""
             SELECT timestamp, step, metrics
             FROM metrics
             WHERE {run_identity[0]} = ?
-            ORDER BY timestamp, id
         """
         params: list[Any] = [run_identity[1]]
+        if start_step is not None:
+            query += " AND step >= ?"
+            params.append(max(0, int(start_step)))
+        if end_step is not None:
+            query += " AND step <= ?"
+            params.append(max(0, int(end_step)))
+        if drop_empty and keys:
+            predicates = []
+            for key in dict.fromkeys(keys):
+                predicates.append("json_extract(metrics, ?) IS NOT NULL")
+                params.append(_json_path(key))
+            query += " AND (" + " OR ".join(predicates) + ")"
+        query += " ORDER BY timestamp, id"
         if limit is not None:
             query += " LIMIT ?"
             params.append(max(0, int(limit)))
@@ -2505,6 +2527,9 @@ class SQLiteStorage:
         limit: int | None = None,
         offset: int = 0,
         keys: Sequence[str] | None = None,
+        start_step: int | None = None,
+        end_step: int | None = None,
+        drop_empty: bool = False,
     ) -> list[dict]:
         """Retrieve logs for a specific run. Logs include the step count (int) and the timestamp (datetime object)."""
         db_path = SQLiteStorage.get_project_db_path(project)
@@ -2514,7 +2539,14 @@ class SQLiteStorage:
         cache_key = _logs_read_cache_key(
             project, run, run_id, max_points, scalar_only=scalar_only
         )
-        if limit is None and offset == 0 and keys is None:
+        cacheable = (
+            limit is None
+            and offset == 0
+            and keys is None
+            and start_step is None
+            and end_step is None
+        )
+        if cacheable:
             cached = _logs_read_cache_get(db_path, cache_key)
             if cached is not None:
                 return cached
@@ -2536,13 +2568,16 @@ class SQLiteStorage:
                         limit=limit,
                         offset=offset,
                         keys=keys,
+                        start_step=start_step,
+                        end_step=end_step,
+                        drop_empty=drop_empty,
                     )
         except sqlite3.OperationalError as e:
             if "no such table: metrics" in str(e):
                 return []
             raise
 
-        if limit is None and offset == 0 and keys is None:
+        if cacheable:
             _logs_read_cache_put(db_path, cache_key, logs)
         return [{**d} for d in logs]
 

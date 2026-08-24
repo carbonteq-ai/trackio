@@ -57,6 +57,13 @@ def _json(value: Any) -> str:
     return orjson.dumps(serialize_values(value)).decode("utf-8")
 
 
+def _json_path(key: str) -> str:
+    """Return one bound Doris path for an exact top-level metric key."""
+
+    escaped = key.replace("\\", "\\\\").replace('"', '\\"')
+    return f'$."{escaped}"'
+
+
 def _decode(value: str | bytes) -> Any:
     return deserialize_values(orjson.loads(value))
 
@@ -1168,17 +1175,43 @@ class DorisStorage:
         limit: int | None = None,
         offset: int = 0,
         keys: Sequence[str] | None = None,
+        start_step: int | None = None,
+        end_step: int | None = None,
+        drop_empty: bool = False,
     ) -> list[dict]:
         with cls._connection() as connection, connection.cursor() as cursor:
             resolved = cls._resolve_run_id(cursor, project, run, run_id)
             if resolved is None:
                 return []
-            query = """
-                SELECT timestamp, step, metrics FROM metrics
+            projected_keys = tuple(dict.fromkeys(keys)) if keys is not None else None
+            params: list[Any] = []
+            if projected_keys is None:
+                select_metrics = "metrics"
+            else:
+                projections = []
+                for index, key in enumerate(projected_keys):
+                    projections.append(f"JSON_EXTRACT(metrics, %s) AS metric_{index}")
+                    params.append(_json_path(key))
+                select_metrics = ", ".join(projections)
+            query = f"""
+                SELECT timestamp, step{', ' if select_metrics else ''}{select_metrics}
+                FROM metrics
                 WHERE project_id = %s AND run_id = %s
-                ORDER BY timestamp, event_id
             """
-            params: list[Any] = [project, resolved]
+            params.extend((project, resolved))
+            if start_step is not None:
+                query += " AND step >= %s"
+                params.append(max(0, int(start_step)))
+            if end_step is not None:
+                query += " AND step <= %s"
+                params.append(max(0, int(end_step)))
+            if drop_empty and projected_keys:
+                predicates = []
+                for key in projected_keys:
+                    predicates.append("JSON_EXTRACT(metrics, %s) IS NOT NULL")
+                    params.append(_json_path(key))
+                query += " AND (" + " OR ".join(predicates) + ")"
+            query += " ORDER BY timestamp, event_id"
             if limit is not None:
                 query += " LIMIT %s"
                 params.append(max(0, int(limit)))
@@ -1193,7 +1226,15 @@ class DorisStorage:
                 rows = cls._subsample(rows, max_points)
         result = []
         for row in rows:
-            metrics = orjson.loads(row["metrics"])
+            if projected_keys is None:
+                metrics = orjson.loads(row["metrics"])
+            else:
+                metrics = {}
+                for index, key in enumerate(projected_keys):
+                    value = row.get(f"metric_{index}")
+                    if value is None:
+                        continue
+                    metrics[key] = orjson.loads(value) if isinstance(value, str | bytes) else value
             if scalar_only:
                 metrics = {
                     key: value
@@ -1202,11 +1243,6 @@ class DorisStorage:
                 }
             else:
                 metrics = deserialize_values(metrics)
-            if keys is not None:
-                selected = set(keys)
-                metrics = {
-                    key: value for key, value in metrics.items() if key in selected
-                }
             metrics["timestamp"] = str(row["timestamp"])
             metrics["step"] = int(row["step"])
             result.append(metrics)
@@ -1252,12 +1288,22 @@ class DorisStorage:
             )
             if resolved is None:
                 return []
-            query = """
-                SELECT timestamp, metrics FROM system_metrics
+            projected_keys = tuple(dict.fromkeys(keys)) if keys is not None else None
+            params: list[Any] = []
+            if projected_keys is None:
+                select_metrics = "metrics"
+            else:
+                projections = []
+                for index, key in enumerate(projected_keys):
+                    projections.append(f"JSON_EXTRACT(metrics, %s) AS metric_{index}")
+                    params.append(_json_path(key))
+                select_metrics = ", ".join(projections)
+            query = f"""
+                SELECT timestamp{', ' if select_metrics else ''}{select_metrics} FROM system_metrics
                 WHERE project_id = %s AND run_id = %s
                 ORDER BY timestamp, event_id
             """
-            params: list[Any] = [project, resolved]
+            params.extend((project, resolved))
             if limit is not None:
                 query += " LIMIT %s"
                 params.append(max(0, int(limit)))
@@ -1272,12 +1318,16 @@ class DorisStorage:
                 rows = cls._subsample(rows, max_points)
         result = []
         for row in rows:
-            metrics = _decode(row["metrics"])
-            if keys is not None:
-                selected = set(keys)
-                metrics = {
-                    key: value for key, value in metrics.items() if key in selected
-                }
+            if projected_keys is None:
+                metrics = _decode(row["metrics"])
+            else:
+                metrics = {}
+                for index, key in enumerate(projected_keys):
+                    value = row.get(f"metric_{index}")
+                    if value is None:
+                        continue
+                    metrics[key] = orjson.loads(value) if isinstance(value, str | bytes) else value
+                metrics = deserialize_values(metrics)
             metrics["timestamp"] = str(row["timestamp"])
             result.append(metrics)
         return result

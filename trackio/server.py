@@ -1360,8 +1360,16 @@ def get_run_history(
     limit: int | None = None,
     offset: int = 0,
     keys: list[str] | None = None,
+    start_step: int | None = None,
+    end_step: int | None = None,
+    drop_empty: bool = False,
 ) -> list[dict[str, Any]]:
     """Return unsampled run history for provider-neutral API consumers."""
+
+    start = _normalize_read_page(start_step, "start_step")
+    end = _normalize_read_page(end_step, "end_step")
+    if start is not None and end is not None and start > end:
+        raise TrackioAPIError("start_step cannot exceed end_step")
 
     return Storage.get_logs(
         project,
@@ -1372,6 +1380,9 @@ def get_run_history(
         limit=_normalize_read_page(limit, "limit"),
         offset=_normalize_read_page(offset, "offset", default=0) or 0,
         keys=_normalize_read_keys(keys),
+        start_step=start,
+        end_step=end,
+        drop_empty=_normalize_bool_param(drop_empty, "drop_empty"),
     )
 
 

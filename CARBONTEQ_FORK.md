@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev17`.
+working candidate is `0.31.5.post14.dev18`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -104,7 +104,7 @@ returns only those safe scalar summaries. This repairs historical Observatory
 rows whose full detail had timing and token evidence while their paged summary
 showed it as missing.
 
-## Trace-facts candidate (`0.31.5.post14.dev17`)
+## Trace-facts candidate (`0.31.5.post14.dev18`)
 
 This candidate adds a generic, typed trace-facts projection for native
 Verifiers traces. The full native record remains in `traces.payload` as replay
@@ -191,6 +191,18 @@ for retry. `Run.upsert_trace_facts()` and `Run.flush()` remain the explicit
 synchronous read-after-write APIs for callers that truly require an immediate
 receipt. The post-training adapter uses the new enqueue API, so ordinary
 training never waits for Doris trace persistence.
+
+`0.31.5.post14.dev18` extends `Run.history` with
+inclusive `start_step` and `end_step` bounds. SQLite and Doris apply those
+bounds before ordering and paging. When callers request metric names, Doris
+uses bound JSON-path extraction for only those names instead of returning the
+complete metrics object for every row. The same SQL projection applies to
+requested system-metric names while preserving the existing run-wide bounded
+sampling behavior. An opt-in `drop_empty` argument excludes rows where every
+requested key is absent before pagination; its default preserves the existing
+timestamp/step-only projection rows. Unbounded history remains an explicit
+compatible operation. The client and server must be deployed together before
+consumers rely on the new arguments.
 
 The contract is implemented in `trackio/trace_facts.py`, accepted on an
 initial `VerifiersTrace` write or through `Run.enqueue_trace_facts` /
@@ -293,6 +305,7 @@ added later without changing the Trackio SDK contract.
 | `0.31.5.post8` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post12` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post13` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
+| `0.31.5.post14.dev18` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 
 `0.31.5.post4` adds project-scoped bulk read APIs so a client can describe every
 run without one configuration request and one history request per run:

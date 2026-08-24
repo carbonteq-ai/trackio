@@ -125,6 +125,8 @@ def test_api_exposes_stable_run_reads(temp_dir):
     )
     assert all(set(row) <= {"cpu/utilization", "timestamp"} for row in projected_system)
     assert [row["step"] for row in run.history(limit=1, offset=1)] == [1]
+    assert [row["step"] for row in run.history(start_step=1, end_step=1)] == [1]
+    assert [row["step"] for row in run.history(keys=["train/loss"], drop_empty=True)] == [0, 1]
     assert [row["cpu/utilization"] for row in run.system_history(limit=1, offset=1)] == [51.0]
 
     traces = run.traces(sort="step_asc")
@@ -220,6 +222,9 @@ def test_api_remote_reader_uses_live_server_queries(monkeypatch):
                     "metrics": ["train/loss"],
                 }
             if api_name == "/get_run_history":
+                assert kwargs["start_step"] is None
+                assert kwargs["end_step"] is None
+                assert kwargs["drop_empty"] is False
                 return [{"step": 7, "timestamp": "now", "train/loss": 0.5}]
             if api_name == "/get_system_metrics_for_run":
                 return ["cpu/utilization"]

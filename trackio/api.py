@@ -113,6 +113,9 @@ class Run:
         scalar_only: bool = False,
         limit: int | None = None,
         offset: int = 0,
+        start_step: int | None = None,
+        end_step: int | None = None,
+        drop_empty: bool = False,
     ) -> list[dict[str, Any]]:
         """Return unsampled run history in occurrence order.
 
@@ -131,6 +134,9 @@ class Run:
                 limit=limit,
                 offset=offset,
                 keys=list(keys) if keys is not None else None,
+                start_step=start_step,
+                end_step=end_step,
+                drop_empty=drop_empty,
             )
         else:
             rows = SQLiteStorage.get_logs(
@@ -142,6 +148,9 @@ class Run:
                 limit=limit,
                 offset=offset,
                 keys=keys,
+                start_step=start_step,
+                end_step=end_step,
+                drop_empty=drop_empty,
             )
         if keys is None:
             return rows
