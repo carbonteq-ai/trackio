@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -297,3 +298,51 @@ def test_concurrent_writers_and_project_isolation():
     )
     assert DorisStorage.get_log_count(other_project, run_id="writer-0") == 1
     assert DorisStorage.get_log_count(project, run_id="writer-0") == 25
+
+
+def test_artifact_commit_uses_reserved_connection_under_real_doris_load(monkeypatch):
+    monkeypatch.setenv("TRACKIO_DORIS_POOL_SIZE", "4")
+    monkeypatch.setenv("TRACKIO_DORIS_CONTROL_RESERVE", "1")
+    monkeypatch.setenv("TRACKIO_DORIS_POOL_TIMEOUT", "2")
+    DorisStorage._reset_connection_pool()
+    ordinary_ready = threading.Barrier(4)
+    release_ordinary = threading.Event()
+    errors = []
+
+    def hold_ordinary_connection():
+        try:
+            with DorisStorage._connection():
+                ordinary_ready.wait()
+                release_ordinary.wait(timeout=10)
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=hold_ordinary_connection) for _ in range(3)]
+    for thread in threads:
+        thread.start()
+    ordinary_ready.wait(timeout=10)
+
+    try:
+        artifact = DorisStorage.commit_artifact_version(
+            project="trackio-doris-pool-integration",
+            name="reserved-control-admission",
+            type="qualification",
+            description="proves finalization admission under ordinary saturation",
+            manifest=[{"path": "receipt.json", "digest": "b" * 64, "size": 17}],
+            metadata={"pool_size": 4, "control_reserve": 1},
+            aliases=["qualified"],
+            run_name="pool-load",
+            run_id="pool-load-v1",
+        )
+        assert artifact["name"] == "reserved-control-admission"
+        assert DorisStorage._pool is not None
+        stats = DorisStorage._pool.stats()
+        assert stats.high_watermark == 4
+        assert stats.total <= 4
+    finally:
+        release_ordinary.set()
+        for thread in threads:
+            thread.join(timeout=10)
+        DorisStorage._reset_connection_pool()
+
+    assert errors == []

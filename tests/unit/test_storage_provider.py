@@ -283,6 +283,7 @@ def test_doris_artifact_relog_preserves_identity_fields(
     monkeypatch, description, expects_update
 ):
     executed = []
+    connection_options = []
 
     class Cursor:
         query = ""
@@ -312,7 +313,7 @@ def test_doris_artifact_relog_preserves_identity_fields(
 
     @contextmanager
     def connection(**kwargs):
-        del kwargs
+        connection_options.append(kwargs)
         yield Connection()
 
     monkeypatch.setattr(DorisStorage, "_connection", staticmethod(connection))
@@ -320,7 +321,7 @@ def test_doris_artifact_relog_preserves_identity_fields(
         DorisStorage,
         "get_artifact_manifest",
         classmethod(
-            lambda cls, project, name, spec: {
+            lambda cls, project, name, spec, **kwargs: {
                 "version_id": 7,
                 "version": 0,
             }
@@ -340,6 +341,7 @@ def test_doris_artifact_relog_preserves_identity_fields(
     )
 
     statements = [query for query, _ in executed]
+    assert connection_options == [{"control": True}]
     assert not any("INSERT INTO artifacts " in query for query in statements)
     assert (
         any("UPDATE artifacts SET description" in query for query in statements)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import os
 import re
@@ -19,6 +20,7 @@ from pymysql.cursors import DictCursor
 import trackio.cas as cas
 import trackio.references as references
 from trackio.artifact_storage import get_artifact_store
+from trackio.doris_pool import DorisConnectionPool, DorisPoolConfig
 from trackio.doris_schema import (
     MANAGED_TABLES,
     SCHEMA_VERSION,
@@ -108,6 +110,9 @@ class DorisStorage:
     _schema_ready = False
     _schema_target: tuple[str, int, str, str] | None = None
     _dataset_import_attempted = True
+    _pool_lock = threading.Lock()
+    _pool: DorisConnectionPool | None = None
+    _pool_key: tuple[Any, ...] | None = None
 
     @classmethod
     def _settings(cls) -> dict[str, Any]:
@@ -142,18 +147,44 @@ class DorisStorage:
     @classmethod
     @contextmanager
     def _connection(
-        cls, *, initialize: bool = True, include_database: bool = True
+        cls,
+        *,
+        initialize: bool = True,
+        include_database: bool = True,
+        control: bool = False,
     ) -> Iterator[pymysql.Connection]:
         if initialize:
             cls._ensure_schema()
         settings = cls._settings()
         if not include_database:
             settings.pop("database")
-        connection = pymysql.connect(**settings)
-        try:
+        config = DorisPoolConfig.from_env()
+        key = (
+            tuple(sorted((name, repr(value)) for name, value in settings.items())),
+            config,
+        )
+        with cls._pool_lock:
+            if cls._pool is None or cls._pool_key != key:
+                previous = cls._pool
+                cls._pool = DorisConnectionPool(settings, config)
+                cls._pool_key = key
+                atexit.register(cls._pool.close)
+                if previous is not None:
+                    previous.close()
+            pool = cls._pool
+        with pool.connection(control=control) as connection:
             yield connection
-        finally:
-            connection.close()
+
+    @classmethod
+    def _reset_connection_pool(cls) -> None:
+        """Close process-local Doris sockets during shutdown or isolated tests."""
+
+        with cls._pool_lock:
+            pool = cls._pool
+            cls._pool = None
+            cls._pool_key = None
+        if pool is not None:
+            pool.close()
 
     @classmethod
     def _ensure_schema(cls) -> None:
@@ -2278,7 +2309,10 @@ class DorisStorage:
         artifact_id = cls._stable_int(project, name)
         version_id = cls._stable_int(project, name, manifest_digest)
         with cls._artifact_lock:
-            with cls._connection() as connection, connection.cursor() as cursor:
+            with (
+                cls._connection(control=True) as connection,
+                connection.cursor() as cursor,
+            ):
                 cursor.execute(
                     """
                     SELECT artifact_type FROM artifacts
@@ -2417,16 +2451,26 @@ class DorisStorage:
                     direction="output",
                     now=now,
                 )
-        result = cls.get_artifact_manifest(project, name, f"v{version_number}")
+        result = cls.get_artifact_manifest(
+            project, name, f"v{version_number}", _control=True
+        )
         if result is None:
             raise RuntimeError("Doris artifact commit was not visible after write")
         return result
 
     @classmethod
     def get_artifact_manifest(
-        cls, project: str, name: str, spec: str | None
+        cls,
+        project: str,
+        name: str,
+        spec: str | None,
+        *,
+        _control: bool = False,
     ) -> dict | None:
-        with cls._connection() as connection, connection.cursor() as cursor:
+        with (
+            cls._connection(control=_control) as connection,
+            connection.cursor() as cursor,
+        ):
             resolved = cls._resolve_artifact_version(cursor, project, name, spec)
             if resolved is None:
                 return None

@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev18`.
+working candidate is `0.31.5.post14.dev19`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -103,6 +103,24 @@ model-call count, and tool-call count from the complete stored record, then
 returns only those safe scalar summaries. This repairs historical Observatory
 rows whose full detail had timing and token evidence while their paged summary
 showed it as missing.
+
+## Doris connection admission candidate (`0.31.5.post14.dev19`)
+
+This candidate replaces one-PyMySQL-connection-per-operation behavior with a
+bounded, reusable process-local pool. Ordinary API and durable-inbox work share
+`TRACKIO_DORIS_POOL_SIZE - TRACKIO_DORIS_CONTROL_RESERVE` slots; artifact
+manifest commit and its visibility read may use the reserved slots so evidence
+finalization continues while bulk reads or imports are saturated. Dead sockets
+are discarded, idle sockets are health-checked before reuse, physical sockets
+are recycled by age, and a bounded checkout timeout surfaces retryable
+backpressure instead of exhausting the Doris service-user limit.
+
+The defaults are a 16-connection pool, a 2-connection control reserve, a
+10-second checkout timeout, and 300-second connection recycling. Deployments
+can set `TRACKIO_DORIS_POOL_SIZE`, `TRACKIO_DORIS_CONTROL_RESERVE`,
+`TRACKIO_DORIS_POOL_TIMEOUT`, and `TRACKIO_DORIS_POOL_RECYCLE_SECONDS`
+explicitly. Application worker counts may exceed the connection pool: the pool
+is the physical database-concurrency authority.
 
 ## Trace-facts candidate (`0.31.5.post14.dev18`)
 
@@ -306,6 +324,7 @@ added later without changing the Trackio SDK contract.
 | `0.31.5.post12` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post13` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev18` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
+| `0.31.5.post14.dev19` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 
 `0.31.5.post4` adds project-scoped bulk read APIs so a client can describe every
 run without one configuration request and one history request per run:
