@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev19`.
+working candidate is `0.31.5.post14.dev20`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -103,6 +103,15 @@ model-call count, and tool-call count from the complete stored record, then
 returns only those safe scalar summaries. This repairs historical Observatory
 rows whose full detail had timing and token evidence while their paged summary
 showed it as missing.
+
+## Verifiers v1 reward compatibility (`0.31.5.post14.dev20`)
+
+This candidate keeps the full native Verifiers reward mapping unchanged while
+projecting its convenience summary from both legacy scalar rewards and the v1
+`{score, weight}` representation. Missing or unrecognized values contribute
+zero to the summary instead of making trace persistence fail. This prevents a
+query-oriented tracking projection from terminating an otherwise usable RL
+rollout batch.
 
 ## Doris connection admission candidate (`0.31.5.post14.dev19`)
 
@@ -325,6 +334,7 @@ added later without changing the Trackio SDK contract.
 | `0.31.5.post13` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev18` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev19` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
+| `0.31.5.post14.dev20` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 
 `0.31.5.post4` adds project-scoped bulk read APIs so a client can describe every
 run without one configuration request and one history request per run:

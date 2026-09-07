@@ -109,6 +109,20 @@ def test_verifiers_trace_preserves_native_record_and_projects_final_branch():
     assert payload["metadata"]["is_truncated"] is True
 
 
+def test_verifiers_trace_projects_weighted_v1_rewards_without_mutating_native_record():
+    record = verifiers_record()
+    record["rewards"] = {
+        "partial_credit": {"score": 0.75, "weight": 0.8},
+        "task_completed": {"score": 1.0, "weight": 0.2},
+        "not_scored": None,
+    }
+
+    payload = VerifiersTrace(record)._to_dict(project="proj", run="run1", step=0)
+
+    assert payload["metadata"]["reward"] == pytest.approx(0.8)
+    assert payload["payload"]["rewards"] == record["rewards"]
+
+
 def test_verifiers_trace_requires_native_identity():
     with pytest.raises(TypeError, match="non-empty string"):
         VerifiersTrace({"version": 2})
@@ -219,15 +233,25 @@ def test_bulk_trace_fact_upsert_validates_a_page_before_writing(monkeypatch):
     writes = []
 
     def upsert_batch(project, run, parsed_updates, *, run_id=None):
-        writes.extend((project, run, parsed.external_id, run_id) for parsed in parsed_updates)
+        writes.extend(
+            (project, run, parsed.external_id, run_id) for parsed in parsed_updates
+        )
         return [
             type(
-                "Receipt", (), {"trace_id": "storage-trace", "projection_id": parsed.projection_id, "applied": True}
+                "Receipt",
+                (),
+                {
+                    "trace_id": "storage-trace",
+                    "projection_id": parsed.projection_id,
+                    "applied": True,
+                },
             )()
             for parsed in parsed_updates
         ]
 
-    monkeypatch.setattr(trackio_server.Storage, "upsert_trace_facts_batch", staticmethod(upsert_batch))
+    monkeypatch.setattr(
+        trackio_server.Storage, "upsert_trace_facts_batch", staticmethod(upsert_batch)
+    )
     response = trackio_server.bulk_upsert_trace_facts(
         "project-a", "run-a", [update.payload()], run_id="provider-run-a"
     )
@@ -235,11 +259,17 @@ def test_bulk_trace_fact_upsert_validates_a_page_before_writing(monkeypatch):
     assert writes == [("project-a", "run-a", "batch-trace", "provider-run-a")]
     assert response == {
         "receipts": [
-            {"trace_id": "storage-trace", "projection_id": update.projection_id, "applied": True}
+            {
+                "trace_id": "storage-trace",
+                "projection_id": update.projection_id,
+                "applied": True,
+            }
         ]
     }
     with pytest.raises(ValueError):
-        trackio_server.bulk_upsert_trace_facts("project-a", "run-a", [{}], run_id="provider-run-a")
+        trackio_server.bulk_upsert_trace_facts(
+            "project-a", "run-a", [{}], run_id="provider-run-a"
+        )
     assert len(writes) == 1
 
 
@@ -291,7 +321,11 @@ def test_remote_trace_fact_upsert_retries_until_queued_parent_arrives(monkeypatc
             self.calls += 1
             if self.calls == 1:
                 raise RuntimeError("trace 'queued-parent' does not exist")
-            return {"trace_id": "parent", "projection_id": kwargs["update"]["projection_id"], "applied": True}
+            return {
+                "trace_id": "parent",
+                "projection_id": kwargs["update"]["projection_id"],
+                "applied": True,
+            }
 
     monkeypatch.setattr("trackio.run.time.sleep", lambda _: None)
     client = Client()
@@ -307,7 +341,9 @@ def test_remote_trace_fact_upsert_retries_until_queued_parent_arrives(monkeypatc
         external_id="queued-parent",
         namespace="posttrain.train.reward",
         calculator_version="test.v1",
-        projection_id=_projection_id("posttrain.train.reward", "test.v1", {}, {"algorithm_reward": 0.5}),
+        projection_id=_projection_id(
+            "posttrain.train.reward", "test.v1", {}, {"algorithm_reward": 0.5}
+        ),
         measures={"algorithm_reward": 0.5},
     )
 
@@ -464,9 +500,10 @@ def test_remote_flush_delivers_parent_before_trace_fact_enrichment():
         "/bulk_log",
         "/upsert_trace_facts",
     ]
-    assert client.calls[0][1]["logs"][0]["metrics"]["traces/verifiers"][
-        "external_id"
-    ] == "buffered-parent"
+    assert (
+        client.calls[0][1]["logs"][0]["metrics"]["traces/verifiers"]["external_id"]
+        == "buffered-parent"
+    )
 
 
 def test_reward_component_aggregates_preserve_name_source_and_coverage(temp_dir):

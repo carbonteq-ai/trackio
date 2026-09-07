@@ -76,15 +76,22 @@ class VerifiersTrace(Trace):
         if not isinstance(schema_version, int) or isinstance(schema_version, bool):
             raise TypeError("Verifiers trace record requires an integer `version`.")
 
-        display_messages = messages if messages is not None else self._final_branch(native)
+        display_messages = (
+            messages if messages is not None else self._final_branch(native)
+        )
         auto_metadata = self._metadata(native)
         super().__init__(display_messages, {**auto_metadata, **dict(metadata or {})})
         self.record = native
         self.trace_id = trace_id
         self.schema_version = schema_version
         if trace_facts is not None:
-            if trace_facts.trace_type != "verifiers" or trace_facts.external_id != trace_id:
-                raise TypeError("Verifiers trace facts must target this Verifiers trace identity.")
+            if (
+                trace_facts.trace_type != "verifiers"
+                or trace_facts.external_id != trace_id
+            ):
+                raise TypeError(
+                    "Verifiers trace facts must target this Verifiers trace identity."
+                )
         self.trace_facts = trace_facts
 
     @staticmethod
@@ -128,6 +135,24 @@ class VerifiersTrace(Trace):
         return messages
 
     @staticmethod
+    def _reward_value(value: Any) -> float:
+        """Project legacy scalars and Verifiers v1 weighted reward records."""
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            return float(value)
+        if not isinstance(value, dict):
+            return 0.0
+        score = value.get("score")
+        weight = value.get("weight", 1.0)
+        if (
+            not isinstance(score, int | float)
+            or isinstance(score, bool)
+            or not isinstance(weight, int | float)
+            or isinstance(weight, bool)
+        ):
+            return 0.0
+        return float(score) * float(weight)
+
+    @staticmethod
     def _metadata(record: dict[str, Any]) -> dict[str, Any]:
         agent = record.get("agent") or {}
         task = record.get("task") or {}
@@ -157,12 +182,18 @@ class VerifiersTrace(Trace):
             "model": agent.get("model") if isinstance(agent, dict) else None,
             "task_type": task.get("type") if isinstance(task, dict) else None,
             "task_index": task_data.get("idx") if isinstance(task_data, dict) else None,
-            "reward": sum(rewards.values()) if isinstance(rewards, dict) else 0.0,
+            "reward": (
+                sum(VerifiersTrace._reward_value(value) for value in rewards.values())
+                if isinstance(rewards, dict)
+                else 0.0
+            ),
             "stop_condition": record.get("stop_condition"),
             "is_completed": bool(record.get("is_completed")),
             "is_truncated": record.get("stop_condition") in truncating_stops
             or bool(last_call and last_call.get("finish_reason") == "length"),
-            "error_type": last_error.get("type") if isinstance(last_error, dict) else None,
+            "error_type": last_error.get("type")
+            if isinstance(last_error, dict)
+            else None,
         }
 
     def _to_dict(self, project: str, run: str, step: int = 0) -> dict[str, Any]:
