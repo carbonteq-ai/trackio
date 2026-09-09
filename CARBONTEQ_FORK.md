@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev20`.
+working candidate is `0.31.5.post14.dev21`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -21,6 +21,17 @@ Spaces use the same CarbonTeq distribution identity so the deployed runtime
 retains the fork's storage, trace, and query behavior.
 
 ## Current extension
+
+`0.31.5.post14.dev21` makes background artifact publication safe for training
+finalization. A caller may wait a bounded time for one queue slot rather than
+draining every active publication, and the run-level finalization timeout is
+explicit with a 600-second default. Remote presence checks, missing-blob
+uploads, and manifest commits are serialized per run because the underlying
+remote client is already serialized; closing that wider transaction prevents
+overlapping checkpoint and adapter manifests from uploading the same absent
+content-addressed blob twice. LoRA model and checkpoint semantics remain owned
+by the training client: Trackio stores their manifests and deduplicates shared
+file digests without merging their distinct lineage and recovery roles.
 
 `trackio.VerifiersTrace` stores a queryable display projection alongside the
 complete JSON-safe Verifiers trace record. Native Verifiers `traces.jsonl`

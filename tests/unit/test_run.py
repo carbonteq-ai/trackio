@@ -35,7 +35,9 @@ def test_background_artifact_wait_and_finish_drain(temp_dir, tmp_path):
     payload.write_bytes(b"checkpoint")
     run = Run(url=None, project="proj", client=None, name="artifact-run", space_id=None)
 
-    queued = run.log_artifact(payload, name="checkpoint", type="training-checkpoint", background=True)
+    queued = run.log_artifact(
+        payload, name="checkpoint", type="training-checkpoint", background=True
+    )
 
     assert queued.submission_id
     assert queued.state in {"uploading", "committed"}
@@ -48,7 +50,14 @@ def test_background_artifact_wait_and_finish_drain(temp_dir, tmp_path):
 def test_background_artifact_queue_is_bounded(temp_dir, tmp_path, monkeypatch):
     payload = tmp_path / "checkpoint.bin"
     payload.write_bytes(b"checkpoint")
-    run = Run(url=None, project="proj", client=None, name="bounded-run", space_id=None, artifact_queue_limit=1)
+    run = Run(
+        url=None,
+        project="proj",
+        client=None,
+        name="bounded-run",
+        space_id=None,
+        artifact_queue_limit=1,
+    )
     started = threading.Event()
     release = threading.Event()
     original = run._log_artifact_sync
@@ -66,6 +75,112 @@ def test_background_artifact_queue_is_bounded(temp_dir, tmp_path, monkeypatch):
     release.set()
     run.flush_artifacts(timeout=5)
     run.finish()
+
+
+def test_background_artifact_queue_can_wait_for_one_slot(
+    temp_dir, tmp_path, monkeypatch
+):
+    payload = tmp_path / "checkpoint.bin"
+    payload.write_bytes(b"checkpoint")
+    run = Run(
+        url=None,
+        project="proj",
+        client=None,
+        name="waiting-run",
+        space_id=None,
+        artifact_queue_limit=1,
+    )
+    started = threading.Event()
+    release = threading.Event()
+    original = run._log_artifact_sync
+    calls = 0
+
+    def blocked(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            release.wait(timeout=5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(run, "_log_artifact_sync", blocked)
+    first = run.log_artifact(payload, name="first", background=True)
+    assert started.wait(timeout=5)
+    timer = threading.Timer(0.05, release.set)
+    timer.start()
+    second = run.log_artifact(payload, name="second", background=True, queue_timeout=2)
+    timer.join()
+
+    assert first.wait(timeout=5).version is not None
+    assert second.wait(timeout=5).version is not None
+    run.finish()
+
+
+def test_background_artifact_queue_wait_is_bounded(temp_dir, tmp_path, monkeypatch):
+    payload = tmp_path / "checkpoint.bin"
+    payload.write_bytes(b"checkpoint")
+    run = Run(
+        url=None,
+        project="proj",
+        client=None,
+        name="timeout-run",
+        space_id=None,
+        artifact_queue_limit=1,
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked(*args, **kwargs):
+        del args, kwargs
+        started.set()
+        release.wait(timeout=5)
+        return MagicMock()
+
+    monkeypatch.setattr(run, "_log_artifact_sync", blocked)
+    run.log_artifact(payload, name="first", background=True)
+    assert started.wait(timeout=5)
+    with pytest.raises(TimeoutError, match="queue wait timed out"):
+        run.log_artifact(payload, name="second", background=True, queue_timeout=0.01)
+    release.set()
+    run.flush_artifacts(timeout=5)
+    run.finish()
+
+
+def test_artifact_timeouts_must_be_finite_and_positive(temp_dir, tmp_path):
+    with pytest.raises(ValueError, match="artifact_finish_timeout"):
+        Run(
+            url=None,
+            project="proj",
+            client=None,
+            name="invalid",
+            space_id=None,
+            artifact_finish_timeout=0,
+        )
+    run = Run(url=None, project="proj", client=None, name="valid", space_id=None)
+    payload = tmp_path / "artifact.bin"
+    payload.write_bytes(b"artifact")
+    with pytest.raises(ValueError, match="queue_timeout"):
+        run.log_artifact(payload, background=True, queue_timeout=float("inf"))
+    run.finish()
+
+
+def test_finish_uses_configured_artifact_timeout(temp_dir, monkeypatch):
+    run = Run(
+        url=None,
+        project="proj",
+        client=None,
+        name="configured-timeout",
+        space_id=None,
+        artifact_finish_timeout=725,
+    )
+    observed: list[float | None] = []
+    monkeypatch.setattr(
+        run, "flush_artifacts", lambda timeout=None: observed.append(timeout) or ()
+    )
+
+    run.finish()
+
+    assert observed == [725.0]
 
 
 def test_markdown_logging(temp_dir):

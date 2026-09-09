@@ -1,9 +1,10 @@
+import math
 import os
 import shutil
 import threading
 import time
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
@@ -81,6 +82,7 @@ class Run:
         webhook_min_level: AlertLevel | str | None = None,
         artifact_workers: int = 2,
         artifact_queue_limit: int = 4,
+        artifact_finish_timeout: float = 600.0,
     ):
         """
         Initialize a Run for logging metrics to Trackio.
@@ -146,13 +148,21 @@ class Run:
             raise ValueError(
                 "artifact_workers and artifact_queue_limit must be positive"
             )
+        if (
+            not isinstance(artifact_finish_timeout, int | float)
+            or not math.isfinite(artifact_finish_timeout)
+            or artifact_finish_timeout <= 0
+        ):
+            raise ValueError("artifact_finish_timeout must be a finite positive number")
         self._artifact_executor = ThreadPoolExecutor(
             max_workers=artifact_workers,
             thread_name_prefix="trackio-artifact",
         )
         self._artifact_queue_limit = artifact_queue_limit
+        self._artifact_finish_timeout = float(artifact_finish_timeout)
         self._artifact_futures: dict[str, Future[Artifact]] = {}
         self._artifact_lock = threading.Lock()
+        self._artifact_publication_lock = threading.Lock()
         self.id = run_id or uuid.uuid4().hex
         self._existing_runs = existing_runs
         self._initial_last_step = initial_last_step
@@ -1332,14 +1342,18 @@ class Run:
                         update=update.payload(),
                     )
             except RuntimeError as error:
-                if attempt == len(TRACE_FACT_PARENT_READY_BACKOFFS) or not _is_missing_trace_error(error):
+                if attempt == len(
+                    TRACE_FACT_PARENT_READY_BACKOFFS
+                ) or not _is_missing_trace_error(error):
                     raise
                 time.sleep(TRACE_FACT_PARENT_READY_BACKOFFS[attempt])
             else:
                 break
         return TraceFactWriteReceipt(**response)
 
-    def enqueue_trace_facts(self, update: TraceFactUpdate) -> TraceFactWriteReceipt | None:
+    def enqueue_trace_facts(
+        self, update: TraceFactUpdate
+    ) -> TraceFactWriteReceipt | None:
         """Queue an idempotent fact enrichment without blocking on Doris.
 
         Remote callers receive only durable-inbox acknowledgement in the
@@ -1426,7 +1440,9 @@ class Run:
             if self._has_local_buffer and not self._flush_local_buffer(
                 synchronous=True
             ):
-                raise RuntimeError("Trackio buffered observations could not be delivered")
+                raise RuntimeError(
+                    "Trackio buffered observations could not be delivered"
+                )
 
     def _artifact_log_with_retry(self, **kwargs) -> dict:
         manifest = kwargs.get("manifest", [])
@@ -1492,8 +1508,15 @@ class Run:
         aliases: list[str] | None = None,
         *,
         background: bool = False,
+        queue_timeout: float | None = None,
     ) -> Artifact:
         """Log an artifact, optionally queueing the commit in a bounded pool."""
+        if queue_timeout is not None and (
+            not isinstance(queue_timeout, int | float)
+            or not math.isfinite(queue_timeout)
+            or queue_timeout <= 0
+        ):
+            raise ValueError("queue_timeout must be a finite positive number")
         if not background:
             return self._log_artifact_sync(artifact_or_path, name, type, aliases)
 
@@ -1511,23 +1534,34 @@ class Run:
                 artifact.add_dir(path)
             else:
                 artifact.add_file(path)
-        with self._artifact_lock:
-            active = sum(
-                not future.done() for future in self._artifact_futures.values()
-            )
-            if active >= self._artifact_queue_limit:
+        deadline = None if queue_timeout is None else time.monotonic() + queue_timeout
+        while True:
+            with self._artifact_lock:
+                active = tuple(
+                    future
+                    for future in self._artifact_futures.values()
+                    if not future.done()
+                )
+                if len(active) < self._artifact_queue_limit:
+                    submission_id = uuid.uuid4().hex
+                    future = self._artifact_executor.submit(
+                        self._log_artifact_sync,
+                        artifact,
+                        None,
+                        None,
+                        aliases,
+                    )
+                    self._artifact_futures[submission_id] = future
+                    artifact._attach_background_future(future, submission_id)
+                    return artifact
+            if deadline is None:
                 raise RuntimeError("Trackio artifact publication queue is full")
-            submission_id = uuid.uuid4().hex
-            future = self._artifact_executor.submit(
-                self._log_artifact_sync,
-                artifact,
-                None,
-                None,
-                aliases,
-            )
-            self._artifact_futures[submission_id] = future
-            artifact._attach_background_future(future, submission_id)
-        return artifact
+            remaining = max(0.0, deadline - time.monotonic())
+            completed, _ = wait(active, timeout=remaining, return_when=FIRST_COMPLETED)
+            if not completed:
+                raise TimeoutError("Trackio artifact publication queue wait timed out")
+            for future in completed:
+                future.result()
 
     def _log_artifact_sync(
         self,
@@ -1579,46 +1613,53 @@ class Run:
         else:
             self._wait_for_client_ready()
 
-            file_entries = [e for e in manifest if not references.is_reference_entry(e)]
-            digests = [e["digest"] for e in file_entries]
-            with self._client_lock:
-                present_response = self._client.predict(
-                    api_name="/check_artifact_blobs",
+            # Remote client calls are already serialized by ``_client_lock``.
+            # Keep the presence check, missing-blob upload, and manifest commit
+            # in one publication transaction so overlapping artifacts cannot
+            # both decide that a shared content-addressed blob is absent.
+            with self._artifact_publication_lock:
+                file_entries = [
+                    e for e in manifest if not references.is_reference_entry(e)
+                ]
+                digests = [e["digest"] for e in file_entries]
+                with self._client_lock:
+                    present_response = self._client.predict(
+                        api_name="/check_artifact_blobs",
+                        project=self.project,
+                        digests=digests,
+                        hf_token=self._hf_token_for_remote(),
+                    )
+                present = set((present_response or {}).get("present", []))
+
+                SQLiteStorage.enqueue_artifact_blob_uploads(
                     project=self.project,
-                    digests=digests,
+                    space_id=self._remote_storage_key,
+                    blobs=[
+                        (
+                            entry["digest"],
+                            str(cas.blob_path(self.project, entry["digest"])),
+                        )
+                        for entry in file_entries
+                        if entry["digest"] not in present
+                    ],
+                    run_name=self.name,
+                    run_id=self.id,
+                )
+
+                self._drain_pending_uploads()
+
+                record = self._artifact_log_with_retry(
+                    project=self.project,
+                    name=artifact.name,
+                    type=artifact.type,
+                    description=artifact.description,
+                    metadata=artifact.metadata,
+                    manifest=manifest,
+                    aliases=user_aliases,
+                    run_name=self.name,
+                    run_id=self.id,
                     hf_token=self._hf_token_for_remote(),
                 )
-            present = set((present_response or {}).get("present", []))
-
-            SQLiteStorage.enqueue_artifact_blob_uploads(
-                project=self.project,
-                space_id=self._remote_storage_key,
-                blobs=[
-                    (
-                        entry["digest"],
-                        str(cas.blob_path(self.project, entry["digest"])),
-                    )
-                    for entry in file_entries
-                    if entry["digest"] not in present
-                ],
-                run_name=self.name,
-                run_id=self.id,
-            )
-
-            self._drain_pending_uploads()
-
-            record = self._artifact_log_with_retry(
-                project=self.project,
-                name=artifact.name,
-                type=artifact.type,
-                description=artifact.description,
-                metadata=artifact.metadata,
-                manifest=manifest,
-                aliases=user_aliases,
-                run_name=self.name,
-                run_id=self.id,
-                hf_token=self._hf_token_for_remote(),
-            )
 
         artifact._hydrate_from_db(
             project=self.project,
@@ -1848,7 +1889,7 @@ class Run:
 
     def finish(self):
         try:
-            self.flush_artifacts(timeout=30)
+            self.flush_artifacts(timeout=self._artifact_finish_timeout)
             if self._gpu_monitor is not None:
                 try:
                     self._gpu_monitor.stop()

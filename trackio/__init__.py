@@ -263,6 +263,9 @@ def init(
     cpu_log_interval: float = 10.0,
     webhook_url: str | None = None,
     webhook_min_level: AlertLevel | str | None = None,
+    artifact_workers: int = 2,
+    artifact_queue_limit: int = 4,
+    artifact_finish_timeout: float = 600.0,
 ) -> Run:
     """
     Creates a new Trackio project and returns a [`Run`] object.
@@ -357,6 +360,13 @@ def init(
             For example, `AlertLevel.WARN` sends only `WARN` and `ERROR`
             alerts to the webhook destination. Can also be set via
             `TRACKIO_WEBHOOK_MIN_LEVEL`.
+        artifact_workers (`int`, *optional*, defaults to `2`):
+            Number of bounded background artifact publication workers.
+        artifact_queue_limit (`int`, *optional*, defaults to `4`):
+            Maximum number of active background artifact publications.
+        artifact_finish_timeout (`float`, *optional*, defaults to `600.0`):
+            Maximum seconds to wait for required artifact publications during
+            run finalization.
     Returns:
         `Run`: A [`Run`] object that can be used to log metrics and finish the run.
     """
@@ -641,6 +651,9 @@ def init(
         cpu_log_interval=cpu_log_interval,
         webhook_url=webhook_url,
         webhook_min_level=webhook_min_level,
+        artifact_workers=artifact_workers,
+        artifact_queue_limit=artifact_queue_limit,
+        artifact_finish_timeout=artifact_finish_timeout,
     )
 
     if space_id is not None:
