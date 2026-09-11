@@ -328,3 +328,73 @@ def test_large_blob_fails_closed_against_legacy_server(tmp_path, monkeypatch):
     assert client.upload_artifact_blob("project", "a" * 64, small) is False
     with pytest.raises(RuntimeError, match="does not support resumable"):
         client.upload_artifact_blob("project", "a" * 64, large)
+
+
+def test_direct_upload_retries_transient_part_ack_without_reuploading_part(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "weights.bin"
+    source.write_bytes(b"model-weights")
+    digest = _digest(source.read_bytes())
+    calls = {"put": 0, "ack": 0, "complete": 0}
+
+    def response(method, url, status=200, json=None, headers=None):
+        return httpx.Response(
+            status,
+            request=httpx.Request(method, url),
+            json=json,
+            headers=headers,
+        )
+
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda url, **kwargs: response(
+            "GET",
+            url,
+            json={"resumable": True, "direct_multipart": True},
+        ),
+    )
+
+    def post(url, **kwargs):
+        if str(url).endswith("/api/artifact-upload/direct/project"):
+            return response(
+                "POST",
+                url,
+                json={
+                    "upload_id": "upload-0000000001",
+                    "chunk_count": 1,
+                    "chunk_size_bytes": 8 * 1024 * 1024,
+                    "parts": [
+                        {
+                            "index": 0,
+                            "part_number": 1,
+                            "url": "https://storage.invalid/part/1",
+                            "headers": {},
+                        }
+                    ],
+                    "acknowledged_parts": [],
+                    "state": "uploading",
+                },
+            )
+        if str(url).endswith("/parts/1"):
+            calls["ack"] += 1
+            if calls["ack"] == 1:
+                return response("POST", url, status=502, json={"error": "temporary"})
+            return response("POST", url, json={"part_number": 1, "etag": "etag-1"})
+        calls["complete"] += 1
+        return response(
+            "POST", url, json={"digest": digest, "size_bytes": source.stat().st_size}
+        )
+
+    def put(url, **kwargs):
+        calls["put"] += 1
+        return response("PUT", url, headers={"etag": "etag-1"})
+
+    monkeypatch.setattr(httpx, "post", post)
+    monkeypatch.setattr(httpx, "put", put)
+    monkeypatch.setattr("trackio.remote_client.time.sleep", lambda _: None)
+    client = _TrackioHTTPClient("https://trackio.invalid")
+
+    assert client.upload_artifact_blob("project", digest, source) is True
+    assert calls == {"put": 1, "ack": 2, "complete": 1}

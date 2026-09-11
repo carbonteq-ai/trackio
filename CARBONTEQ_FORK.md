@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev21`.
+working candidate is `0.31.5.post14.dev22`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -21,6 +21,14 @@ Spaces use the same CarbonTeq distribution identity so the deployed runtime
 retains the fork's storage, trace, and query behavior.
 
 ## Current extension
+
+`0.31.5.post14.dev22` retains the dev21 bounded-finalization behavior and adds
+bounded retry for idempotent direct multipart control-plane operations. A
+transient network or HTTP 5xx response while creating a session,
+acknowledging an uploaded part, or completing an upload no longer forces the
+producer to regenerate the artifact or restart the entire job. In particular,
+retrying an acknowledgment does not upload the already accepted object-store
+part again.
 
 `0.31.5.post14.dev21` makes background artifact publication safe for training
 finalization. A caller may wait a bounded time for one queue slot rather than

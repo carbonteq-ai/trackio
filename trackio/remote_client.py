@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -16,6 +17,7 @@ from trackio.utils import parse_trackio_server_url
 
 HTTP_API_VERSION = 1
 FORCE_SYNC_TIMEOUT = 180.0
+ARTIFACT_CONTROL_RETRY_BACKOFFS = (0.5, 1.0, 2.0)
 
 WRITE_TOKEN_HEADER = "x-trackio-write-token"
 
@@ -92,6 +94,25 @@ def is_transient_remote_error(exc: BaseException) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code >= 500
     return isinstance(exc, (httpx.RequestError, ConnectionError))
+
+
+def _request_with_transient_retry(
+    operation: Callable[[], httpx.Response],
+) -> httpx.Response:
+    """Retry only idempotent artifact control-plane requests."""
+
+    attempts = len(ARTIFACT_CONTROL_RETRY_BACKOFFS) + 1
+    for attempt in range(attempts):
+        if attempt > 0:
+            time.sleep(ARTIFACT_CONTROL_RETRY_BACKOFFS[attempt - 1])
+        try:
+            response = operation()
+            response.raise_for_status()
+            return response
+        except Exception as error:
+            if attempt == attempts - 1 or not is_transient_remote_error(error):
+                raise
+    raise AssertionError("artifact request retry loop did not return")
 
 
 class _TrackioHTTPClient:
@@ -267,17 +288,18 @@ class _TrackioHTTPClient:
         idempotency_key = hashlib.sha256(
             f"{project}\0{digest}".encode("utf-8")
         ).hexdigest()
-        init_response = httpx.post(
-            urljoin(self.src, f"api/artifact-upload/direct/{project}"),
-            headers=self.headers,
-            json={
-                "digest": digest,
-                "size_bytes": size_bytes,
-                "idempotency_key": idempotency_key,
-            },
-            **self.httpx_kwargs,
+        init_response = _request_with_transient_retry(
+            lambda: httpx.post(
+                urljoin(self.src, f"api/artifact-upload/direct/{project}"),
+                headers=self.headers,
+                json={
+                    "digest": digest,
+                    "size_bytes": size_bytes,
+                    "idempotency_key": idempotency_key,
+                },
+                **self.httpx_kwargs,
+            )
         )
-        init_response.raise_for_status()
         session = init_response.json()
         if session.get("already_present") is True or session.get("state") == "completed":
             return True
@@ -309,34 +331,37 @@ class _TrackioHTTPClient:
                             {"PartNumber": part_number, "ETag": acknowledged[part_number]}
                         )
                         continue
-                    response = httpx.put(
-                        part["url"],
-                        headers=dict(part.get("headers") or {}),
-                        content=chunk,
-                        **self.httpx_kwargs,
+                    response = _request_with_transient_retry(
+                        lambda: httpx.put(
+                            part["url"],
+                            headers=dict(part.get("headers") or {}),
+                            content=chunk,
+                            **self.httpx_kwargs,
+                        )
                     )
-                    response.raise_for_status()
                     etag = response.headers.get("etag") or response.headers.get("ETag")
                     if not etag:
                         raise RuntimeError(
                             f"S3-compatible upload did not return an ETag for part {index + 1}"
                         )
                     uploaded_parts.append({"PartNumber": part_number, "ETag": etag})
-                    ack_response = httpx.post(
-                        f"{session_url}/parts/{part_number}",
-                        headers=self.headers,
-                        json={"etag": etag},
-                        **self.httpx_kwargs,
+                    _request_with_transient_retry(
+                        lambda: httpx.post(
+                            f"{session_url}/parts/{part_number}",
+                            headers=self.headers,
+                            json={"etag": etag},
+                            **self.httpx_kwargs,
+                        )
                     )
-                    ack_response.raise_for_status()
 
-            complete_response = httpx.post(
-                session_url,
-                headers=self.headers,
-                json={"parts": uploaded_parts},
-                **self.httpx_kwargs,
+            complete_response = _request_with_transient_retry(
+                lambda: httpx.post(
+                    session_url,
+                    headers=self.headers,
+                    json={"parts": uploaded_parts},
+                    **self.httpx_kwargs,
+                )
             )
-            complete_response.raise_for_status()
             completed = complete_response.json()
             if (
                 completed.get("digest") != digest
