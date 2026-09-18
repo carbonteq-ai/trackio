@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev23`.
+working candidate is `0.31.5.post14.dev24`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -21,6 +21,11 @@ Spaces use the same CarbonTeq distribution identity so the deployed runtime
 retains the fork's storage, trace, and query behavior.
 
 ## Current extension
+
+`0.31.5.post14.dev24` retains the dev23 multipart retry behavior and imports
+Hugging Face Hub commit operations through the package's public API. This
+keeps the Trackio client importable with Hub 1.31 and later after the private
+`huggingface_hub.hf_api.CommitOperationAdd` re-export was removed.
 
 `0.31.5.post14.dev23` retains the dev21 bounded-finalization behavior and adds
 bounded retry for idempotent direct multipart control-plane operations. A
@@ -358,6 +363,7 @@ added later without changing the Trackio SDK contract.
 | `0.31.5.post14.dev18` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev19` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev20` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
+| `0.31.5.post14.dev24` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 
 `0.31.5.post4` adds project-scoped bulk read APIs so a client can describe every
 run without one configuration request and one history request per run:
