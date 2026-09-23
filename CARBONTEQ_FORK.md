@@ -22,7 +22,13 @@ retains the fork's storage, trace, and query behavior.
 
 ## Current extension
 
-`0.31.5.post14.dev25` adds exact `task_id` and `prompt_group_id` scalar
+`0.31.5.post14.dev25` is a published prerelease candidate tagged
+`carbonteq-v0.31.5.post14.dev25` at immutable fork commit
+`bb40b7e333b7f74f4cf6923e3ff6030255ed746d`. Its retained wheel is
+SHA-256 `a349d7cb5848865255019204fc2c1cc538d12164bda634a5360c2a9ff52a0f90`
+and sdist is SHA-256
+`72091a9064cbd0e1ba171bfbb080d16abf83798a32af85deca8bd98c01c59b61`.
+This candidate adds exact `task_id` and `prompt_group_id` scalar
 dimensions to materialized trace facts and exposes `sum_squares` for finite
 numeric measures. SQLite and Doris aggregate these columns directly; callers
 can compute complete prompt-group reward mean and population standard deviation
