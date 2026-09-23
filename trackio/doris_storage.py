@@ -1602,7 +1602,8 @@ class DorisStorage:
             cursor.execute(
                 """UPDATE traces SET fact_namespace=%s, fact_calculator_version=%s, fact_projection_id=%s,
                fact_state=%s, fact_calculated_at=%s, fact_dimensions=%s, fact_provenance=%s,
-               fact_model=%s, fact_task_type=%s, fact_rollout_step=%s, fact_is_truncated=%s,
+               fact_model=%s, fact_task_type=%s, fact_task_id=%s, fact_prompt_group_id=%s,
+               fact_rollout_step=%s, fact_is_truncated=%s,
                fact_has_error=%s, fact_model_input_tokens=%s, fact_model_output_tokens=%s,
                fact_thinking_tokens=%s, fact_tool_calls=%s, fact_model_calls=%s,
                fact_trace_latency_ms=%s, fact_task_reward=%s
@@ -1617,6 +1618,8 @@ class DorisStorage:
                     _json(dict(update.provenance)),
                     dimensions.get("model"),
                     dimensions.get("task_type"),
+                    dimensions.get("task_id"),
+                    dimensions.get("prompt_group_id"),
                     dimensions.get("rollout_step"),
                     dimensions.get("is_truncated"),
                     dimensions.get("has_error"),
@@ -1745,6 +1748,8 @@ class DorisStorage:
                     ("fact_provenance", lambda update: _json(dict(update.provenance))),
                     ("fact_model", lambda update: update.dimensions.get("model")),
                     ("fact_task_type", lambda update: update.dimensions.get("task_type")),
+                    ("fact_task_id", lambda update: update.dimensions.get("task_id")),
+                    ("fact_prompt_group_id", lambda update: update.dimensions.get("prompt_group_id")),
                     ("fact_rollout_step", lambda update: update.dimensions.get("rollout_step")),
                     ("fact_is_truncated", lambda update: update.dimensions.get("is_truncated")),
                     ("fact_has_error", lambda update: update.dimensions.get("has_error")),
@@ -1802,6 +1807,8 @@ class DorisStorage:
         columns = {
             "model": "traces.fact_model",
             "task_type": "traces.fact_task_type",
+            "task_id": "traces.fact_task_id",
+            "prompt_group_id": "traces.fact_prompt_group_id",
             "rollout_step": "traces.fact_rollout_step",
             "is_truncated": "traces.fact_is_truncated",
             "has_error": "traces.fact_has_error",
@@ -1842,16 +1849,13 @@ class DorisStorage:
                     if component_query
                     else f"traces.fact_{item.measure}"
                 )
-                expression = {
-                    "mean": "AVG",
-                    "sum": "SUM",
-                    "count": "COUNT",
-                    "min": "MIN",
-                    "max": "MAX",
-                }[item.operation]
+                expression = (
+                    f"SUM({field} * {field})" if item.operation == "sum_squares"
+                    else f"{ {'mean': 'AVG', 'sum': 'SUM', 'count': 'COUNT', 'min': 'MIN', 'max': 'MAX'}[item.operation] }({field})"
+                )
                 select.extend(
                     (
-                        f"{expression}({field}) AS {key}",
+                        f"{expression} AS {key}",
                         f"COUNT({field}) AS coverage_{key}",
                     )
                 )

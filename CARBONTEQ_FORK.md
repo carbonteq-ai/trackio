@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev24`.
+working candidate is `0.31.5.post14.dev25`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -21,6 +21,28 @@ Spaces use the same CarbonTeq distribution identity so the deployed runtime
 retains the fork's storage, trace, and query behavior.
 
 ## Current extension
+
+`0.31.5.post14.dev25` adds exact `task_id` and `prompt_group_id` scalar
+dimensions to materialized trace facts and exposes `sum_squares` for finite
+numeric measures. SQLite and Doris aggregate these columns directly; callers
+can compute complete prompt-group reward mean and population standard deviation
+without loading native traces. Doris schema v3 is an explicit v2-to-v3 migration
+that adds nullable columns and inverted indexes on run and prompt-group identity.
+Existing Doris segments require a separate `BUILD INDEX` operation after the
+index definitions are created; verify its completion before claiming indexed
+historical reads. Existing source facts remain replayable but need a producer
+reprojection/backfill to populate the new dimensions. Native traces are not
+rewritten.
+The delta is in `trackio/trace_facts.py`, `trackio/sqlite_storage.py`,
+`trackio/doris_storage.py`, and `trackio/doris_schema.py`, with regression tests
+in `tests/unit/test_trace.py`, `tests/unit/test_doris_schema.py`, and
+`tests/integration/test_doris_storage.py`. The generic contract is intentionally
+limited to bounded scalar identifiers and finite numeric moments; it does not
+interpret Posttrain task semantics. Rebase review must retain the explicit
+Doris migration, SQLite additive-column path, and identical aggregate coverage
+on both engines. Validate with `python -m pytest -q tests/unit` and, against an
+isolated Doris database, `python -m pytest -q
+tests/integration/test_doris_storage.py::test_prompt_group_fact_moments_on_real_doris`.
 
 `0.31.5.post14.dev24` retains the dev23 multipart retry behavior and imports
 Hugging Face Hub commit operations through the package's public API. This
@@ -364,6 +386,7 @@ added later without changing the Trackio SDK contract.
 | `0.31.5.post14.dev19` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev20` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev24` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
+| `0.31.5.post14.dev25` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 
 `0.31.5.post4` adds project-scoped bulk read APIs so a client can describe every
 run without one configuration request and one history request per run:

@@ -7,6 +7,13 @@ import pytest
 
 from trackio.doris_migration import migrate_sqlite_to_doris
 from trackio.doris_storage import DorisStorage
+from trackio.trace import VerifiersTrace
+from trackio.trace_facts import (
+    TraceAggregate,
+    TraceFactsQuery,
+    TraceFactUpdate,
+    projection_id,
+)
 
 REQUIRED_ENV = (
     "TRACKIO_DORIS_HOST",
@@ -89,6 +96,68 @@ def test_core_evidence_round_trip_is_idempotent():
     traces = DorisStorage.get_traces(project, run_id=run_id)
     assert len(traces) == 1
     assert traces[0]["metadata"]["reward"] == 1.0
+
+
+def test_prompt_group_fact_moments_on_real_doris():
+    project = "trackio-group-facts-qualification"
+    run = "group-moments"
+    run_id = "group-moments-20260923"
+    for index in (0, 1):
+        DorisStorage.bulk_log(
+            project=project,
+            run=run,
+            run_id=run_id,
+            metrics_list=[{
+                "rollout": VerifiersTrace({
+                    "id": f"group-moment-trace-{index}",
+                    "version": 2,
+                    "nodes": [
+                        {"message": {"role": "user", "content": f"sample {index}"}},
+                        {"parent": 0, "sampled": True, "message": {"role": "assistant", "content": "done"}},
+                    ],
+                    "rewards": {"task": float(index)},
+                })._to_dict(project=project, run=run, step=index)
+            }],
+            steps=[index],
+            timestamps=[f"2026-09-23T00:00:0{index}+00:00"],
+            log_ids=[f"group-moment-{index}"],
+            config={"qualification": "indexed-group-moments"},
+        )
+    traces = DorisStorage.get_traces(project, run_id=run_id, trace_type="verifiers")
+    assert len(traces) == 2
+    for index, trace in enumerate(sorted(traces, key=lambda item: item["external_id"])):
+        dimensions = {"rollout_step": 3, "task_id": "task-7", "prompt_group_id": "step/3/group/2"}
+        measures = {"task_reward": float(index)}
+        projection = projection_id({
+            "namespace": "verifiers.trace",
+            "calculator_version": "test.v1",
+            "dimensions": dimensions,
+            "measures": measures,
+            "reward_components": [],
+            "provenance": {},
+            "state": "complete",
+        })
+        DorisStorage.upsert_trace_facts(project, run, TraceFactUpdate(
+            trace_type=trace["trace_type"],
+            external_id=trace["external_id"],
+            namespace="verifiers.trace",
+            calculator_version="test.v1",
+            projection_id=projection,
+            dimensions=dimensions,
+            measures=measures,
+            replace_reward_components=True,
+        ), run_id=run_id)
+    result = DorisStorage.aggregate_trace_facts(project, run, TraceFactsQuery(
+        trace_type=traces[0]["trace_type"],
+        group_by=("rollout_step", "task_id", "prompt_group_id"),
+        aggregates=(TraceAggregate("task_reward", "sum"), TraceAggregate("task_reward", "sum_squares")),
+    ), run_id=run_id)
+    assert len(result.buckets) == 1
+    bucket = result.buckets[0]
+    assert bucket.dimensions == dimensions
+    assert bucket.trace_count == 2
+    assert bucket.values == {"sum_task_reward": 1.0, "sum_squares_task_reward": 1.0}
+    assert bucket.coverage == {"sum_task_reward": 2, "sum_squares_task_reward": 2}
 
 
 def test_artifact_metadata_lineage_and_run_mutations():

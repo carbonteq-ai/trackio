@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MANAGED_TABLES = (
     "schema_versions",
     "metrics",
@@ -91,6 +91,13 @@ def migration_statements(from_version: int, to_version: int, replication_num: in
     apply the ordered statements as part of the coordinated Trackio upgrade.
     """
 
+    if (from_version, to_version) == (2, 3):
+        return (
+            "ALTER TABLE traces ADD COLUMN fact_task_id VARCHAR(768) NULL",
+            "ALTER TABLE traces ADD COLUMN fact_prompt_group_id VARCHAR(768) NULL",
+            "CREATE INDEX idx_trace_run_id ON traces(run_id) USING INVERTED",
+            "CREATE INDEX idx_trace_prompt_group_id ON traces(fact_prompt_group_id) USING INVERTED",
+        )
     if (from_version, to_version) != (1, 2):
         raise ValueError(f"unsupported Trackio Doris migration {from_version} -> {to_version}")
     properties = f'PROPERTIES ("replication_num" = "{replication_num}")'
@@ -201,6 +208,8 @@ def schema_statements(replication_num: int = 1) -> tuple[str, ...]:
             fact_provenance STRING NULL,
             fact_model VARCHAR(512) NULL,
             fact_task_type VARCHAR(512) NULL,
+            fact_task_id VARCHAR(768) NULL,
+            fact_prompt_group_id VARCHAR(768) NULL,
             fact_rollout_step BIGINT NULL,
             fact_is_truncated BOOLEAN NULL,
             fact_has_error BOOLEAN NULL,
@@ -214,7 +223,9 @@ def schema_statements(replication_num: int = 1) -> tuple[str, ...]:
             fact_algorithm_reward DOUBLE NULL,
             fact_algorithm_projection_id VARCHAR(64) NULL,
             fact_algorithm_calculator_version VARCHAR(256) NULL,
-            fact_algorithm_calculated_at VARCHAR(64) NULL
+            fact_algorithm_calculated_at VARCHAR(64) NULL,
+            INDEX idx_trace_run_id(run_id) USING INVERTED,
+            INDEX idx_trace_prompt_group_id(fact_prompt_group_id) USING INVERTED
         )
         UNIQUE KEY(project_id, trace_id)
         DISTRIBUTED BY HASH(project_id, trace_id) BUCKETS 1

@@ -28,7 +28,7 @@ SignalSourceKind = Literal[
     "composite",
     "unknown",
 ]
-AggregateOperation = Literal["mean", "sum", "count", "min", "max"]
+AggregateOperation = Literal["mean", "sum", "sum_squares", "count", "min", "max"]
 
 _SOURCE_KINDS = frozenset(SignalSourceKind.__args__)
 _DIMENSION_NAMES = frozenset(
@@ -40,6 +40,8 @@ _DIMENSION_NAMES = frozenset(
         "template_revision",
         "trace_schema_version",
         "task_type",
+        "task_id",
+        "prompt_group_id",
         "rollout_step",
         "is_truncated",
         "has_error",
@@ -162,6 +164,8 @@ class TraceFactUpdate:
                 raise ValueError(f"unsupported trace fact dimension {name!r}")
             if value is not None and isinstance(value, (list, tuple, Mapping)):
                 raise ValueError(f"trace fact dimension {name!r} must be scalar")
+            if name in {"task_id", "prompt_group_id"} and value is not None:
+                _text(value, f"trace fact dimension {name!r}", maximum=768)
         for name, value in self.measures.items():
             if name not in _MEASURE_NAMES:
                 raise ValueError(f"unsupported trace fact measure {name!r}")
@@ -292,7 +296,7 @@ class TraceAggregate:
     def __post_init__(self) -> None:
         if self.measure not in _MEASURE_NAMES:
             raise ValueError(f"unsupported trace aggregate measure {self.measure!r}")
-        if self.operation not in {"mean", "sum", "count", "min", "max"}:
+        if self.operation not in {"mean", "sum", "sum_squares", "count", "min", "max"}:
             raise ValueError(
                 f"unsupported trace aggregate operation {self.operation!r}"
             )

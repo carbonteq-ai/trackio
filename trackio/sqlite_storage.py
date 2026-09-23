@@ -603,6 +603,8 @@ class SQLiteStorage:
                         fact_provenance TEXT,
                         fact_model TEXT,
                         fact_task_type TEXT,
+                        fact_task_id TEXT,
+                        fact_prompt_group_id TEXT,
                         fact_rollout_step INTEGER,
                         fact_is_truncated INTEGER,
                         fact_has_error INTEGER,
@@ -840,6 +842,8 @@ class SQLiteStorage:
                     "fact_provenance TEXT",
                     "fact_model TEXT",
                     "fact_task_type TEXT",
+                    "fact_task_id TEXT",
+                    "fact_prompt_group_id TEXT",
                     "fact_rollout_step INTEGER",
                     "fact_is_truncated INTEGER",
                     "fact_has_error INTEGER",
@@ -867,6 +871,11 @@ class SQLiteStorage:
                 cursor.execute(
                     """CREATE INDEX IF NOT EXISTS idx_trace_facts_rollout_step
                     ON traces(run_id, trace_type, fact_rollout_step)"""
+                )
+                cursor.execute(
+                    """CREATE INDEX IF NOT EXISTS idx_trace_facts_prompt_group
+                    ON traces(run_id, trace_type, fact_prompt_group_id, fact_rollout_step, fact_task_id)
+                    WHERE fact_prompt_group_id IS NOT NULL"""
                 )
                 cursor.execute(
                     """CREATE INDEX IF NOT EXISTS idx_trace_reward_components_current
@@ -2900,7 +2909,7 @@ class SQLiteStorage:
         cursor.execute(
             """UPDATE traces SET fact_namespace=?, fact_calculator_version=?, fact_projection_id=?,
                fact_state=?, fact_calculated_at=?, fact_dimensions=?, fact_provenance=?, fact_model=?,
-               fact_task_type=?, fact_rollout_step=?, fact_is_truncated=?, fact_has_error=?,
+               fact_task_type=?, fact_task_id=?, fact_prompt_group_id=?, fact_rollout_step=?, fact_is_truncated=?, fact_has_error=?,
                fact_model_input_tokens=?, fact_model_output_tokens=?, fact_thinking_tokens=?,
                fact_tool_calls=?, fact_model_calls=?, fact_trace_latency_ms=?, fact_task_reward=? WHERE id=?""",
             (
@@ -2913,6 +2922,8 @@ class SQLiteStorage:
                 orjson.dumps(dict(update.provenance)),
                 dimensions.get("model"),
                 dimensions.get("task_type"),
+                dimensions.get("task_id"),
+                dimensions.get("prompt_group_id"),
                 dimensions.get("rollout_step"),
                 int(dimensions["is_truncated"])
                 if dimensions.get("is_truncated") is not None
@@ -3047,6 +3058,8 @@ class SQLiteStorage:
         columns = {
             "model": "traces.fact_model",
             "task_type": "traces.fact_task_type",
+            "task_id": "traces.fact_task_id",
+            "prompt_group_id": "traces.fact_prompt_group_id",
             "rollout_step": "traces.fact_rollout_step",
             "is_truncated": "traces.fact_is_truncated",
             "has_error": "traces.fact_has_error",
@@ -3092,8 +3105,12 @@ class SQLiteStorage:
                     if component_query
                     else f"traces.fact_{item.measure}"
                 )
+                expression = (
+                    f"SUM({field} * {field})" if item.operation == "sum_squares"
+                    else f"{ {'mean': 'AVG', 'sum': 'SUM', 'count': 'COUNT', 'min': 'MIN', 'max': 'MAX'}[item.operation] }({field})"
+                )
                 select += [
-                    f"{ {'mean': 'AVG', 'sum': 'SUM', 'count': 'COUNT', 'min': 'MIN', 'max': 'MAX'}[item.operation] }({field}) AS {key}",
+                    f"{expression} AS {key}",
                     f"COUNT({field}) AS coverage_{key}",
                 ]
             source = "traces"

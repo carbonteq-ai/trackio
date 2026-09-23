@@ -53,8 +53,13 @@ def test_version_two_migration_adds_trace_facts_before_recording_the_version():
 
     assert any("ALTER TABLE traces ADD COLUMN fact_projection_id" in statement for statement in statements)
     assert any("CREATE TABLE IF NOT EXISTS trace_reward_components" in statement for statement in statements)
+    group_statements = migration_statements(2, 3)
+    assert any("ADD COLUMN fact_task_id" in statement for statement in group_statements)
+    assert any("ADD COLUMN fact_prompt_group_id" in statement for statement in group_statements)
+    assert any("idx_trace_run_id" in statement for statement in group_statements)
+    assert any("idx_trace_prompt_group_id" in statement for statement in group_statements)
     with pytest.raises(ValueError, match="unsupported"):
-        migration_statements(2, 3)
+        migration_statements(3, 4)
 
 
 class _SchemaCursor:

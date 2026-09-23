@@ -218,6 +218,52 @@ def test_verifiers_trace_facts_are_idempotent_and_aggregate_without_payload_read
     assert row["fact_algorithm_reward"] == 0.75
 
 
+def test_prompt_group_reward_moments_use_indexed_fact_dimensions(temp_dir):
+    run = Run(url=None, project="proj", client=None, name="group-facts-run", space_id=None)
+    for index, reward in enumerate((0.0, 1.0)):
+        trace_id = f"group-trace-{index}"
+        run.log({"rollout": VerifiersTrace(verifiers_record(trace_id))})
+    run._flush_queues_inline()
+    for index, reward in enumerate((0.0, 1.0)):
+        dimensions = {
+            "rollout_step": 3,
+            "task_id": "task-7",
+            "prompt_group_id": "step/3/group/2",
+        }
+        measures = {"task_reward": reward}
+        run.upsert_trace_facts(TraceFactUpdate(
+            trace_type="verifiers",
+            external_id=f"group-trace-{index}",
+            namespace="verifiers.trace",
+            calculator_version="test.v1",
+            projection_id=_projection_id("verifiers.trace", "test.v1", dimensions, measures),
+            dimensions=dimensions,
+            measures=measures,
+            replace_reward_components=True,
+        ))
+    result = run.aggregate_trace_facts(TraceFactsQuery(
+        group_by=("rollout_step", "task_id", "prompt_group_id"),
+        aggregates=(
+            TraceAggregate("task_reward", "sum"),
+            TraceAggregate("task_reward", "sum_squares"),
+        ),
+    ))
+
+    assert len(result.buckets) == 1
+    bucket = result.buckets[0]
+    assert bucket.dimensions == {
+        "rollout_step": 3,
+        "task_id": "task-7",
+        "prompt_group_id": "step/3/group/2",
+    }
+    assert bucket.trace_count == 2
+    assert bucket.values == {"sum_task_reward": 1.0, "sum_squares_task_reward": 1.0}
+    assert bucket.coverage == {"sum_task_reward": 2, "sum_squares_task_reward": 2}
+    with SQLiteStorage._get_connection(SQLiteStorage.get_project_db_path("proj")) as conn:
+        indexes = {row["name"] for row in conn.execute("PRAGMA index_list(traces)")}
+    assert "idx_trace_facts_prompt_group" in indexes
+
+
 def test_bulk_trace_fact_upsert_validates_a_page_before_writing(monkeypatch):
     update = TraceFactUpdate(
         trace_type="verifiers",
