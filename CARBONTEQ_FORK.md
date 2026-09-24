@@ -22,8 +22,15 @@ retains the fork's storage, trace, and query behavior.
 
 ## Current extension
 
-`0.31.5.post14.dev26` retains dev25's trace-fact schema and query behavior and
-adds server inbox failure isolation: a claimed importer batch that fails for a
+`0.31.5.post14.dev26` is a published prerelease candidate tagged
+`carbonteq-v0.31.5.post14.dev26` at immutable fork commit
+`5593ef84865c1ab134ed24ac2534f6c018027052`. Its retained wheel is
+SHA-256 `c4ecb89aed2f6620b93ddd4d20d2cfbfb364d75dd6b0f6c73fc8b50e9d2ef64f`
+and sdist is SHA-256
+`a4b791c82542c977432c448da2ee115676098510ed93b94806bfdfe4419b8af1`; both were
+published unchanged to `carbonteq/dev` by Posttrain workflow `36057501387`.
+This candidate retains dev25's trace-fact schema and query behavior and adds
+server inbox failure isolation: a claimed importer batch that fails for a
 non-outage reason is re-imported fragment by fragment, and a fragment that can
 never be stored is moved to `inbox-dead-letter/` with an error sidecar instead
 of blocking every healthy fragment claimed with it. See "Inbox failure
