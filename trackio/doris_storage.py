@@ -46,6 +46,38 @@ from trackio.utils import (
 )
 
 _DATABASE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+_DEFAULT_MAX_STRING_BYTES = 10 * 1024 * 1024
+
+
+class DorisValueTooLargeError(ValueError):
+    """A value is larger than Doris accepts for a ``STRING`` column.
+
+    Doris rejects such rows in strict mode on every attempt, so the write is
+    refused before any statement runs instead of partially applying a batch.
+    """
+
+
+def _max_string_bytes() -> int:
+    raw = os.environ.get("TRACKIO_DORIS_MAX_STRING_BYTES", "").strip()
+    if not raw:
+        return _DEFAULT_MAX_STRING_BYTES
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        return _DEFAULT_MAX_STRING_BYTES
+
+
+def _ensure_string_fits(
+    value: str | None, *, limit: int, column: str, identity: str
+) -> None:
+    if value is None or limit <= 0 or len(value) * 4 <= limit:
+        return
+    size = len(value) if len(value) > limit else len(value.encode("utf-8"))
+    if size > limit:
+        raise DorisValueTooLargeError(
+            f"{column} for {identity} is at least {size} bytes, above the Doris "
+            f"STRING limit of {limit} bytes (TRACKIO_DORIS_MAX_STRING_BYTES)"
+        )
 
 
 def _required_env(name: str) -> str:
@@ -613,6 +645,49 @@ class DorisStorage:
                     )
                 )
 
+            trace_values = [
+                (
+                    project,
+                    row["id"],
+                    row["run_id"],
+                    row["timestamp"],
+                    row["run_name"],
+                    row["step"],
+                    row["key"],
+                    row["trace_index"],
+                    _json(row["messages"]),
+                    _json(row["metadata"]),
+                    row["search_text"],
+                    row["log_id"],
+                    row["space_id"],
+                    row["trace_type"],
+                    row["external_id"],
+                    row["schema_version"],
+                    _json(row["payload"]) if row["payload"] is not None else None,
+                )
+                for row in trace_rows
+            ]
+            limit = _max_string_bytes()
+            for metric_row in metric_rows:
+                _ensure_string_fits(
+                    metric_row[6],
+                    limit=limit,
+                    column="metrics",
+                    identity=f"run {resolved_run_id!r} step {metric_row[5]}",
+                )
+            for values in trace_values:
+                for column, value in (
+                    ("messages", values[8]),
+                    ("metadata", values[9]),
+                    ("search_text", values[10]),
+                    ("payload", values[16]),
+                ):
+                    _ensure_string_fits(
+                        value,
+                        limit=limit,
+                        column=f"traces.{column}",
+                        identity=f"trace {values[1]!r}",
+                    )
             cursor.executemany(
                 """
                 INSERT INTO metrics
@@ -633,30 +708,7 @@ class DorisStorage:
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                             %s, %s, %s, %s, %s, %s)
                     """,
-                    [
-                        (
-                            project,
-                            row["id"],
-                            row["run_id"],
-                            row["timestamp"],
-                            row["run_name"],
-                            row["step"],
-                            row["key"],
-                            row["trace_index"],
-                            _json(row["messages"]),
-                            _json(row["metadata"]),
-                            row["search_text"],
-                            row["log_id"],
-                            row["space_id"],
-                            row["trace_type"],
-                            row["external_id"],
-                            row["schema_version"],
-                            _json(row["payload"])
-                            if row["payload"] is not None
-                            else None,
-                        )
-                        for row in trace_rows
-                    ],
+                    trace_values,
                 )
                 for row in trace_rows:
                     raw_facts = row.get("trace_facts")
@@ -1225,7 +1277,7 @@ class DorisStorage:
                     params.append(_json_path(key))
                 select_metrics = ", ".join(projections)
             query = f"""
-                SELECT timestamp, step{', ' if select_metrics else ''}{select_metrics}
+                SELECT timestamp, step{", " if select_metrics else ""}{select_metrics}
                 FROM metrics
                 WHERE project_id = %s AND run_id = %s
             """
@@ -1265,7 +1317,9 @@ class DorisStorage:
                     value = row.get(f"metric_{index}")
                     if value is None:
                         continue
-                    metrics[key] = orjson.loads(value) if isinstance(value, str | bytes) else value
+                    metrics[key] = (
+                        orjson.loads(value) if isinstance(value, str | bytes) else value
+                    )
             if scalar_only:
                 metrics = {
                     key: value
@@ -1330,7 +1384,7 @@ class DorisStorage:
                     params.append(_json_path(key))
                 select_metrics = ", ".join(projections)
             query = f"""
-                SELECT timestamp{', ' if select_metrics else ''}{select_metrics} FROM system_metrics
+                SELECT timestamp{", " if select_metrics else ""}{select_metrics} FROM system_metrics
                 WHERE project_id = %s AND run_id = %s
                 ORDER BY timestamp, event_id
             """
@@ -1357,7 +1411,9 @@ class DorisStorage:
                     value = row.get(f"metric_{index}")
                     if value is None:
                         continue
-                    metrics[key] = orjson.loads(value) if isinstance(value, str | bytes) else value
+                    metrics[key] = (
+                        orjson.loads(value) if isinstance(value, str | bytes) else value
+                    )
                 metrics = deserialize_values(metrics)
             metrics["timestamp"] = str(row["timestamp"])
             result.append(metrics)
@@ -1712,13 +1768,17 @@ class DorisStorage:
                 update
                 for update in updates
                 if update.replace_reward_components
-                and not traces[(update.trace_type, update.external_id)].get("fact_projection_id")
+                and not traces[(update.trace_type, update.external_id)].get(
+                    "fact_projection_id"
+                )
             ]
             if fresh:
                 component_rows = [
                     (
                         project,
-                        str(traces[(update.trace_type, update.external_id)]["trace_id"]),
+                        str(
+                            traces[(update.trace_type, update.external_id)]["trace_id"]
+                        ),
                         str(traces[(update.trace_type, update.external_id)]["run_id"]),
                         update.projection_id,
                         component.name,
@@ -1740,26 +1800,68 @@ class DorisStorage:
                     )
                 columns = (
                     ("fact_namespace", lambda update: update.namespace),
-                    ("fact_calculator_version", lambda update: update.calculator_version),
+                    (
+                        "fact_calculator_version",
+                        lambda update: update.calculator_version,
+                    ),
                     ("fact_projection_id", lambda update: update.projection_id),
                     ("fact_state", lambda update: update.state),
-                    ("fact_calculated_at", lambda update: update.calculated_at.isoformat()),
+                    (
+                        "fact_calculated_at",
+                        lambda update: update.calculated_at.isoformat(),
+                    ),
                     ("fact_dimensions", lambda update: _json(dict(update.dimensions))),
                     ("fact_provenance", lambda update: _json(dict(update.provenance))),
                     ("fact_model", lambda update: update.dimensions.get("model")),
-                    ("fact_task_type", lambda update: update.dimensions.get("task_type")),
+                    (
+                        "fact_task_type",
+                        lambda update: update.dimensions.get("task_type"),
+                    ),
                     ("fact_task_id", lambda update: update.dimensions.get("task_id")),
-                    ("fact_prompt_group_id", lambda update: update.dimensions.get("prompt_group_id")),
-                    ("fact_rollout_step", lambda update: update.dimensions.get("rollout_step")),
-                    ("fact_is_truncated", lambda update: update.dimensions.get("is_truncated")),
-                    ("fact_has_error", lambda update: update.dimensions.get("has_error")),
-                    ("fact_model_input_tokens", lambda update: update.measures.get("model_input_tokens")),
-                    ("fact_model_output_tokens", lambda update: update.measures.get("model_output_tokens")),
-                    ("fact_thinking_tokens", lambda update: update.measures.get("thinking_tokens")),
-                    ("fact_tool_calls", lambda update: update.measures.get("tool_calls")),
-                    ("fact_model_calls", lambda update: update.measures.get("model_calls")),
-                    ("fact_trace_latency_ms", lambda update: update.measures.get("trace_latency_ms")),
-                    ("fact_task_reward", lambda update: update.measures.get("task_reward")),
+                    (
+                        "fact_prompt_group_id",
+                        lambda update: update.dimensions.get("prompt_group_id"),
+                    ),
+                    (
+                        "fact_rollout_step",
+                        lambda update: update.dimensions.get("rollout_step"),
+                    ),
+                    (
+                        "fact_is_truncated",
+                        lambda update: update.dimensions.get("is_truncated"),
+                    ),
+                    (
+                        "fact_has_error",
+                        lambda update: update.dimensions.get("has_error"),
+                    ),
+                    (
+                        "fact_model_input_tokens",
+                        lambda update: update.measures.get("model_input_tokens"),
+                    ),
+                    (
+                        "fact_model_output_tokens",
+                        lambda update: update.measures.get("model_output_tokens"),
+                    ),
+                    (
+                        "fact_thinking_tokens",
+                        lambda update: update.measures.get("thinking_tokens"),
+                    ),
+                    (
+                        "fact_tool_calls",
+                        lambda update: update.measures.get("tool_calls"),
+                    ),
+                    (
+                        "fact_model_calls",
+                        lambda update: update.measures.get("model_calls"),
+                    ),
+                    (
+                        "fact_trace_latency_ms",
+                        lambda update: update.measures.get("trace_latency_ms"),
+                    ),
+                    (
+                        "fact_task_reward",
+                        lambda update: update.measures.get("task_reward"),
+                    ),
                 )
                 trace_ids = [
                     str(traces[(update.trace_type, update.external_id)]["trace_id"])
@@ -1790,9 +1892,13 @@ class DorisStorage:
                 applied = (
                     True
                     if key in fresh_keys
-                    else cls._upsert_trace_facts_cursor(cursor, project, trace_id, update)
+                    else cls._upsert_trace_facts_cursor(
+                        cursor, project, trace_id, update
+                    )
                 )
-                receipts.append(TraceFactWriteReceipt(trace_id, update.projection_id, applied))
+                receipts.append(
+                    TraceFactWriteReceipt(trace_id, update.projection_id, applied)
+                )
             return receipts
 
     @classmethod
@@ -1850,7 +1956,8 @@ class DorisStorage:
                     else f"traces.fact_{item.measure}"
                 )
                 expression = (
-                    f"SUM({field} * {field})" if item.operation == "sum_squares"
+                    f"SUM({field} * {field})"
+                    if item.operation == "sum_squares"
                     else f"{ {'mean': 'AVG', 'sum': 'SUM', 'count': 'COUNT', 'min': 'MIN', 'max': 'MAX'}[item.operation] }({field})"
                 )
                 select.extend(

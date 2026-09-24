@@ -151,6 +151,19 @@ How often (in seconds) the dashboard server and Trackio Spaces check for new JSO
 export TRACKIO_INBOX_POLL_INTERVAL="30"
 ```
 
+### `TRACKIO_INBOX_RETRY_MAX_AGE` and `TRACKIO_INBOX_RETRY_MAX_BACKOFF`
+
+When a claimed batch of inbox fragments fails to import, the server retries each fragment on its own so one bad fragment cannot block the others. A fragment the storage backend will never accept (for example a Doris strict-mode length rejection or a validation error) is moved to `TRACKIO_DIR/inbox-dead-letter/<writer>/<fragment>.jsonl` together with a `<fragment>.jsonl.error.json` sidecar describing the error. Storage outages (connection loss, pool timeouts) keep fragments pending indefinitely. Other failures, such as a trace fact whose parent trace has not been imported yet, are retried with exponential backoff (starting at 5 seconds, capped by `TRACKIO_INBOX_RETRY_MAX_BACKOFF`, default `300`) until `TRACKIO_INBOX_RETRY_MAX_AGE` seconds (default `86400`) have passed since their first failure, and are then dead-lettered. Attempt counts live in a `<fragment>.jsonl.retry.json` sidecar beside the pending fragment and survive restarts. Dead-lettered fragments are never deleted; move a fragment back into the inbox to replay it.
+
+```bash
+export TRACKIO_INBOX_RETRY_MAX_AGE="172800"
+export TRACKIO_INBOX_RETRY_MAX_BACKOFF="600"
+```
+
+### `TRACKIO_DORIS_MAX_STRING_BYTES`
+
+With `TRACKIO_DATABASE_ENGINE=doris`, the largest encoded value Trackio will write to a Doris `STRING` column (metric JSON and trace messages, metadata, search text, and native payload). It should match the Doris backend `string_type_length_soft_limit_bytes`. A larger value is refused before any row is written, and the inbox dead-letters its fragment instead of retrying it. Defaults to `10485760` (10 MiB); `0` disables the check.
+
 ### `TRACKIO_SQLITE_*` (advanced)
 
 Override the PRAGMAs Trackio sets on its SQLite connections. These are mainly useful on unusual filesystems; invalid values are ignored.

@@ -160,6 +160,77 @@ returns only those safe scalar summaries. This repairs historical Observatory
 rows whose full detail had timing and token evidence while their paged summary
 showed it as missing.
 
+## Inbox failure isolation (unreleased, after `0.31.5.post14.dev25`)
+
+Status: committed on branch `codex/inbox-poison-isolation`, not pushed, not
+tagged, and not version-bumped. The next published candidate must assign a
+version, add an upstream-baseline row, and record its commit and hashes.
+
+Before this change the server importer treated a claimed inbox batch as one
+unit. Any exception returned every fragment in the batch to the inbox and the
+same batch was retried forever, so one fragment that could never be stored
+blocked every healthy fragment claimed with it. Production dev25 held an
+evaluation run's trace, summary metrics, and completion events for hours behind
+two 22.9 MB fragments whose native Verifiers `payload` exceeded the Doris
+10 MiB `STRING` limit and behind sixteen trace-fact fragments whose parent
+trace never arrived.
+
+The importer now behaves as follows:
+
+- A failed batch that is not a storage outage is re-imported one fragment at a
+  time (scalar fragments, then trace metrics, then trace facts). Healthy
+  fragments are committed and removed; each failing fragment is handled on its
+  own. Claims whose file has disappeared are skipped instead of being imported
+  from stale in-memory records.
+- `fragments.classify_import_error` classifies failures. `transient`
+  (connection loss, PyMySQL interface errors, pool checkout timeouts, known
+  outage error codes and Doris timeout/too-many-versions messages) keeps the
+  whole batch pending with backoff and is never dead-lettered. `permanent`
+  (Doris strict-mode or length rejection, `DorisValueTooLargeError`, other
+  `ValueError`/`TypeError`, PyMySQL `DataError`/`IntegrityError`) is moved to
+  the dead-letter directory on its first isolated failure. Everything else,
+  including a missing trace-fact parent (`KeyError ... does not exist`) and
+  unrecognized Doris `1105` errors, is `retryable`: it is retried with backoff
+  and dead-lettered once `TRACKIO_INBOX_RETRY_MAX_AGE` seconds (default 86400)
+  have passed since its first failure.
+- Backoff starts at 5 seconds and doubles up to `TRACKIO_INBOX_RETRY_MAX_BACKOFF`
+  seconds (default 300). The scanner skips a fragment until its backoff expires.
+  Attempt count, first-failure time, and the last error are stored in a
+  `<fragment>.jsonl.retry.json` sidecar beside the pending fragment, so
+  `recover_processing_fragments` and restarts preserve them; startup removes
+  sidecars whose fragment no longer exists.
+- Dead-lettered fragments move, unchanged, to
+  `<TRACKIO_DIR>/inbox-dead-letter/<writer>/<fragment>.jsonl` with a
+  `<fragment>.jsonl.error.json` sidecar (classification, error class, bounded
+  message, attempts, first-failure and dead-letter times, record count, and
+  record kinds). Nothing is deleted. One warning is logged per dead-lettered
+  fragment. Operators replay a fragment by moving it back into the inbox.
+- `DorisStorage.bulk_log` checks every metric JSON and trace
+  `messages`/`metadata`/`search_text`/`payload` value against
+  `TRACKIO_DORIS_MAX_STRING_BYTES` (default 10485760, `0` disables) before any
+  statement runs and raises `DorisValueTooLargeError`. This gives an oversized
+  native trace a typed, deterministic error instead of a partially applied
+  batch and a strict-mode rejection. It does not change the Doris schema.
+
+The oversized records were single `metric` records whose `traces/verifiers`
+value was a complete native Verifiers record from a long agentic rollout. This
+fork has no content-addressed offload for trace payloads; `cas.py` and the
+artifact store handle only media and artifact bytes. Oversized traces are
+therefore dead-lettered, not truncated; the native Verifiers `traces.jsonl`
+remains the replay authority. Rejecting such traces at HTTP ingestion or
+offloading their payloads is deferred because it changes the producer contract.
+
+The delta is in `trackio/fragments.py` and `trackio/doris_storage.py`, with
+operator documentation in `docs/source/environment_variables.md`. Regression
+tests are `tests/unit/test_inbox_isolation.py` and the updated missing-parent
+test in `tests/unit/test_fragments.py`. Rebase review must keep batch-then-
+per-fragment isolation, outage-versus-data classification, durable retry
+sidecars keyed by the pending fragment name, and the dead-letter directory
+outside the scanned inbox. Validate with
+`uv run python -m pytest -q tests/unit/test_inbox_isolation.py
+tests/unit/test_fragments.py tests/unit/test_server_trace_durability.py` and
+then `uv run python -m pytest -q tests/unit`.
+
 ## Verifiers v1 reward compatibility (`0.31.5.post14.dev20`)
 
 This candidate keeps the full native Verifiers reward mapping unchanged while
@@ -270,7 +341,8 @@ exhaust the HTTP client timeout. Remote `Run.enqueue_trace_facts()` now sends
 the idempotent fact update to `/enqueue_trace_facts`; the server durably writes
 both native trace metrics and later facts to its mounted inbox, then imports
 metrics before facts. A missing parent returns the fact fragment to the inbox
-for retry. `Run.upsert_trace_facts()` and `Run.flush()` remain the explicit
+for retry; after the inbox failure-isolation change that retry is bounded by
+`TRACKIO_INBOX_RETRY_MAX_AGE` and then dead-lettered. `Run.upsert_trace_facts()` and `Run.flush()` remain the explicit
 synchronous read-after-write APIs for callers that truly require an immediate
 receipt. The post-training adapter uses the new enqueue API, so ordinary
 training never waits for Doris trace persistence.

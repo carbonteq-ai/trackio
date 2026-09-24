@@ -1,8 +1,6 @@
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-import pytest
-
 import trackio
 from trackio import Run, fragments, utils
 from trackio.remote_client import RemoteClient as Client
@@ -157,13 +155,17 @@ def test_trace_fact_fragment_is_requeued_until_its_parent_is_ready(
         "trackio.storage.Storage.upsert_trace_facts_batch", parent_not_ready
     )
     claimed = fragments.claim_inbox_batch(max_files=1)
-    with pytest.raises(KeyError, match="delayed-parent"):
-        fragments.import_claimed_fragments(claimed)
+    assert fragments.import_claimed_fragments(claimed) == 0
 
     # The failed claim is returned unchanged to the durable inbox for a later
     # scanner pass, rather than silently losing a reward enrichment.
     assert path.exists()
     assert not list(fragments.local_inbox_dir().rglob("*.processing"))
+    state = fragments.read_retry_state(path)
+    assert state is not None
+    assert state["attempts"] == 1
+    assert state["classification"] == fragments.RETRYABLE
+    assert "delayed-parent" in state["message"]
 
 
 def test_parse_tolerates_corrupt_and_unknown_lines():
@@ -257,7 +259,9 @@ def test_import_inbox_dir_claims_fragments_for_concurrent_workers(temp_dir):
     assert not list(fragments.local_inbox_dir().rglob("*.processing"))
 
 
-def test_claimed_batch_prioritizes_scalar_records_over_trace_records(temp_dir, monkeypatch):
+def test_claimed_batch_prioritizes_scalar_records_over_trace_records(
+    temp_dir, monkeypatch
+):
     writer = fragments.FragmentWriter()
     writer.write_local(
         [
