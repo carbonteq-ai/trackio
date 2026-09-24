@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev25`.
+working candidate is `0.31.5.post14.dev26`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -21,6 +21,16 @@ Spaces use the same CarbonTeq distribution identity so the deployed runtime
 retains the fork's storage, trace, and query behavior.
 
 ## Current extension
+
+`0.31.5.post14.dev26` retains dev25's trace-fact schema and query behavior and
+adds server inbox failure isolation: a claimed importer batch that fails for a
+non-outage reason is re-imported fragment by fragment, and a fragment that can
+never be stored is moved to `inbox-dead-letter/` with an error sidecar instead
+of blocking every healthy fragment claimed with it. See "Inbox failure
+isolation" below. It adds the server settings `TRACKIO_INBOX_RETRY_MAX_AGE`
+(default 86400), `TRACKIO_INBOX_RETRY_MAX_BACKOFF` (default 300), and
+`TRACKIO_DORIS_MAX_STRING_BYTES` (default 10485760). No Doris schema change or
+client contract change is required; only the Trackio server must be upgraded.
 
 `0.31.5.post14.dev25` is a published prerelease candidate tagged
 `carbonteq-v0.31.5.post14.dev25` at immutable fork commit
@@ -160,11 +170,11 @@ returns only those safe scalar summaries. This repairs historical Observatory
 rows whose full detail had timing and token evidence while their paged summary
 showed it as missing.
 
-## Inbox failure isolation (unreleased, after `0.31.5.post14.dev25`)
+## Inbox failure isolation (`0.31.5.post14.dev26`)
 
-Status: committed on branch `codex/inbox-poison-isolation`, not pushed, not
-tagged, and not version-bumped. The next published candidate must assign a
-version, add an upstream-baseline row, and record its commit and hashes.
+Released as the `0.31.5.post14.dev26` prerelease candidate from branch
+`codex/inbox-poison-isolation`. Deployment to the shared Trackio server and a
+real-Doris backlog replay remain separate operational gates.
 
 Before this change the server importer treated a claimed inbox batch as one
 unit. Any exception returned every fragment in the batch to the inbox and the
@@ -465,6 +475,7 @@ added later without changing the Trackio SDK contract.
 | `0.31.5.post14.dev20` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev24` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev25` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
+| `0.31.5.post14.dev26` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 
 `0.31.5.post4` adds project-scoped bulk read APIs so a client can describe every
 run without one configuration request and one history request per run:
