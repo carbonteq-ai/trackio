@@ -22,7 +22,14 @@ retains the fork's storage, trace, and query behavior.
 
 ## Current extension
 
-`0.31.5.post14.dev27` retains dev26's storage, trace-fact and inbox behavior and
+`0.31.5.post14.dev27` is a published prerelease candidate tagged
+`carbonteq-v0.31.5.post14.dev27` at immutable fork commit
+`f4d1027441449d3d59870541edb275fa859fee35` (branch `codex/trace-payload-aggregates`). Its retained wheel is
+SHA-256 `228651b05e88409cb374296ad8a675057cf75377adcbe104a6fd0903b922c57c`
+and sdist is SHA-256
+`c48db39df03b4dfa4764d79d88a0bce113cd6a3c803320a61d7ef959cbc4a73a`; both were
+published unchanged to `carbonteq/dev` by Posttrain workflow `36140293044`.
+This candidate retains dev26's storage, trace-fact and inbox behavior and
 adds a read-only payload aggregate query: `Run.aggregate_trace_payload`,
 served by `get_trace_payload_aggregates`. See "Trace payload aggregates" below.
 No Doris schema change is required; the server and any client that calls the
