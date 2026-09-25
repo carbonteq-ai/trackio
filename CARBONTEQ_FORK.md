@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev26`.
+working candidate is `0.31.5.post14.dev27`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -21,6 +21,12 @@ Spaces use the same CarbonTeq distribution identity so the deployed runtime
 retains the fork's storage, trace, and query behavior.
 
 ## Current extension
+
+`0.31.5.post14.dev27` retains dev26's storage, trace-fact and inbox behavior and
+adds a read-only payload aggregate query: `Run.aggregate_trace_payload`,
+served by `get_trace_payload_aggregates`. See "Trace payload aggregates" below.
+No Doris schema change is required; the server and any client that calls the
+new query must be upgraded.
 
 `0.31.5.post14.dev26` is a published prerelease candidate tagged
 `carbonteq-v0.31.5.post14.dev26` at immutable fork commit
@@ -176,6 +182,37 @@ model-call count, and tool-call count from the complete stored record, then
 returns only those safe scalar summaries. This repairs historical Observatory
 rows whose full detail had timing and token evidence while their paged summary
 showed it as missing.
+
+## Trace payload aggregates (`0.31.5.post14.dev27`)
+
+`TracePayloadQuery` aggregates numeric values read directly from each trace's
+stored native payload in one storage query, grouped and filtered by the same
+materialized fact dimensions as `TraceFactsQuery` (rollout step, task, prompt
+group, model, truncation, error; not reward components). Each
+`TracePayloadMeasure` names an output key, a JSON path, an optional `minus`
+path for spans stored as start/end timestamps, and one of mean, sum, count,
+min or max. Paths are bounded chains of object keys
+(`^\$(\.[A-Za-z_][A-Za-z0-9_]{0,63}){1,8}$`), bound as query parameters; array
+indexing and wildcards are rejected. A query carries 1 to 16 measures with
+unique keys. Missing or non-numeric values do not contribute, and each bucket's
+coverage reports how many traces did.
+
+Doris evaluates `get_json_double(payload, path)`; SQLite evaluates
+`json_extract` guarded by `json_type` so text never counts as zero. Posttrain
+uses it for rollout phase time (inference, harness, setup, scoring) from
+Verifiers `timing`. Measured on Doris 4.0.7 with 512 real 208 KB Verifiers
+payloads: a five-measure per-step aggregate takes about 1.1 s, against about
+0.2 s for a fact-only query. The cost is one JSON parse per row, independent
+of measure count and query shape; storing the payload as Doris JSON was about
+4x faster but is a schema change and is not part of this release.
+
+The delta is in `trackio/trace_facts.py`, `trackio/sqlite_storage.py`,
+`trackio/doris_storage.py`, `trackio/server.py`, `trackio/api.py` and
+`trackio/run.py`, with regression tests in
+`tests/unit/test_trace_payload_aggregates.py` and
+`tests/integration/test_doris_storage.py::test_payload_timing_aggregates_on_real_doris`
+(passed against the isolated `trackio_candidate` Doris database). Validate with
+`python -m pytest -q tests/unit/test_trace_payload_aggregates.py`.
 
 ## Inbox failure isolation (`0.31.5.post14.dev26`)
 
@@ -483,6 +520,7 @@ added later without changing the Trackio SDK contract.
 | `0.31.5.post14.dev24` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev25` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev26` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
+| `0.31.5.post14.dev27` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 
 `0.31.5.post4` adds project-scoped bulk read APIs so a client can describe every
 run without one configuration request and one history request per run:
