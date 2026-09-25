@@ -37,6 +37,7 @@ from trackio.trace_facts import (
     TraceFactsQuery,
     TraceFactUpdate,
     TraceFactWriteReceipt,
+    TracePayloadQuery,
 )
 from trackio.utils import (
     deserialize_values,
@@ -1989,6 +1990,83 @@ class DorisStorage:
                         {
                             item.key: row[f"coverage_{item.key}"]
                             for item in query.aggregates
+                        },
+                    )
+                    for row in cursor.fetchall()
+                )
+            )
+
+    @classmethod
+    def aggregate_trace_payload(
+        cls,
+        project: str,
+        run: str,
+        query: TracePayloadQuery,
+        *,
+        run_id: str | None = None,
+    ) -> TraceAggregateResult:
+        """Aggregate numeric payload values with one scan of the run's traces."""
+
+        columns = {
+            "model": "fact_model",
+            "task_type": "fact_task_type",
+            "task_id": "fact_task_id",
+            "prompt_group_id": "fact_prompt_group_id",
+            "rollout_step": "fact_rollout_step",
+            "is_truncated": "fact_is_truncated",
+            "has_error": "fact_has_error",
+        }
+        if any(name not in columns for name in (*query.group_by, *query.dimensions)):
+            raise ValueError("requested dimension is not materialized for aggregation")
+        operations = {
+            "mean": "AVG",
+            "sum": "SUM",
+            "count": "COUNT",
+            "min": "MIN",
+            "max": "MAX",
+        }
+        with cls._connection() as connection, connection.cursor() as cursor:
+            resolved = cls._resolve_run_id(cursor, project, run, run_id, table="traces")
+            if resolved is None:
+                return TraceAggregateResult(())
+            select = [f"{columns[name]} AS {name}" for name in query.group_by]
+            select.append("COUNT(*) AS trace_count")
+            select_params: list[Any] = []
+            for measure in query.measures:
+                value = "get_json_double(payload, %s)"
+                value_params: list[Any] = [measure.path]
+                if measure.minus is not None:
+                    value = f"({value} - get_json_double(payload, %s))"
+                    value_params.append(measure.minus)
+                select.append(
+                    f"{operations[measure.operation]}({value}) AS {measure.key}"
+                )
+                select.append(f"COUNT({value}) AS coverage_{measure.key}")
+                select_params.extend(value_params * 2)
+            where = [
+                "project_id=%s",
+                "run_id=%s",
+                "trace_type=%s",
+                "payload IS NOT NULL",
+            ]
+            where_params: list[Any] = [project, resolved, query.trace_type]
+            for name, expected in query.dimensions.items():
+                where.append(f"{columns[name]} <=> %s")
+                where_params.append(expected)
+            sql = f"SELECT {', '.join(select)} FROM traces WHERE {' AND '.join(where)}"
+            if query.group_by:
+                grouped = ", ".join(columns[name] for name in query.group_by)
+                sql += f" GROUP BY {grouped} ORDER BY {grouped}"
+            cursor.execute(sql, [*select_params, *where_params])
+            return TraceAggregateResult(
+                tuple(
+                    TraceAggregateBucket(
+                        {name: row[name] for name in query.group_by},
+                        int(row["trace_count"]),
+                        {measure.key: row[measure.key] for measure in query.measures},
+                        {
+                            measure.key: int(row[f"coverage_{measure.key}"])
+                            for measure in query.measures
                         },
                     )
                     for row in cursor.fetchall()

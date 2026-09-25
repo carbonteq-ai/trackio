@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -356,6 +357,77 @@ class TraceFactsQuery:
             raise ValueError(
                 "scalar and reward-component aggregates must be queried separately"
             )
+        object.__setattr__(self, "dimensions", MappingProxyType(dict(self.dimensions)))
+
+
+# A payload path is a bounded chain of object keys, for example
+# ``$.timing.agent.model.duration``. Array indexing and wildcards are
+# deliberately unsupported: the path is bound as a query parameter and must
+# name one scalar per trace.
+_PAYLOAD_PATH = re.compile(r"^\$(\.[A-Za-z_][A-Za-z0-9_]{0,63}){1,8}$")
+_OUTPUT_KEY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+PayloadOperation = Literal["mean", "sum", "count", "min", "max"]
+_MAX_PAYLOAD_MEASURES = 16
+
+
+@dataclass(frozen=True, slots=True)
+class TracePayloadMeasure:
+    """One numeric value read from each trace's native payload.
+
+    The value is the number at ``path``, or ``path`` minus ``minus`` when both
+    are present (for a span stored as ``start``/``end`` timestamps). Traces
+    where either path is missing or not numeric do not contribute; the
+    bucket's coverage reports how many did.
+    """
+
+    key: str
+    path: str
+    minus: str | None = None
+    operation: PayloadOperation = "sum"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, str) or not _OUTPUT_KEY.fullmatch(self.key):
+            raise ValueError("payload measure key must be lower_snake_case")
+        for value in (self.path, self.minus):
+            if value is not None and (
+                not isinstance(value, str) or not _PAYLOAD_PATH.fullmatch(value)
+            ):
+                raise ValueError(f"unsupported payload path {value!r}")
+        if self.operation not in {"mean", "sum", "count", "min", "max"}:
+            raise ValueError(f"unsupported payload operation {self.operation!r}")
+
+
+@dataclass(frozen=True, slots=True)
+class TracePayloadQuery:
+    """Aggregate numeric payload values over a run's traces in one query.
+
+    Grouping and filtering use the same materialized fact dimensions as
+    :class:`TraceFactsQuery`; the measures read the stored payload directly, so
+    no producer-side projection is required.
+    """
+
+    measures: tuple[TracePayloadMeasure, ...]
+    trace_type: str = "verifiers"
+    group_by: tuple[str, ...] = ()
+    dimensions: Mapping[str, str | int | float | bool | None] = field(
+        default_factory=dict
+    )
+
+    def __post_init__(self) -> None:
+        allowed = _DIMENSION_NAMES - _COMPONENT_DIMENSION_NAMES
+        if any(name not in allowed for name in self.group_by):
+            raise ValueError("payload grouping includes an unsupported dimension")
+        if len(self.group_by) != len(set(self.group_by)):
+            raise ValueError("payload grouping dimensions must be unique")
+        if any(name not in allowed for name in self.dimensions):
+            raise ValueError("payload filter includes an unsupported dimension")
+        if not 1 <= len(self.measures) <= _MAX_PAYLOAD_MEASURES:
+            raise ValueError(
+                f"payload queries need between 1 and {_MAX_PAYLOAD_MEASURES} measures"
+            )
+        keys = [measure.key for measure in self.measures]
+        if len(keys) != len(set(keys)):
+            raise ValueError("payload measure keys must be unique")
         object.__setattr__(self, "dimensions", MappingProxyType(dict(self.dimensions)))
 
 

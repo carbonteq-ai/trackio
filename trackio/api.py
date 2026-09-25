@@ -8,6 +8,7 @@ from trackio.trace_facts import (
     TraceFactsQuery,
     TraceFactUpdate,
     TraceFactWriteReceipt,
+    TracePayloadQuery,
 )
 
 
@@ -339,6 +340,35 @@ class Run:
                 tuple(TraceAggregateBucket(**item) for item in response["buckets"])
             )
         return SQLiteStorage.aggregate_trace_facts(
+            self.project, self.name, query, run_id=self.id
+        )
+
+    def aggregate_trace_payload(self, query: TracePayloadQuery) -> TraceAggregateResult:
+        """Aggregate numeric values read from this run's stored trace payloads."""
+
+        if self._remote_client is not None:
+            response = self._remote(
+                "/get_trace_payload_aggregates",
+                project=self.project,
+                run=self.name,
+                run_id=self.id,
+                trace_type=query.trace_type,
+                group_by=list(query.group_by),
+                measures=[
+                    {
+                        "key": measure.key,
+                        "path": measure.path,
+                        "minus": measure.minus,
+                        "operation": measure.operation,
+                    }
+                    for measure in query.measures
+                ],
+                dimensions=dict(query.dimensions),
+            )
+            return TraceAggregateResult(
+                tuple(TraceAggregateBucket(**item) for item in response["buckets"])
+            )
+        return SQLiteStorage.aggregate_trace_payload(
             self.project, self.name, query, run_id=self.id
         )
 

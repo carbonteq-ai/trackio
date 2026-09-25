@@ -12,6 +12,8 @@ from trackio.trace_facts import (
     TraceAggregate,
     TraceFactsQuery,
     TraceFactUpdate,
+    TracePayloadMeasure,
+    TracePayloadQuery,
     projection_id,
 )
 
@@ -158,6 +160,81 @@ def test_prompt_group_fact_moments_on_real_doris():
     assert bucket.trace_count == 2
     assert bucket.values == {"sum_task_reward": 1.0, "sum_squares_task_reward": 1.0}
     assert bucket.coverage == {"sum_task_reward": 2, "sum_squares_task_reward": 2}
+
+
+def test_payload_timing_aggregates_on_real_doris():
+    project = "trackio-payload-aggregate-qualification"
+    run = "payload-timing"
+    run_id = "payload-timing-20260925"
+    rows = [(0, 1, 13.0, 50.0, 2.0), (1, 1, 0.5, 40.0, 1.0), (2, 2, 0.4, 30.0, "n/a")]
+    for index, step, setup, model, harness in rows:
+        start = 1000.0 * step + index
+        DorisStorage.bulk_log(
+            project=project,
+            run=run,
+            run_id=run_id,
+            metrics_list=[{
+                "rollout": VerifiersTrace({
+                    "id": f"payload-timing-trace-{index}",
+                    "version": 3,
+                    "nodes": [{"message": {"role": "user", "content": f"task {index}"}}],
+                    "rewards": {"task": 1.0},
+                    "timing": {
+                        "start": start,
+                        "setup": {"start": start, "end": start + setup},
+                        "agent": {"model": {"duration": model}, "harness": {"duration": harness}},
+                    },
+                })._to_dict(project=project, run=run, step=index)
+            }],
+            steps=[index],
+            timestamps=[f"2026-09-25T00:00:0{index}+00:00"],
+            log_ids=[f"payload-timing-{index}"],
+            config={"qualification": "payload-aggregates"},
+        )
+    traces = {item["external_id"]: item for item in DorisStorage.get_traces(project, run_id=run_id, trace_type="verifiers")}
+    assert len(traces) == 3
+    for index, step, *_ in rows:
+        dimensions = {"rollout_step": step}
+        DorisStorage.upsert_trace_facts(project, run, TraceFactUpdate(
+            trace_type="verifiers",
+            external_id=f"payload-timing-trace-{index}",
+            namespace="verifiers.trace",
+            calculator_version="test.v1",
+            projection_id=projection_id({
+                "namespace": "verifiers.trace",
+                "calculator_version": "test.v1",
+                "dimensions": dimensions,
+                "measures": {},
+                "reward_components": [],
+                "provenance": {},
+                "state": "complete",
+            }),
+            dimensions=dimensions,
+            replace_reward_components=True,
+        ), run_id=run_id)
+    query = TracePayloadQuery(
+        measures=(
+            TracePayloadMeasure("inference_s", "$.timing.agent.model.duration"),
+            TracePayloadMeasure("harness_s", "$.timing.agent.harness.duration"),
+            TracePayloadMeasure("setup_s", "$.timing.setup.end", minus="$.timing.setup.start"),
+        ),
+        group_by=("rollout_step",),
+    )
+    result = DorisStorage.aggregate_trace_payload(project, run, query, run_id=run_id)
+    by_step = {bucket.dimensions["rollout_step"]: bucket for bucket in result.buckets}
+    assert set(by_step) == {1, 2}
+    assert by_step[1].trace_count == 2
+    assert by_step[1].values["inference_s"] == pytest.approx(90.0)
+    assert by_step[1].values["harness_s"] == pytest.approx(3.0)
+    assert by_step[1].values["setup_s"] == pytest.approx(13.5)
+    assert by_step[1].coverage == {"inference_s": 2, "harness_s": 2, "setup_s": 2}
+    assert by_step[2].values["harness_s"] is None
+    assert by_step[2].coverage["harness_s"] == 0
+    filtered = DorisStorage.aggregate_trace_payload(
+        project, run, TracePayloadQuery(measures=query.measures, dimensions={"rollout_step": 2}), run_id=run_id
+    )
+    assert [bucket.trace_count for bucket in filtered.buckets] == [1]
+    assert filtered.buckets[0].values["setup_s"] == pytest.approx(0.4)
 
 
 def test_artifact_metadata_lineage_and_run_mutations():

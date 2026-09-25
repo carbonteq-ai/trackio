@@ -54,6 +54,8 @@ from trackio.trace_facts import (
     TraceFactsQuery,
     TraceFactUpdate,
     TraceFactWriteReceipt,
+    TracePayloadMeasure,
+    TracePayloadQuery,
     TraceRewardComponent,
 )
 from trackio.typehints import UploadEntry
@@ -98,6 +100,8 @@ __all__ = [
     "TraceFactUpdate",
     "TraceFactWriteReceipt",
     "TraceFactsQuery",
+    "TracePayloadMeasure",
+    "TracePayloadQuery",
     "TraceAggregate",
     "TraceAggregateBucket",
     "TraceAggregateResult",

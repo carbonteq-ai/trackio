@@ -44,7 +44,13 @@ from trackio.storage import (
     is_retryable_storage_error,
     selected_engine,
 )
-from trackio.trace_facts import TraceAggregate, TraceFactsQuery, TraceFactUpdate
+from trackio.trace_facts import (
+    TraceAggregate,
+    TraceFactsQuery,
+    TraceFactUpdate,
+    TracePayloadMeasure,
+    TracePayloadQuery,
+)
 from trackio.typehints import (
     AlertEntry,
     ArtifactBlobUploadEntry,
@@ -1590,6 +1596,37 @@ def get_trace_facts(
     }
 
 
+def get_trace_payload_aggregates(
+    project: str,
+    run: str,
+    measures: list[dict[str, Any]],
+    trace_type: str = "verifiers",
+    group_by: list[str] | None = None,
+    dimensions: dict[str, Any] | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Aggregate numeric values read from stored trace payloads in one query."""
+
+    query = TracePayloadQuery(
+        measures=tuple(TracePayloadMeasure(**item) for item in measures),
+        trace_type=trace_type,
+        group_by=tuple(group_by or ()),
+        dimensions=dimensions or {},
+    )
+    result = Storage.aggregate_trace_payload(project, run, query, run_id=run_id)
+    return {
+        "buckets": [
+            {
+                "dimensions": dict(bucket.dimensions),
+                "trace_count": bucket.trace_count,
+                "values": dict(bucket.values),
+                "coverage": dict(bucket.coverage),
+            }
+            for bucket in result.buckets
+        ]
+    }
+
+
 def query_project(project: str, query: str) -> dict[str, Any]:
     return Storage.query_project(project, query)
 
@@ -1798,6 +1835,7 @@ def _api_registry() -> dict[str, Any]:
         "enqueue_trace_facts": enqueue_trace_facts,
         "bulk_upsert_trace_facts": bulk_upsert_trace_facts,
         "get_trace_facts": get_trace_facts,
+        "get_trace_payload_aggregates": get_trace_payload_aggregates,
         "query_project": query_project,
         "get_settings": get_settings,
         "get_project_files": get_project_files,

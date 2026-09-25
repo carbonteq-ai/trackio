@@ -39,6 +39,7 @@ from trackio.trace_facts import (
     TraceFactsQuery,
     TraceFactUpdate,
     TraceFactWriteReceipt,
+    TracePayloadQuery,
 )
 from trackio.typehints import AlertEntry, LogEntry, SystemLogEntry, UploadEntry
 from trackio.utils import MEDIA_DIR, _emit_nonfatal_warning, _get_default_namespace
@@ -1401,6 +1402,39 @@ class Run:
                         "component_name": aggregate.component_name,
                     }
                     for aggregate in query.aggregates
+                ],
+                dimensions=dict(query.dimensions),
+            )
+        return TraceAggregateResult(
+            tuple(TraceAggregateBucket(**bucket) for bucket in response["buckets"])
+        )
+
+    def aggregate_trace_payload(self, query: TracePayloadQuery) -> TraceAggregateResult:
+        """Aggregate numeric values read from this run's stored trace payloads."""
+
+        if self._is_local:
+            return SQLiteStorage.aggregate_trace_payload(
+                self.project, self.name, query, run_id=self.id
+            )
+        self._wait_for_client_ready()
+        with self._client_lock:
+            if self._client is None:
+                raise RuntimeError("trackio remote client is not available")
+            response = self._client.predict(
+                api_name="/get_trace_payload_aggregates",
+                project=self.project,
+                run=self.name,
+                run_id=self.id,
+                trace_type=query.trace_type,
+                group_by=list(query.group_by),
+                measures=[
+                    {
+                        "key": measure.key,
+                        "path": measure.path,
+                        "minus": measure.minus,
+                        "operation": measure.operation,
+                    }
+                    for measure in query.measures
                 ],
                 dimensions=dict(query.dimensions),
             )

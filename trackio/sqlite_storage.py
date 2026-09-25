@@ -38,6 +38,7 @@ from trackio.trace_facts import (
     TraceFactsQuery,
     TraceFactUpdate,
     TraceFactWriteReceipt,
+    TracePayloadQuery,
 )
 from trackio.typehints import (
     ARTIFACT_BLOB_UPLOAD_KIND,
@@ -3137,6 +3138,80 @@ class SQLiteStorage:
                         {
                             item.key: row[f"coverage_{item.key}"]
                             for item in query.aggregates
+                        },
+                    )
+                    for row in cursor.fetchall()
+                )
+            )
+
+    @staticmethod
+    def aggregate_trace_payload(
+        project: str, run: str, query: TracePayloadQuery, *, run_id: str | None = None
+    ) -> TraceAggregateResult:
+        """Aggregate numeric payload values with one scan of the run's traces."""
+
+        columns = {
+            "model": "fact_model",
+            "task_type": "fact_task_type",
+            "task_id": "fact_task_id",
+            "prompt_group_id": "fact_prompt_group_id",
+            "rollout_step": "fact_rollout_step",
+            "is_truncated": "fact_is_truncated",
+            "has_error": "fact_has_error",
+        }
+        if any(name not in columns for name in (*query.group_by, *query.dimensions)):
+            raise ValueError("requested dimension is not materialized for aggregation")
+        operations = {"mean": "AVG", "sum": "SUM", "count": "COUNT", "min": "MIN", "max": "MAX"}
+        db_path = SQLiteStorage.get_project_db_path(project)
+        if not db_path.exists():
+            return TraceAggregateResult(())
+        with SQLiteStorage._get_connection(db_path) as conn:
+            identity = SQLiteStorage._resolve_run_identity(
+                conn, run_name=run, run_id=run_id, table="traces"
+            )
+            if identity is None:
+                return TraceAggregateResult(())
+            run_column, run_value = identity
+
+            def number(params: list[Any], path: str) -> str:
+                # Only JSON numbers count; text or objects are missing, not zero.
+                params.extend((path, path))
+                return "(CASE WHEN json_type(payload, ?) IN ('integer', 'real') THEN json_extract(payload, ?) END)"
+
+            select = [f"{columns[name]} AS {name}" for name in query.group_by]
+            select.append("COUNT(*) AS trace_count")
+            select_params: list[Any] = []
+            for measure in query.measures:
+                for _ in range(2):  # the aggregate and its coverage
+                    value = number(select_params, measure.path)
+                    if measure.minus is not None:
+                        value = f"({value} - {number(select_params, measure.minus)})"
+                    if _ == 0:
+                        select.append(
+                            f"{operations[measure.operation]}({value}) AS {measure.key}"
+                        )
+                    else:
+                        select.append(f"COUNT({value}) AS coverage_{measure.key}")
+            where = [f"{run_column} = ?", "trace_type = ?", "payload IS NOT NULL"]
+            where_params: list[Any] = [run_value, query.trace_type]
+            for name, expected in query.dimensions.items():
+                where.append(f"{columns[name]} IS ?")
+                where_params.append(expected)
+            sql = f"SELECT {', '.join(select)} FROM traces WHERE {' AND '.join(where)}"
+            if query.group_by:
+                grouped = ", ".join(columns[name] for name in query.group_by)
+                sql += f" GROUP BY {grouped} ORDER BY {grouped}"
+            cursor = conn.cursor()
+            cursor.execute(sql, [*select_params, *where_params])
+            return TraceAggregateResult(
+                tuple(
+                    TraceAggregateBucket(
+                        {name: row[name] for name in query.group_by},
+                        int(row["trace_count"]),
+                        {measure.key: row[measure.key] for measure in query.measures},
+                        {
+                            measure.key: int(row[f"coverage_{measure.key}"])
+                            for measure in query.measures
                         },
                     )
                     for row in cursor.fetchall()
