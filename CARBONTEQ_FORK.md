@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev27`.
+working candidate is `0.31.5.post14.dev28`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -21,6 +21,15 @@ Spaces use the same CarbonTeq distribution identity so the deployed runtime
 retains the fork's storage, trace, and query behavior.
 
 ## Current extension
+
+`0.31.5.post14.dev28` is an unreleased candidate. It retains dev27's storage,
+trace-fact, payload-aggregate and inbox behavior and adds revisioned Markdown
+run notes: a `run_notes` table on SQLite/Turso and Doris, five server
+endpoints, and matching `Api` client methods. See "Run notes" below. Doris
+moves to schema version 4, which requires the explicit, backup-gated
+`trackio storage migrate-doris --to 4` before a dev28 server starts against an
+existing Doris database. The server and any client that reads or writes notes
+must be upgraded; other clients are unaffected.
 
 `0.31.5.post14.dev27` retains dev26's storage, trace-fact and inbox behavior and
 adds a read-only payload aggregate query: `Run.aggregate_trace_payload`,
@@ -182,6 +191,97 @@ model-call count, and tool-call count from the complete stored record, then
 returns only those safe scalar summaries. This repairs historical Observatory
 rows whose full detail had timing and token evidence while their paged summary
 showed it as missing.
+
+## Run notes (`0.31.5.post14.dev28`)
+
+Unreleased candidate on branch `codex/run-notes`. Publication, deployment to
+the shared Trackio server, and the Doris v3-to-v4 migration are separate
+operational gates.
+
+A run note is Markdown attached to one run (`scope = 'run'`) or to the project
+(`scope = 'project'`), with a `kind`, an optional `title`, optional JSON
+`metadata`, and a `source` string recording how a revision was written
+(Posttrain uses `cli`, `mcp` and `observatory`; the server only requires a
+non-empty value of at most 64 bytes). There is no author or user concept. The
+generic rules live in `trackio/run_notes.py`; both storage engines read a
+note's revisions, ask that module which row to append, and persist it.
+
+Behavior that must survive an upstream merge:
+
+- Notes are append-only revisions keyed by a stable `note_id` (generated when
+  omitted; caller-chosen ids are 1-128 characters from `[A-Za-z0-9._:/-]`).
+  `created_at` is copied forward from revision 1; `revised_at` is the time of
+  each revision; `parent_revision` names the revision it replaced.
+- `add_run_note` stores revision 1. Repeating it with the same `note_id` and
+  identical scope, run, kind, title and body returns the stored revision 1
+  (safe retry); different content is a conflict.
+- `revise_run_note` requires `expected_revision` to equal the latest revision
+  and appends `latest + 1`. A stale revision, or any change to a deleted note,
+  raises `RunNoteConflictError`, whose message and `current_revision` name the
+  current revision. `kind`, `title` and `metadata` left as `None` carry
+  forward; an empty title clears it.
+- `delete_run_note` appends a tombstone revision (`deleted = 1`, body copied
+  forward). Default listings hide it; `include_deleted=True` and
+  `get_run_note_history` still return it and every earlier revision.
+- `get_run_notes` returns the latest revision per note, newest `revised_at`
+  first, filtered by `run_id`, `scope` and `kind`.
+- A run note is resolved like other run-scoped writes: an explicit `run_id` is
+  used as given (its `run_name` is looked up when omitted); a `run_name` alone
+  resolves to the newest run with that name and fails if none exists.
+- Run lifecycle: `delete_run` and `purge_runs` delete the run's notes;
+  `rename_run` rewrites `run_name` on every revision; SQLite `move_run` copies
+  every revision, with the same `note_id`, to the target project and removes
+  them from the source; project deletion removes all notes. Project-scope
+  notes are never touched by run operations.
+- SQLite/Turso: `run_notes` is created idempotently by `init_db` with a unique
+  `(note_id, revision)` index and indexes on `run_id` and `(scope,
+  revised_at)`. Writes run under the project process lock; a unique-index
+  violation is reported as a conflict. Parquet export writes every revision to
+  `{project}_run_notes.parquet` (removed when the table is empty so deleted
+  notes cannot be resurrected on import), and project names ending in
+  `_run_notes` are reserved for that sidecar.
+- Doris: schema version 4 adds `run_notes` with
+  `UNIQUE KEY(project_id, note_id, revision)` and an inverted index on
+  `run_id`. Because a Doris unique key upserts instead of rejecting a
+  duplicate, revision allocation is serialized by a process-local lock; like
+  artifact versions, this is correct only for the documented single Trackio
+  server replica. `migration_statements(3, 4)` creates the table, and a
+  multi-version migration is the ordered concatenation of single steps, so a
+  v2 database can go directly to v4. `migrate-doris --apply` now verifies that
+  every managed table exists before recording the version. The SQLite-to-Doris
+  importer copies and reconciles every revision (`run_notes` is an
+  authoritative, run-scoped table whose project-scope rows are included in
+  source-inclusion verification).
+- Server: `/get_run_notes` and `/get_run_note_history` are unauthenticated
+  reads like other reads. `/add_run_note`, `/revise_run_note` and
+  `/delete_run_note` require run-mutation access (`assert_can_mutate_runs`:
+  the write token off Spaces) and write synchronously, bypassing the inbox.
+  A conflict is `TrackioConflictError` (a `TrackioAPIError` and a
+  `RuntimeError`) answered with HTTP 409 and a `conflict` object carrying
+  `note_id` and `current_revision`; other invalid input stays HTTP 400.
+- Client: `RemoteClient` raises `TrackioConflictError` for HTTP 409, and
+  `Api.add_run_note` / `revise_run_note` / `delete_run_note` re-raise it as
+  `RunNoteConflictError`. `Api(server_url, write_token=...)` passes a write
+  token for mutations; without a server, `Api` uses local `SQLiteStorage`.
+  `Api.capabilities()["run_notes"]` is `True`.
+
+The delta is in `trackio/run_notes.py`, `trackio/exceptions.py`,
+`trackio/sqlite_storage.py`, `trackio/doris_schema.py`,
+`trackio/doris_storage.py`, `trackio/doris_migration.py`,
+`trackio/doris_schema_migration.py`, `trackio/server.py`,
+`trackio/asgi_app.py`, `trackio/remote_client.py` and `trackio/api.py`. The
+Svelte dashboard and the MCP server do not expose notes yet. Regression tests
+are `tests/unit/test_run_notes.py` (storage semantics, run lifecycle, Parquet
+round trip, local and HTTP `Api` round trips including a write refused
+without the write token, and the Doris provider's SQL exercised against an
+in-memory SQLite stand-in), the version-4 cases in
+`tests/unit/test_doris_schema.py`, the run-note cases in
+`tests/unit/test_doris_migration.py`, and
+`tests/integration/test_doris_storage.py::test_run_notes_revisions_and_lifecycle_on_real_doris`,
+which has not yet been run against a real Doris. Validate with
+`uv run python -m pytest -q tests/unit/test_run_notes.py
+tests/unit/test_doris_schema.py tests/unit/test_doris_migration.py` and then
+`uv run python -m pytest -q tests/unit`.
 
 ## Trace payload aggregates (`0.31.5.post14.dev27`)
 
@@ -521,6 +621,7 @@ added later without changing the Trackio SDK contract.
 | `0.31.5.post14.dev25` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev26` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev27` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
+| `0.31.5.post14.dev28` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 
 `0.31.5.post4` adds project-scoped bulk read APIs so a client can describe every
 run without one configuration request and one history request per run:

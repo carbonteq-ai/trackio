@@ -27,6 +27,7 @@ import orjson
 
 from trackio import cas, references
 from trackio import database as sqlite3
+from trackio import run_notes as notes
 from trackio.artifact_storage import get_artifact_store
 from trackio.commit_scheduler import CommitScheduler
 from trackio.dummy_commit_scheduler import DummyCommitScheduler
@@ -431,6 +432,14 @@ class SQLiteStorage:
             "created_at",
         ],
     }
+    _RUN_NOTES_PARQUET_COLUMNS: list[str] = ["id", *notes.NOTE_COLUMNS]
+
+    @staticmethod
+    def _sidecar_parquet_tables() -> dict[str, list[str]]:
+        return {
+            **SQLiteStorage._ARTIFACT_PARQUET_TABLES,
+            "run_notes": SQLiteStorage._RUN_NOTES_PARQUET_COLUMNS,
+        }
 
     @staticmethod
     @contextmanager
@@ -507,7 +516,7 @@ class SQLiteStorage:
                 "system",
                 "configs",
                 "traces",
-                *SQLiteStorage._ARTIFACT_PARQUET_TABLES,
+                *SQLiteStorage._sidecar_parquet_tables(),
             )
         )
         canonical = canonical_project_name(project)
@@ -900,6 +909,45 @@ class SQLiteStorage:
                     """
                     CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_alert_id
                     ON alerts(alert_id) WHERE alert_id IS NOT NULL
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS run_notes (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        note_id TEXT NOT NULL,
+                        revision INTEGER NOT NULL,
+                        scope TEXT NOT NULL,
+                        run_id TEXT,
+                        run_name TEXT,
+                        kind TEXT NOT NULL,
+                        title TEXT,
+                        body_md TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        revised_at TEXT NOT NULL,
+                        deleted INTEGER NOT NULL DEFAULT 0,
+                        parent_revision INTEGER,
+                        metadata TEXT
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_run_notes_revision
+                    ON run_notes(note_id, revision)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_run_notes_run
+                    ON run_notes(run_id)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_run_notes_scope_revised
+                    ON run_notes(scope, revised_at)
                     """
                 )
 
@@ -1333,6 +1381,12 @@ class SQLiteStorage:
                 artifact_rows = SQLiteStorage._read_table_rows(db_path, table)
                 if artifact_rows:
                     SQLiteStorage._write_parquet_rows(parquet_path, artifact_rows)
+            notes_parquet = TRACKIO_DIR / f"{db_path.stem}_run_notes.parquet"
+            note_rows = SQLiteStorage._read_table_rows(db_path, "run_notes")
+            if note_rows:
+                SQLiteStorage._write_parquet_rows(notes_parquet, note_rows)
+            else:
+                notes_parquet.unlink(missing_ok=True)
 
     @staticmethod
     def export_for_static_space(
@@ -1466,7 +1520,7 @@ class SQLiteStorage:
             "_traces.parquet",
         ]
         suffixes += [
-            f"_{table}.parquet" for table in SQLiteStorage._ARTIFACT_PARQUET_TABLES
+            f"_{table}.parquet" for table in SQLiteStorage._sidecar_parquet_tables()
         ]
         return [db_path.with_name(f"{stem}{suffix}") for suffix in suffixes]
 
@@ -1483,8 +1537,10 @@ class SQLiteStorage:
         all_paths = os.listdir(TRACKIO_DIR)
         all_paths_set = set(all_paths)
 
+        sidecar_tables = SQLiteStorage._sidecar_parquet_tables()
+
         def _artifact_sidecar(pq_name: str) -> tuple[str, str] | None:
-            for table in SQLiteStorage._ARTIFACT_PARQUET_TABLES:
+            for table in sidecar_tables:
                 suffix = f"_{table}.parquet"
                 if not pq_name.endswith(suffix) or len(pq_name) <= len(suffix):
                     continue
@@ -1651,7 +1707,7 @@ class SQLiteStorage:
             if sidecar is None:
                 continue
             project_name, table = sidecar
-            columns = SQLiteStorage._ARTIFACT_PARQUET_TABLES[table]
+            columns = sidecar_tables[table]
             parquet_path = TRACKIO_DIR / pq_name
             db_path = TRACKIO_DIR / f"{project_name}{DB_EXT}"
             rows = SQLiteStorage._read_parquet_rows(parquet_path)
@@ -2138,6 +2194,240 @@ class SQLiteStorage:
                 return cursor.fetchone()[0]
             except sqlite3.OperationalError:
                 return 0
+
+    @staticmethod
+    def _run_note_history_cursor(cursor, note_id: str) -> list[dict[str, Any]]:
+        cursor.execute(
+            "SELECT * FROM run_notes WHERE note_id = ? ORDER BY revision",
+            (note_id,),
+        )
+        return notes.history_from_rows(dict(row) for row in cursor.fetchall())
+
+    @staticmethod
+    def _insert_run_note_cursor(cursor, row: dict[str, Any]) -> None:
+        columns = notes.NOTE_COLUMNS
+        cursor.execute(
+            f"INSERT INTO run_notes ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            tuple(row[column] for column in columns),
+        )
+
+    @staticmethod
+    def _resolve_run_note_target(
+        project: str, run_id: str | None, run_name: str | None
+    ) -> tuple[str, str | None]:
+        records = SQLiteStorage.get_run_records(project)
+        if run_id is not None:
+            if run_name is None:
+                run_name = next(
+                    (
+                        record["name"]
+                        for record in records
+                        if record["id"] == run_id and record["name"] is not None
+                    ),
+                    None,
+                )
+            return run_id, run_name
+        matches = [record for record in records if record["name"] == run_name]
+        if not matches or matches[-1]["id"] is None:
+            raise ValueError(f"Run {run_name!r} does not exist in project {project!r}")
+        return str(matches[-1]["id"]), run_name
+
+    @staticmethod
+    def _write_run_note(project: str, note_id: str, plan: Any) -> dict[str, Any]:
+        db_path = SQLiteStorage.init_db(project)
+        with SQLiteStorage._get_process_lock(project):
+            with SQLiteStorage._get_connection(db_path) as conn:
+                cursor = conn.cursor()
+                history = SQLiteStorage._run_note_history_cursor(cursor, note_id)
+                row = plan(history)
+                if row is None:
+                    return history[0]
+                try:
+                    SQLiteStorage._insert_run_note_cursor(cursor, row)
+                except sqlite3.Error as error:
+                    if "unique" not in str(error).lower():
+                        raise
+                    conn.rollback()
+                    current = SQLiteStorage._run_note_history_cursor(cursor, note_id)
+                    revision = current[-1]["revision"] if current else None
+                    raise notes.RunNoteConflictError(
+                        f"Run note {note_id!r} changed concurrently and is now at "
+                        f"revision {revision}; read it and retry.",
+                        note_id=note_id,
+                        current_revision=revision,
+                    ) from error
+                conn.commit()
+                return notes.row_to_note(row)
+
+    @staticmethod
+    def add_run_note(
+        project: str,
+        *,
+        scope: str,
+        kind: str,
+        body_md: str,
+        source: str,
+        run_id: str | None = None,
+        run_name: str | None = None,
+        title: str | None = None,
+        note_id: str | None = None,
+        metadata: dict | None = None,
+    ) -> dict[str, Any]:
+        """Add revision 1 of a Markdown note on a run or on the project.
+
+        Retrying with the same ``note_id`` and identical content returns the
+        stored revision 1; the same ``note_id`` with different content is a
+        :class:`~trackio.run_notes.RunNoteConflictError`.
+        """
+        scope = notes.validate_scope(scope)
+        run_id, run_name = notes.validate_run_target(scope, run_id, run_name)
+        note_id = notes.validate_note_id(
+            note_id if note_id is not None else notes.new_note_id()
+        )
+        kind = notes.validate_kind(kind)
+        title = notes.validate_title(title)
+        body_md = notes.validate_body(body_md)
+        source = notes.validate_source(source)
+        encoded_metadata = notes.encode_metadata(metadata)
+        if scope == "run":
+            run_id, run_name = SQLiteStorage._resolve_run_note_target(
+                project, run_id, run_name
+            )
+        now = notes.utc_now()
+        return SQLiteStorage._write_run_note(
+            project,
+            note_id,
+            lambda history: notes.plan_add(
+                history,
+                note_id=note_id,
+                scope=scope,
+                run_id=run_id,
+                run_name=run_name,
+                kind=kind,
+                title=title,
+                body_md=body_md,
+                source=source,
+                metadata=encoded_metadata,
+                now=now,
+            ),
+        )
+
+    @staticmethod
+    def revise_run_note(
+        project: str,
+        note_id: str,
+        *,
+        expected_revision: int,
+        body_md: str,
+        source: str,
+        kind: str | None = None,
+        title: str | None = None,
+        metadata: dict | None = None,
+    ) -> dict[str, Any]:
+        """Append a revision to a live note whose latest revision is expected.
+
+        ``kind``, ``title`` and ``metadata`` left as ``None`` carry the previous
+        value forward; an empty title clears it.
+        """
+        note_id = notes.validate_note_id(note_id)
+        expected_revision = notes.validate_expected_revision(expected_revision)
+        body_md = notes.validate_body(body_md)
+        source = notes.validate_source(source)
+        kind = None if kind is None else notes.validate_kind(kind)
+        new_title = notes.KEEP if title is None else notes.validate_title(title)
+        new_metadata = (
+            notes.KEEP if metadata is None else notes.encode_metadata(metadata)
+        )
+        now = notes.utc_now()
+        return SQLiteStorage._write_run_note(
+            project,
+            note_id,
+            lambda history: notes.plan_revision(
+                history,
+                project=project,
+                note_id=note_id,
+                expected_revision=expected_revision,
+                source=source,
+                now=now,
+                body_md=body_md,
+                kind=kind,
+                title=new_title,
+                metadata=new_metadata,
+            ),
+        )
+
+    @staticmethod
+    def delete_run_note(
+        project: str, note_id: str, *, expected_revision: int, source: str
+    ) -> dict[str, Any]:
+        """Append a tombstone revision that hides the note but keeps history."""
+        note_id = notes.validate_note_id(note_id)
+        expected_revision = notes.validate_expected_revision(expected_revision)
+        source = notes.validate_source(source)
+        now = notes.utc_now()
+        return SQLiteStorage._write_run_note(
+            project,
+            note_id,
+            lambda history: notes.plan_revision(
+                history,
+                project=project,
+                note_id=note_id,
+                expected_revision=expected_revision,
+                source=source,
+                now=now,
+                deleted=True,
+            ),
+        )
+
+    @staticmethod
+    def get_run_notes(
+        project: str,
+        run_id: str | None = None,
+        scope: str | None = None,
+        kind: str | None = None,
+        include_deleted: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return each note's latest revision, most recently revised first."""
+        if scope is not None:
+            scope = notes.validate_scope(scope)
+        db_path = SQLiteStorage.get_project_db_path(project)
+        if not db_path.exists():
+            return []
+        conditions = []
+        params: list[Any] = []
+        if run_id is not None:
+            conditions.append("run_id = ?")
+            params.append(run_id)
+        if scope is not None:
+            conditions.append("scope = ?")
+            params.append(scope)
+        query = "SELECT * FROM run_notes"
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        with SQLiteStorage._get_connection(db_path) as conn:
+            try:
+                rows = [dict(row) for row in conn.execute(query, params).fetchall()]
+            except sqlite3.OperationalError as error:
+                if "no such table" in str(error):
+                    return []
+                raise
+        return notes.latest_notes(rows, kind=kind, include_deleted=include_deleted)
+
+    @staticmethod
+    def get_run_note_history(project: str, note_id: str) -> list[dict[str, Any]]:
+        """Return every revision of one note, oldest first."""
+        note_id = notes.validate_note_id(note_id)
+        db_path = SQLiteStorage.get_project_db_path(project)
+        if not db_path.exists():
+            return []
+        with SQLiteStorage._get_connection(db_path) as conn:
+            try:
+                return SQLiteStorage._run_note_history_cursor(conn.cursor(), note_id)
+            except sqlite3.OperationalError as error:
+                if "no such table" in str(error):
+                    return []
+                raise
 
     @staticmethod
     def _fetch_system_logs_with_cursor(
@@ -4039,7 +4329,7 @@ class SQLiteStorage:
     @staticmethod
     def delete_run(project: str, run: str, run_id: str | None = None) -> bool:
         """Delete a run from the database (metrics, config, system_metrics,
-        alerts, traces, and artifact links). Artifact versions produced by the
+        alerts, run notes, traces, and artifact links). Artifact versions produced by the
         run are kept but their producer reference is cleared."""
         db_path = SQLiteStorage.get_project_db_path(project)
         if not db_path.exists():
@@ -4080,6 +4370,13 @@ class SQLiteStorage:
                     try:
                         cursor.execute(
                             f"DELETE FROM alerts WHERE {run_identity[0]} = ?",
+                            (run_identity[1],),
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+                    try:
+                        cursor.execute(
+                            f"DELETE FROM run_notes WHERE {run_identity[0]} = ?",
                             (run_identity[1],),
                         )
                     except sqlite3.OperationalError:
@@ -4145,6 +4442,7 @@ class SQLiteStorage:
                         "system_metrics",
                         "alerts",
                         "traces",
+                        "run_notes",
                     ):
                         try:
                             cursor.execute(
@@ -4435,6 +4733,14 @@ class SQLiteStorage:
 
                     try:
                         cursor.execute(
+                            f"UPDATE run_notes SET run_name = ? WHERE {run_col} = ?",
+                            (new_name, run_value),
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+
+                    try:
+                        cursor.execute(
                             f"""
                             SELECT id, run_id, timestamp, step, key, trace_index, messages, metadata, search_text, log_id, space_id
                             FROM traces WHERE {run_col} = ?
@@ -4615,6 +4921,16 @@ class SQLiteStorage:
                             alert_rows = source_cursor.fetchall()
                         except sqlite3.OperationalError:
                             alert_rows = []
+
+                    note_rows = []
+                    try:
+                        source_cursor.execute(
+                            f"SELECT * FROM run_notes WHERE {metrics_col} = ?",
+                            (metrics_val,),
+                        )
+                        note_rows = [dict(row) for row in source_cursor.fetchall()]
+                    except sqlite3.OperationalError:
+                        note_rows = []
 
                     trace_rows = []
                     if traces_identity is not None:
@@ -4881,6 +5197,24 @@ class SQLiteStorage:
                             except sqlite3.OperationalError:
                                 pass
 
+                        note_columns = notes.NOTE_COLUMNS
+                        if note_rows:
+                            target_cursor.executemany(
+                                f"INSERT OR IGNORE INTO run_notes ({', '.join(note_columns)}) "
+                                f"VALUES ({', '.join('?' for _ in note_columns)})",
+                                [
+                                    tuple(
+                                        {
+                                            **row,
+                                            "run_id": generated_run_id or row["run_id"],
+                                            "run_name": run,
+                                        }[column]
+                                        for column in note_columns
+                                    )
+                                    for row in note_rows
+                                ],
+                            )
+
                         target_conn.commit()
 
                         SQLiteStorage._move_media_dir(
@@ -4925,6 +5259,11 @@ class SQLiteStorage:
                                 )
                             except sqlite3.OperationalError:
                                 pass
+                        if note_rows:
+                            source_cursor.execute(
+                                f"DELETE FROM run_notes WHERE {metrics_col} = ?",
+                                (metrics_val,),
+                            )
                         SQLiteStorage._detach_run_artifact_refs(
                             source_cursor, metrics_col, metrics_val, run
                         )

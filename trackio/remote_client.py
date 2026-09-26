@@ -12,6 +12,7 @@ import huggingface_hub
 from gradio_client import Client as GradioClient
 from huggingface_hub.utils import build_hf_headers
 
+from trackio.exceptions import TrackioConflictError
 from trackio.resumable_uploads import COMPATIBILITY_MAX_BYTES
 from trackio.utils import parse_trackio_server_url
 
@@ -187,6 +188,12 @@ class _TrackioHTTPClient:
             resp.raise_for_status()
             raise RuntimeError(f"Trackio '/{api_name}' returned an invalid response")
         if isinstance(body, dict) and body.get("error") is not None:
+            if resp.status_code == TrackioConflictError.status_code:
+                detail = body.get("conflict")
+                raise TrackioConflictError(
+                    str(body["error"]),
+                    detail=detail if isinstance(detail, dict) else None,
+                )
             raise RuntimeError(str(body["error"]))
         resp.raise_for_status()
         return body.get("data")

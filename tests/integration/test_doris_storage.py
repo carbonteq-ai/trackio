@@ -492,3 +492,62 @@ def test_artifact_commit_uses_reserved_connection_under_real_doris_load(monkeypa
         DorisStorage._reset_connection_pool()
 
     assert errors == []
+
+
+def test_run_notes_revisions_and_lifecycle_on_real_doris():
+    project = "trackio-run-notes-qualification"
+    run = "noted-run"
+    run_id = f"noted-run-{os.getpid()}"
+    DorisStorage.bulk_log(
+        project=project,
+        run=run,
+        run_id=run_id,
+        metrics_list=[{"loss": 1.0}],
+        steps=[0],
+        timestamps=["2026-09-27T00:00:00+00:00"],
+        log_ids=[f"{run_id}-0"],
+    )
+    note_id = f"note-{run_id}"
+    note = DorisStorage.add_run_note(
+        project,
+        scope="run",
+        run_name=run,
+        kind="observation",
+        body_md="first",
+        source="cli",
+        note_id=note_id,
+    )
+    assert note["run_id"] == run_id
+    assert (
+        DorisStorage.add_run_note(
+            project,
+            scope="run",
+            run_name=run,
+            kind="observation",
+            body_md="first",
+            source="cli",
+            note_id=note_id,
+        )
+        == note
+    )
+    revised = DorisStorage.revise_run_note(
+        project, note_id, expected_revision=1, body_md="second", source="mcp"
+    )
+    assert revised["revision"] == 2
+    with pytest.raises(RuntimeError, match="at revision 2"):
+        DorisStorage.revise_run_note(
+            project, note_id, expected_revision=1, body_md="stale", source="cli"
+        )
+    DorisStorage.rename_run(project, run, f"{run}-renamed", run_id=run_id)
+    tombstone = DorisStorage.delete_run_note(
+        project, note_id, expected_revision=2, source="observatory"
+    )
+    assert tombstone["run_name"] == f"{run}-renamed"
+    assert note_id not in {n["note_id"] for n in DorisStorage.get_run_notes(project)}
+    assert [
+        entry["revision"]
+        for entry in DorisStorage.get_run_note_history(project, note_id)
+    ] == [1, 2, 3]
+
+    assert DorisStorage.delete_run(project, run_id=run_id)
+    assert DorisStorage.get_run_note_history(project, note_id) == []

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from trackio.doris_schema import SCHEMA_VERSION, migration_statements
+from trackio.doris_schema import MANAGED_TABLES, SCHEMA_VERSION, migration_statements
 from trackio.doris_storage import DorisStorage
 
 
@@ -54,6 +54,11 @@ def apply(target: int, backup_receipt: Path) -> dict[str, object]:
         tables = {str(row["table_name"]) for row in cursor.fetchall()}
         if "trace_reward_components" not in tables:
             raise RuntimeError("Doris trace-fact component table was not created")
+        missing = set(MANAGED_TABLES).difference(tables)
+        if missing:
+            raise RuntimeError(
+                f"Doris migration left managed tables missing: {', '.join(sorted(missing))}"
+            )
         cursor.execute(
             """INSERT INTO schema_versions (component, version, applied_at)
                VALUES (%s, %s, UTC_TIMESTAMP())""",

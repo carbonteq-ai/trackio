@@ -19,6 +19,7 @@ from pymysql.cursors import DictCursor
 
 import trackio.cas as cas
 import trackio.references as references
+import trackio.run_notes as notes
 from trackio.artifact_storage import get_artifact_store
 from trackio.doris_pool import DorisConnectionPool, DorisPoolConfig
 from trackio.doris_schema import (
@@ -140,6 +141,7 @@ class DorisStorage:
 
     _schema_lock = threading.Lock()
     _artifact_lock = threading.Lock()
+    _notes_lock = threading.Lock()
     _schema_ready = False
     _schema_target: tuple[str, int, str, str] | None = None
     _dataset_import_attempted = True
@@ -1081,6 +1083,7 @@ class DorisStorage:
                     UNION ALL SELECT project_id FROM system_metrics
                     UNION ALL SELECT project_id FROM traces
                     UNION ALL SELECT project_id FROM alerts
+                    UNION ALL SELECT project_id FROM run_notes
                     UNION ALL SELECT project_id FROM artifacts
                     UNION ALL SELECT project_id FROM run_artifact_links
                 ) projects
@@ -1133,6 +1136,7 @@ class DorisStorage:
                 ("system_metrics", None),
                 ("traces", None),
                 ("alerts", None),
+                ("run_notes", None),
                 ("project_metadata", None),
                 ("run_artifact_links", None),
             ):
@@ -1178,6 +1182,7 @@ class DorisStorage:
                 "artifacts",
                 "traces",
                 "alerts",
+                "run_notes",
                 "system_metrics",
                 "metrics",
                 "configs",
@@ -1592,6 +1597,253 @@ class DorisStorage:
                 }
                 for row in cursor.fetchall()
             ]
+
+    @staticmethod
+    def _run_note_history_cursor(
+        cursor: DictCursor, project: str, note_id: str
+    ) -> list[dict[str, Any]]:
+        cursor.execute(
+            """
+            SELECT * FROM run_notes
+            WHERE project_id = %s AND note_id = %s
+            ORDER BY revision
+            """,
+            (project, note_id),
+        )
+        return notes.history_from_rows(cursor.fetchall())
+
+    @staticmethod
+    def _insert_run_note_rows(
+        cursor: DictCursor, project: str, rows: list[dict[str, Any]]
+    ) -> None:
+        if not rows:
+            return
+        columns = ("project_id", *notes.NOTE_COLUMNS)
+        cursor.executemany(
+            f"INSERT INTO run_notes ({', '.join(columns)}) "
+            f"VALUES ({', '.join('%s' for _ in columns)})",
+            [
+                (project, *(row[column] for column in notes.NOTE_COLUMNS))
+                for row in rows
+            ],
+        )
+
+    @classmethod
+    def _resolve_run_note_target(
+        cls,
+        cursor: DictCursor,
+        project: str,
+        run_id: str | None,
+        run_name: str | None,
+    ) -> tuple[str, str | None]:
+        if run_id is None:
+            resolved = cls._resolve_run_id(cursor, project, run_name, None)
+            if resolved is None:
+                raise ValueError(
+                    f"Run {run_name!r} does not exist in project {project!r}"
+                )
+            return resolved, run_name
+        if run_name is None:
+            for table in ("metrics", "configs", "run_artifact_links"):
+                cursor.execute(
+                    f"""
+                    SELECT run_name FROM {table}
+                    WHERE project_id = %s AND run_id = %s AND run_name IS NOT NULL
+                    LIMIT 1
+                    """,
+                    (project, run_id),
+                )
+                row = cursor.fetchone()
+                if row is not None:
+                    run_name = str(row["run_name"])
+                    break
+        return run_id, run_name
+
+    @classmethod
+    def _write_run_note(
+        cls,
+        project: str,
+        note_id: str,
+        plan: Any,
+        *,
+        run_target: tuple[str | None, str | None] | None = None,
+    ) -> dict[str, Any]:
+        with (
+            cls._notes_lock,
+            cls._connection() as connection,
+            connection.cursor() as cursor,
+        ):
+            if run_target is not None:
+                run_target = cls._resolve_run_note_target(
+                    cursor, project, run_target[0], run_target[1]
+                )
+            history = cls._run_note_history_cursor(cursor, project, note_id)
+            row = plan(history, run_target)
+            if row is None:
+                return history[0]
+            cls._insert_run_note_rows(cursor, project, [row])
+        return notes.row_to_note(row)
+
+    @classmethod
+    def add_run_note(
+        cls,
+        project: str,
+        *,
+        scope: str,
+        kind: str,
+        body_md: str,
+        source: str,
+        run_id: str | None = None,
+        run_name: str | None = None,
+        title: str | None = None,
+        note_id: str | None = None,
+        metadata: dict | None = None,
+    ) -> dict[str, Any]:
+        scope = notes.validate_scope(scope)
+        run_id, run_name = notes.validate_run_target(scope, run_id, run_name)
+        note_id = notes.validate_note_id(
+            note_id if note_id is not None else notes.new_note_id()
+        )
+        kind = notes.validate_kind(kind)
+        title = notes.validate_title(title)
+        body_md = notes.validate_body(body_md)
+        source = notes.validate_source(source)
+        encoded_metadata = notes.encode_metadata(metadata)
+        now = notes.utc_now()
+
+        def plan(history, run_target):
+            resolved_id, resolved_name = run_target or (None, None)
+            return notes.plan_add(
+                history,
+                note_id=note_id,
+                scope=scope,
+                run_id=resolved_id,
+                run_name=resolved_name,
+                kind=kind,
+                title=title,
+                body_md=body_md,
+                source=source,
+                metadata=encoded_metadata,
+                now=now,
+            )
+
+        return cls._write_run_note(
+            project,
+            note_id,
+            plan,
+            run_target=(run_id, run_name) if scope == "run" else None,
+        )
+
+    @classmethod
+    def revise_run_note(
+        cls,
+        project: str,
+        note_id: str,
+        *,
+        expected_revision: int,
+        body_md: str,
+        source: str,
+        kind: str | None = None,
+        title: str | None = None,
+        metadata: dict | None = None,
+    ) -> dict[str, Any]:
+        note_id = notes.validate_note_id(note_id)
+        expected_revision = notes.validate_expected_revision(expected_revision)
+        body_md = notes.validate_body(body_md)
+        source = notes.validate_source(source)
+        kind = None if kind is None else notes.validate_kind(kind)
+        new_title = notes.KEEP if title is None else notes.validate_title(title)
+        new_metadata = (
+            notes.KEEP if metadata is None else notes.encode_metadata(metadata)
+        )
+        now = notes.utc_now()
+        return cls._write_run_note(
+            project,
+            note_id,
+            lambda history, _target: notes.plan_revision(
+                history,
+                project=project,
+                note_id=note_id,
+                expected_revision=expected_revision,
+                source=source,
+                now=now,
+                body_md=body_md,
+                kind=kind,
+                title=new_title,
+                metadata=new_metadata,
+            ),
+        )
+
+    @classmethod
+    def delete_run_note(
+        cls, project: str, note_id: str, *, expected_revision: int, source: str
+    ) -> dict[str, Any]:
+        note_id = notes.validate_note_id(note_id)
+        expected_revision = notes.validate_expected_revision(expected_revision)
+        source = notes.validate_source(source)
+        now = notes.utc_now()
+        return cls._write_run_note(
+            project,
+            note_id,
+            lambda history, _target: notes.plan_revision(
+                history,
+                project=project,
+                note_id=note_id,
+                expected_revision=expected_revision,
+                source=source,
+                now=now,
+                deleted=True,
+            ),
+        )
+
+    @classmethod
+    def get_run_notes(
+        cls,
+        project: str,
+        run_id: str | None = None,
+        scope: str | None = None,
+        kind: str | None = None,
+        include_deleted: bool = False,
+    ) -> list[dict[str, Any]]:
+        if scope is not None:
+            scope = notes.validate_scope(scope)
+        conditions = ["project_id = %s"]
+        params: list[Any] = [project]
+        if run_id is not None:
+            conditions.append("run_id = %s")
+            params.append(run_id)
+        if scope is not None:
+            conditions.append("scope = %s")
+            params.append(scope)
+        with cls._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT * FROM run_notes WHERE {' AND '.join(conditions)}",
+                params,
+            )
+            rows = list(cursor.fetchall())
+        return notes.latest_notes(rows, kind=kind, include_deleted=include_deleted)
+
+    @classmethod
+    def get_run_note_history(cls, project: str, note_id: str) -> list[dict[str, Any]]:
+        note_id = notes.validate_note_id(note_id)
+        with cls._connection() as connection, connection.cursor() as cursor:
+            return cls._run_note_history_cursor(cursor, project, note_id)
+
+    @classmethod
+    def import_run_note_rows(cls, project: str, rows: list[dict[str, Any]]) -> None:
+        """Copy stored revisions verbatim, preserving ids and timestamps."""
+        with cls._connection() as connection, connection.cursor() as cursor:
+            cls._insert_run_note_rows(
+                cursor,
+                project,
+                [
+                    {
+                        **{column: row.get(column) for column in notes.NOTE_COLUMNS},
+                        "deleted": int(row.get("deleted") or 0),
+                    }
+                    for row in rows
+                ],
+            )
 
     @classmethod
     def _upsert_trace_facts_cursor(
@@ -2381,6 +2633,7 @@ class DorisStorage:
                 "system_metrics",
                 "traces",
                 "alerts",
+                "run_notes",
                 "run_artifact_links",
             ):
                 cursor.execute(
@@ -2423,6 +2676,7 @@ class DorisStorage:
                 "system_metrics",
                 "traces",
                 "alerts",
+                "run_notes",
                 "run_artifact_links",
             ):
                 cursor.execute(
@@ -2957,6 +3211,7 @@ class DorisStorage:
                     "system_metrics",
                     "traces",
                     "alerts",
+                    "run_notes",
                     "run_artifact_links",
                 ):
                     cursor.execute(

@@ -28,11 +28,13 @@ AUTHORITATIVE_TABLES = (
     "artifact_versions",
     "artifact_aliases",
     "run_artifact_links",
+    "run_notes",
 )
 
 _RUN_SCOPED_TABLES = frozenset(
-    {"metrics", "configs", "system_metrics", "traces", "alerts"}
+    {"metrics", "configs", "system_metrics", "traces", "alerts", "run_notes"}
 )
+_PROJECT_SCOPED_ROWS_TABLES = frozenset({"run_notes"})
 
 
 def _sha256(path: Path) -> str:
@@ -156,6 +158,26 @@ def _sqlite_snapshot(db_path: Path) -> Iterator[tuple[Path, dict[str, Any]]]:
         metadata["snapshot_sha256"] = _sha256(snapshot)
         metadata["snapshot_bytes"] = snapshot.stat().st_size
         yield snapshot, metadata
+
+
+def _run_note_record(row: dict[str, Any]) -> dict[str, Any]:
+    parent = row.get("parent_revision")
+    return {
+        "note_id": str(row["note_id"]),
+        "revision": int(row["revision"]),
+        "scope": str(row["scope"]),
+        "run_id": row.get("run_id"),
+        "run_name": row.get("run_name"),
+        "kind": str(row["kind"]),
+        "title": row.get("title"),
+        "body_md": str(row["body_md"]),
+        "source": str(row["source"]),
+        "created_at": str(row["created_at"]),
+        "revised_at": str(row["revised_at"]),
+        "deleted": int(row.get("deleted") or 0),
+        "parent_revision": None if parent is None else int(parent),
+        "metadata": _canonical_json(row.get("metadata"), None),
+    }
 
 
 def _source_records(
@@ -321,6 +343,7 @@ def _source_records(
         "artifact_versions": artifact_versions,
         "artifact_aliases": artifact_aliases,
         "run_artifact_links": run_artifact_links,
+        "run_notes": [_run_note_record(row) for row in _rows(connection, "run_notes")],
     }
 
 
@@ -495,6 +518,13 @@ def _migrate_project(
         migrated["artifact_versions"] += len(versions)
         migrated["artifact_aliases"] += len(aliases)
         migrated["run_artifact_links"] += len(links)
+
+        note_rows = _rows(connection, "run_notes")
+        for start in range(0, len(note_rows), batch_size):
+            DorisStorage.import_run_note_rows(
+                project, note_rows[start : start + batch_size]
+            )
+        migrated["run_notes"] += len(note_rows)
     finally:
         connection.close()
     return dict(migrated)
@@ -520,6 +550,12 @@ def _target_records(
             cursor.execute(
                 f"SELECT * FROM {table} WHERE project_id = %s AND run_id IN ({placeholders})",
                 (project, *batch),
+            )
+            result.extend(cursor.fetchall())
+        if table in _PROJECT_SCOPED_ROWS_TABLES:
+            cursor.execute(
+                f"SELECT * FROM {table} WHERE project_id = %s AND run_id IS NULL",
+                (project,),
             )
             result.extend(cursor.fetchall())
         return result
@@ -687,6 +723,7 @@ def _target_records(
         "artifact_versions": artifact_versions,
         "artifact_aliases": artifact_aliases,
         "run_artifact_links": run_artifact_links,
+        "run_notes": [_run_note_record(row) for row in rows("run_notes")],
     }
 
 

@@ -6,9 +6,11 @@ import pytest
 
 from trackio.doris_migration import (
     AUTHORITATIVE_TABLES,
+    _migrate_project,
     _records_evidence,
     _source_inclusion_evidence,
     _target_evidence,
+    _target_records,
     inspect_sqlite_project,
     migrate_sqlite_to_doris,
 )
@@ -365,3 +367,172 @@ def test_snapshot_evidence_covers_artifacts_aliases_and_links(tmp_path):
     assert evidence["artifact_versions"]["count"] == 1
     assert evidence["artifact_aliases"]["count"] == 1
     assert evidence["run_artifact_links"]["count"] == 1
+
+
+def _add_run_notes(path):
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE run_notes (
+                id INTEGER PRIMARY KEY,
+                note_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                scope TEXT NOT NULL,
+                run_id TEXT,
+                run_name TEXT,
+                kind TEXT NOT NULL,
+                title TEXT,
+                body_md TEXT NOT NULL,
+                source TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                revised_at TEXT NOT NULL,
+                deleted INTEGER NOT NULL DEFAULT 0,
+                parent_revision INTEGER,
+                metadata TEXT
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO run_notes
+                (note_id, revision, scope, run_id, run_name, kind, title,
+                 body_md, source, created_at, revised_at, deleted,
+                 parent_revision, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "run-note",
+                    1,
+                    "run",
+                    "run-v1",
+                    "run",
+                    "observation",
+                    "t",
+                    "first",
+                    "cli",
+                    "2026-07-26T12:00:00+00:00",
+                    "2026-07-26T12:00:00+00:00",
+                    0,
+                    None,
+                    '{"job":"j-1"}',
+                ),
+                (
+                    "run-note",
+                    2,
+                    "run",
+                    "run-v1",
+                    "run",
+                    "observation",
+                    "t",
+                    "first",
+                    "mcp",
+                    "2026-07-26T12:00:00+00:00",
+                    "2026-07-26T12:05:00+00:00",
+                    1,
+                    1,
+                    '{"job":"j-1"}',
+                ),
+                (
+                    "project-note",
+                    1,
+                    "project",
+                    None,
+                    None,
+                    "plan",
+                    None,
+                    "plan",
+                    "observatory",
+                    "2026-07-26T12:01:00+00:00",
+                    "2026-07-26T12:01:00+00:00",
+                    0,
+                    None,
+                    None,
+                ),
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_snapshot_evidence_and_import_cover_run_note_revisions(tmp_path, monkeypatch):
+    source = tmp_path / "notes-project.db"
+    _source_database(source)
+    _add_run_notes(source)
+
+    evidence = inspect_sqlite_project(source)["evidence"]
+    assert "run_notes" in AUTHORITATIVE_TABLES
+    assert evidence["run_notes"]["count"] == 3
+
+    imported = []
+    for name in (
+        "bulk_log",
+        "upsert_run_config",
+        "bulk_log_system",
+        "bulk_alert",
+        "import_trace_rows",
+        "set_project_metadata",
+        "import_artifact_graph",
+    ):
+        monkeypatch.setattr(DorisStorage, name, lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        DorisStorage,
+        "import_run_note_rows",
+        lambda project, rows: imported.append((project, list(rows))),
+    )
+
+    migrated = _migrate_project(source, "notes-project", batch_size=2)
+
+    assert migrated["run_notes"] == 3
+    assert [len(rows) for _, rows in imported] == [2, 1]
+    assert {row["note_id"] for _, rows in imported for row in rows} == {
+        "run-note",
+        "project-note",
+    }
+
+
+def test_source_inclusion_reads_project_scope_notes_without_run_ids():
+    run_note = {
+        "note_id": "run-note",
+        "revision": 1,
+        "scope": "run",
+        "run_id": "run-v1",
+        "run_name": "run",
+        "kind": "observation",
+        "title": None,
+        "body_md": "b",
+        "source": "cli",
+        "created_at": "t",
+        "revised_at": "t",
+        "deleted": 0,
+        "parent_revision": None,
+        "metadata": None,
+    }
+    project_note = {
+        **run_note,
+        "note_id": "project-note",
+        "scope": "project",
+        "run_id": None,
+        "run_name": None,
+    }
+    queries = []
+
+    class Cursor:
+        def execute(self, query, params):
+            queries.append(query)
+            self.rows = []
+            if "FROM run_notes" in query:
+                self.rows = [project_note if "run_id IS NULL" in query else run_note]
+
+        def fetchall(self):
+            return list(self.rows)
+
+    records = _target_records(Cursor(), "notes-project", run_ids=("run-v1",))
+
+    assert {note["note_id"] for note in records["run_notes"]} == {
+        "run-note",
+        "project-note",
+    }
+    assert any("run_id IN" in query and "run_notes" in query for query in queries)

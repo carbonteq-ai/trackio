@@ -89,6 +89,29 @@ Indexes:
 - `timestamp`
 - unique partial index on `alert_id`
 
+### `run_notes`
+
+Revisioned Markdown notes on a run (`scope = 'run'`) or on the project
+(`scope = 'project'`). Every edit appends a row; deletion appends a tombstone
+row with `deleted = 1`. Read notes through `Api.run_notes` /
+`Api.run_note_history` rather than raw SQL so tombstones and revisions are
+resolved for you.
+
+- `id`
+- `note_id`: stable across revisions
+- `revision`: starts at 1
+- `scope`, `run_id`, `run_name`
+- `kind`, `title`, `body_md`
+- `source`: how the revision was written (for example `cli`, `mcp`, `observatory`)
+- `created_at`: time of revision 1; `revised_at`: time of this revision
+- `deleted`, `parent_revision`, `metadata` (JSON)
+
+Indexes:
+
+- unique `(note_id, revision)`
+- `run_id`
+- `(scope, revised_at)`
+
 ## Parquet Layout
 
 Trackio flattens JSON blobs when exporting parquet:
@@ -96,6 +119,7 @@ Trackio flattens JSON blobs when exporting parquet:
 - `{project}.parquet` comes from `metrics`
 - `{project}_system.parquet` comes from `system_metrics`
 - `{project}_configs.parquet` comes from `configs`
+- `{project}_run_notes.parquet` comes from `run_notes` (all revisions, unflattened)
 
 Static export layout:
 

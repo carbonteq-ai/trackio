@@ -1174,6 +1174,138 @@ def get_alerts(
     )
 
 
+def _run_note_project(project: Any) -> str:
+    if not isinstance(project, str) or not project.strip():
+        raise TrackioAPIError(f"Invalid project name: {project!r}")
+    return project
+
+
+def _run_note_revision(value: Any) -> int:
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value.strip())
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise TrackioAPIError("expected_revision must be a positive integer")
+    return value
+
+
+def _run_note_call(operation: Callable[[], Any]) -> Any:
+    try:
+        return operation()
+    except TrackioAPIError:
+        raise
+    except (ValueError, LookupError) as error:
+        raise TrackioAPIError(str(error)) from error
+
+
+def get_run_notes(
+    project: str,
+    run_id: str | None = None,
+    scope: str | None = None,
+    kind: str | None = None,
+    include_deleted: bool = False,
+) -> list[dict[str, Any]]:
+    """Latest revision of each note, newest first; tombstones are opt-in."""
+    project = _run_note_project(project)
+    include_deleted = _normalize_bool_param(include_deleted, "include_deleted")
+    return _run_note_call(
+        lambda: Storage.get_run_notes(
+            project,
+            run_id=run_id,
+            scope=scope,
+            kind=kind,
+            include_deleted=include_deleted,
+        )
+    )
+
+
+def get_run_note_history(project: str, note_id: str) -> list[dict[str, Any]]:
+    """Every revision of one note, oldest first, including a tombstone."""
+    project = _run_note_project(project)
+    return _run_note_call(lambda: Storage.get_run_note_history(project, note_id))
+
+
+def add_run_note(
+    request: Request,
+    project: str,
+    scope: str,
+    kind: str,
+    body_md: str,
+    source: str,
+    run_id: str | None = None,
+    run_name: str | None = None,
+    title: str | None = None,
+    note_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Add revision 1 of a note; an identical retry with its note_id is a no-op."""
+    assert_can_mutate_runs(request)
+    project = _run_note_project(project)
+    return _run_note_call(
+        lambda: Storage.add_run_note(
+            project,
+            scope=scope,
+            kind=kind,
+            body_md=body_md,
+            source=source,
+            run_id=run_id,
+            run_name=run_name,
+            title=title,
+            note_id=note_id,
+            metadata=metadata,
+        )
+    )
+
+
+def revise_run_note(
+    request: Request,
+    project: str,
+    note_id: str,
+    expected_revision: int,
+    body_md: str,
+    source: str,
+    kind: str | None = None,
+    title: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Append a revision; a stale expected_revision answers HTTP 409."""
+    assert_can_mutate_runs(request)
+    project = _run_note_project(project)
+    expected_revision = _run_note_revision(expected_revision)
+    return _run_note_call(
+        lambda: Storage.revise_run_note(
+            project,
+            note_id,
+            expected_revision=expected_revision,
+            body_md=body_md,
+            source=source,
+            kind=kind,
+            title=title,
+            metadata=metadata,
+        )
+    )
+
+
+def delete_run_note(
+    request: Request,
+    project: str,
+    note_id: str,
+    expected_revision: int,
+    source: str,
+) -> dict[str, Any]:
+    """Append a tombstone revision; history stays readable."""
+    assert_can_mutate_runs(request)
+    project = _run_note_project(project)
+    expected_revision = _run_note_revision(expected_revision)
+    return _run_note_call(
+        lambda: Storage.delete_run_note(
+            project,
+            note_id,
+            expected_revision=expected_revision,
+            source=source,
+        )
+    )
+
+
 def get_metric_values(
     project: str,
     run: str | None,
@@ -1813,6 +1945,11 @@ def _api_registry() -> dict[str, Any]:
         "bulk_log_system": bulk_log_system,
         "bulk_alert": bulk_alert,
         "get_alerts": get_alerts,
+        "get_run_notes": get_run_notes,
+        "get_run_note_history": get_run_note_history,
+        "add_run_note": add_run_note,
+        "revise_run_note": revise_run_note,
+        "delete_run_note": delete_run_note,
         "get_metric_values": get_metric_values,
         "get_runs_for_project": get_runs_for_project,
         "get_run_configs": get_run_configs,

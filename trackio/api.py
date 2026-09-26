@@ -1,6 +1,8 @@
 from typing import Any, Iterator, Sequence
 
+from trackio.exceptions import TrackioConflictError
 from trackio.remote_client import RemoteClient
+from trackio.run_notes import RunNoteConflictError
 from trackio.sqlite_storage import SQLiteStorage
 from trackio.trace_facts import (
     TraceAggregateBucket,
@@ -481,10 +483,22 @@ class Runs:
 
 class Api:
     def __init__(
-        self, server_url: str | None = None, *, hf_token: str | None = None
+        self,
+        server_url: str | None = None,
+        *,
+        hf_token: str | None = None,
+        write_token: str | None = None,
     ) -> None:
+        """Read (and, with a write token, annotate) a local or remote Trackio.
+
+        ``write_token`` authorizes mutations such as run-note writes against a
+        self-hosted server. A token embedded in ``server_url`` is also used.
+        """
+        client_options: dict[str, Any] = {"hf_token": hf_token}
+        if write_token is not None:
+            client_options["write_token"] = write_token
         self._remote_client = (
-            RemoteClient(server_url, hf_token=hf_token)
+            RemoteClient(server_url, **client_options)
             if server_url is not None
             else None
         )
@@ -502,6 +516,7 @@ class Api:
             "artifact_lineage": True,
             "alerts": True,
             "system_metrics": True,
+            "run_notes": True,
         }
 
     def run_configs(self, project: str) -> dict[str, Any]:
@@ -523,6 +538,131 @@ class Api:
             return SQLiteStorage.get_run_lifecycles(project)
         return self._remote_client.predict(
             project=project, api_name="/get_run_lifecycles"
+        )
+
+    def _remote_note_write(self, api_name: str, **kwargs: Any) -> dict[str, Any]:
+        try:
+            return self._remote_client.predict(api_name=api_name, **kwargs)
+        except TrackioConflictError as error:
+            raise RunNoteConflictError.from_conflict(error) from error
+
+    def run_notes(
+        self,
+        project: str,
+        run_id: str | None = None,
+        scope: str | None = None,
+        kind: str | None = None,
+        include_deleted: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Latest revision of each note in a project, newest revision first.
+
+        Deleted notes are hidden unless ``include_deleted`` is true.
+        """
+        if self._remote_client is None:
+            return SQLiteStorage.get_run_notes(
+                project,
+                run_id=run_id,
+                scope=scope,
+                kind=kind,
+                include_deleted=include_deleted,
+            )
+        return self._remote_client.predict(
+            project=project,
+            run_id=run_id,
+            scope=scope,
+            kind=kind,
+            include_deleted=include_deleted,
+            api_name="/get_run_notes",
+        )
+
+    def run_note_history(self, project: str, note_id: str) -> list[dict[str, Any]]:
+        """Every revision of one note, oldest first."""
+        if self._remote_client is None:
+            return SQLiteStorage.get_run_note_history(project, note_id)
+        return self._remote_client.predict(
+            project=project, note_id=note_id, api_name="/get_run_note_history"
+        )
+
+    def add_run_note(
+        self,
+        project: str,
+        *,
+        scope: str,
+        kind: str,
+        body_md: str,
+        source: str,
+        run_id: str | None = None,
+        run_name: str | None = None,
+        title: str | None = None,
+        note_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Add revision 1 of a Markdown note on a run or the project.
+
+        Passing a ``note_id`` makes the call safe to retry: identical content
+        returns the stored note, different content raises
+        :class:`~trackio.run_notes.RunNoteConflictError`.
+        """
+        fields: dict[str, Any] = {
+            "scope": scope,
+            "kind": kind,
+            "body_md": body_md,
+            "source": source,
+            "run_id": run_id,
+            "run_name": run_name,
+            "title": title,
+            "note_id": note_id,
+            "metadata": metadata,
+        }
+        if self._remote_client is None:
+            return SQLiteStorage.add_run_note(project, **fields)
+        return self._remote_note_write("/add_run_note", project=project, **fields)
+
+    def revise_run_note(
+        self,
+        project: str,
+        note_id: str,
+        *,
+        expected_revision: int,
+        body_md: str,
+        source: str,
+        kind: str | None = None,
+        title: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Append a revision to a note whose latest revision is expected.
+
+        Raises :class:`~trackio.run_notes.RunNoteConflictError`, carrying the
+        current revision, when the note changed since it was read.
+        """
+        fields: dict[str, Any] = {
+            "expected_revision": expected_revision,
+            "body_md": body_md,
+            "source": source,
+            "kind": kind,
+            "title": title,
+            "metadata": metadata,
+        }
+        if self._remote_client is None:
+            return SQLiteStorage.revise_run_note(project, note_id, **fields)
+        return self._remote_note_write(
+            "/revise_run_note", project=project, note_id=note_id, **fields
+        )
+
+    def delete_run_note(
+        self, project: str, note_id: str, *, expected_revision: int, source: str
+    ) -> dict[str, Any]:
+        """Hide a note behind a tombstone revision; its history is kept."""
+        if self._remote_client is None:
+            return SQLiteStorage.delete_run_note(
+                project, note_id, expected_revision=expected_revision, source=source
+            )
+        return self._remote_note_write(
+            "/delete_run_note",
+            project=project,
+            note_id=note_id,
+            expected_revision=expected_revision,
+            source=source,
         )
 
     def runs(self, project: str) -> Runs:

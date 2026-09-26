@@ -43,7 +43,7 @@ from trackio.direct_uploads import (
 from trackio.direct_uploads import (
     get_session as get_direct_session,
 )
-from trackio.exceptions import TrackioAPIError
+from trackio.exceptions import TrackioAPIError, TrackioConflictError
 from trackio.remote_client import HTTP_API_VERSION
 from trackio.resumable_uploads import (
     COMPATIBILITY_MAX_BYTES,
@@ -373,6 +373,11 @@ async def run_api_request(request: Request, api_name: str) -> Response:
         if inspect.isawaitable(result):
             result = await result
         return JSONResponse({"data": _json_safe(result)})
+    except TrackioConflictError as e:
+        return JSONResponse(
+            {"error": str(e), "conflict": _json_safe(e.detail)},
+            status_code=TrackioConflictError.status_code,
+        )
     except TrackioAPIError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:

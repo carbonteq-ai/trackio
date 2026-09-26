@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MANAGED_TABLES = (
     "schema_versions",
     "metrics",
@@ -16,6 +16,7 @@ MANAGED_TABLES = (
     "artifact_versions",
     "artifact_aliases",
     "run_artifact_links",
+    "run_notes",
 )
 
 
@@ -84,13 +85,52 @@ _TRACE_FACT_COLUMNS = (
 )
 
 
+def _run_notes_table(properties: str) -> str:
+    return f"""
+        CREATE TABLE IF NOT EXISTS run_notes (
+            project_id VARCHAR(255) NOT NULL,
+            note_id VARCHAR(128) NOT NULL,
+            revision BIGINT NOT NULL,
+            scope VARCHAR(16) NOT NULL,
+            run_id VARCHAR(255) NULL,
+            run_name VARCHAR(255) NULL,
+            kind VARCHAR(128) NOT NULL,
+            title STRING NULL,
+            body_md STRING NOT NULL,
+            source VARCHAR(64) NOT NULL,
+            created_at VARCHAR(64) NOT NULL,
+            revised_at VARCHAR(64) NOT NULL,
+            deleted TINYINT NOT NULL DEFAULT "0",
+            parent_revision BIGINT NULL,
+            metadata STRING NULL,
+            INDEX idx_run_notes_run_id(run_id) USING INVERTED
+        )
+        UNIQUE KEY(project_id, note_id, revision)
+        DISTRIBUTED BY HASH(project_id, note_id) BUCKETS 1
+        {properties}
+    """
+
+
 def migration_statements(from_version: int, to_version: int, replication_num: int = 1) -> tuple[str, ...]:
     """Return the explicit supported Doris database transition.
 
     Startup deliberately refuses to apply this itself. Operators inspect and
     apply the ordered statements as part of the coordinated Trackio upgrade.
+    A transition across several versions is the ordered concatenation of each
+    single-version step.
     """
 
+    if not 1 <= from_version < to_version <= SCHEMA_VERSION:
+        raise ValueError(f"unsupported Trackio Doris migration {from_version} -> {to_version}")
+    if to_version - from_version > 1:
+        return tuple(
+            statement
+            for version in range(from_version, to_version)
+            for statement in migration_statements(version, version + 1, replication_num)
+        )
+    properties = f'PROPERTIES ("replication_num" = "{replication_num}")'
+    if (from_version, to_version) == (3, 4):
+        return (_run_notes_table(properties),)
     if (from_version, to_version) == (2, 3):
         return (
             "ALTER TABLE traces ADD COLUMN fact_task_id VARCHAR(768) NULL",
@@ -98,9 +138,6 @@ def migration_statements(from_version: int, to_version: int, replication_num: in
             "CREATE INDEX idx_trace_run_id ON traces(run_id) USING INVERTED",
             "CREATE INDEX idx_trace_prompt_group_id ON traces(fact_prompt_group_id) USING INVERTED",
         )
-    if (from_version, to_version) != (1, 2):
-        raise ValueError(f"unsupported Trackio Doris migration {from_version} -> {to_version}")
-    properties = f'PROPERTIES ("replication_num" = "{replication_num}")'
     component_table = f"""
         CREATE TABLE IF NOT EXISTS trace_reward_components (
             project_id VARCHAR(255) NOT NULL,
@@ -333,4 +370,5 @@ def schema_statements(replication_num: int = 1) -> tuple[str, ...]:
         DISTRIBUTED BY HASH(project_id, link_id) BUCKETS 1
         {properties}
         """,
+        _run_notes_table(properties),
     )

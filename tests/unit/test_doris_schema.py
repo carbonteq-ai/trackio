@@ -59,7 +59,42 @@ def test_version_two_migration_adds_trace_facts_before_recording_the_version():
     assert any("idx_trace_run_id" in statement for statement in group_statements)
     assert any("idx_trace_prompt_group_id" in statement for statement in group_statements)
     with pytest.raises(ValueError, match="unsupported"):
-        migration_statements(3, 4)
+        migration_statements(SCHEMA_VERSION, SCHEMA_VERSION + 1)
+
+
+def test_version_four_adds_the_revisioned_run_notes_table():
+    assert SCHEMA_VERSION == 4
+    assert "run_notes" in MANAGED_TABLES
+    (statement,) = migration_statements(3, 4)
+    normalized = " ".join(statement.split())
+
+    assert "CREATE TABLE IF NOT EXISTS run_notes" in normalized
+    assert "UNIQUE KEY(project_id, note_id, revision)" in normalized
+    assert "idx_run_notes_run_id(run_id) USING INVERTED" in normalized
+    for column in (
+        "scope VARCHAR(16) NOT NULL",
+        "run_id VARCHAR(255) NULL",
+        "body_md STRING NOT NULL",
+        "source VARCHAR(64) NOT NULL",
+        'deleted TINYINT NOT NULL DEFAULT "0"',
+        "parent_revision BIGINT NULL",
+        "metadata STRING NULL",
+    ):
+        assert column in normalized
+    bootstrap = [" ".join(item.split()) for item in schema_statements()]
+    assert normalized in bootstrap
+
+
+def test_multi_version_migration_is_the_ordered_single_steps():
+    assert migration_statements(2, 4) == (
+        *migration_statements(2, 3),
+        *migration_statements(3, 4),
+    )
+    assert migration_statements(1, 4)[-1] == migration_statements(3, 4)[0]
+    with pytest.raises(ValueError, match="unsupported"):
+        migration_statements(4, 3)
+    with pytest.raises(ValueError, match="unsupported"):
+        migration_statements(0, 1)
 
 
 class _SchemaCursor:
