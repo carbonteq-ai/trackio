@@ -13,9 +13,9 @@ from trackio.trace_facts import (
     TraceAggregate,
     TraceFactsQuery,
     TraceFactUpdate,
-    TraceRewardComponent,
     TracePayloadMeasure,
     TracePayloadQuery,
+    TraceRewardComponent,
     projection_id,
 )
 
