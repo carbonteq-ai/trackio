@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev29`.
+working candidate is `0.31.5.post14.dev30`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -22,7 +22,29 @@ retains the fork's storage, trace, and query behavior.
 
 ## Current extension
 
-`0.31.5.post14.dev29` is an unreleased candidate. It retains dev28's storage,
+`0.31.5.post14.dev30` is an unreleased candidate. It retains dev29's behavior
+and replaces trace facts with set-oriented Doris writes: a batch fact write now
+applies every source projection whose id changes with one reward-component
+insert and one `UPDATE` for the page, not a `SELECT`, insert and `UPDATE` per
+trace; unchanged projections are skipped and algorithm projections keep the
+single-row path. On a merge-on-write unique-key table an `UPDATE` rewrites the
+whole row, payload included, so re-projecting a run with a new fact calculator
+cost 0.17 s per trace on the test database and about 0.38 s on the shared
+server; the set-oriented path took 0.005 s per trace on 100 real rows. Results
+are unchanged; no schema change; only the server needs upgrading. The delta is
+in `DorisStorage.upsert_trace_facts_batch`; the regression test is
+`tests/integration/test_doris_storage.py::test_batch_fact_replacement_is_set_oriented_and_exact_on_real_doris`,
+which passed with the rest of that file (10 tests) against the test database
+`trackio_candidate` on 2026-09-27.
+
+`0.31.5.post14.dev29` is a published prerelease candidate tagged
+`carbonteq-v0.31.5.post14.dev29` at immutable fork commit
+`6b6c87ecca4ffb6cf617045ca53197aecbcbec18`. Its retained wheel is
+SHA-256 `594084ca863a8f4aa686d59e3b005248a6a3b865d25ff910bf73fbe227c9b01d`
+and sdist is SHA-256
+`33a4b4d48fbb5b432eb8ce34f5993e24520a69f69c19ea9b9ec3cb8d5584a81f`; both were
+published unchanged to `carbonteq/dev` by Posttrain workflow `36285539613`.
+It retains dev28's storage,
 trace-fact, payload-aggregate, inbox and run-note behavior and adds read-only
 project SQL: `project_sql(project, sql, max_rows, timeout_seconds)`, served by
 `/project_sql`, exposed as `Api.project_sql` and advertised by the
@@ -208,9 +230,8 @@ showed it as missing.
 
 ## Project SQL (`0.31.5.post14.dev29`)
 
-Unreleased candidate on branch `codex/run-notes`. Deployment to the shared
-Trackio server and the real-Doris integration test are separate operational
-gates.
+Published as prerelease `0.31.5.post14.dev29` from branch `codex/run-notes`.
+Deployment to the shared Trackio server is a separate operational gate.
 
 `project_sql(project, sql, max_rows=None, timeout_seconds=None)` runs one
 read-only Doris SQL statement over one project's data and returns `engine`,
@@ -268,8 +289,9 @@ with the stand-in functions, refusals, truncation, JSON path quoting, logical
 tables named like base tables, `unix_timestamp`, and the local `Api` round
 trip), the capability case in `tests/unit/test_api_reads.py`, and
 `tests/integration/test_doris_storage.py::test_project_sql_is_scoped_read_only_and_uses_doris_functions`,
-which has not yet been run against a real Doris: it needs `TRACKIO_DORIS_*`
-and remains a release gate before a dev29 server is deployed against Doris.
+which passed against a real Doris (the test database `trackio_candidate`,
+after its backup-gated migration to schema version 4) on 2026-09-27, together
+with the run-note and other real-Doris tests.
 Validate with `uv run python -m pytest -q tests/unit/test_project_sql.py` and
 then `uv run python -m pytest -q tests/unit` under the default engine and with
 `TRACKIO_DATABASE_ENGINE=sqlite`.
@@ -709,6 +731,7 @@ added later without changing the Trackio SDK contract.
 | `0.31.5.post14.dev27` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev28` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev29` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
+| `0.31.5.post14.dev30` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 
 `0.31.5.post4` adds project-scoped bulk read APIs so a client can describe every
 run without one configuration request and one history request per run:
