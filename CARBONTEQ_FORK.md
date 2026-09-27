@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev28`.
+working candidate is `0.31.5.post14.dev29`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -22,9 +22,23 @@ retains the fork's storage, trace, and query behavior.
 
 ## Current extension
 
-`0.31.5.post14.dev28` is an unreleased candidate. It retains dev27's storage,
-trace-fact, payload-aggregate and inbox behavior and adds revisioned Markdown
-run notes: a `run_notes` table on SQLite/Turso and Doris, five server
+`0.31.5.post14.dev29` is an unreleased candidate. It retains dev28's storage,
+trace-fact, payload-aggregate, inbox and run-note behavior and adds read-only
+project SQL: `project_sql(project, sql, max_rows, timeout_seconds)`, served by
+`/project_sql`, exposed as `Api.project_sql` and advertised by the
+`project_sql` capability. See "Project SQL" below. It adds the runtime
+dependency `sqlglot>=30.19,<31`. No Doris schema change is required; the
+server and any client that calls the new query must be upgraded.
+
+`0.31.5.post14.dev28` is a published prerelease candidate tagged
+`carbonteq-v0.31.5.post14.dev28` at immutable fork commit
+`144ed40c4554839b3764a2a53db000ac4f9c8bc6`. Its retained wheel is
+SHA-256 `e16e312ccd4bf1689a23c9a261098f685dcc0caa296248155d17af55175c008b`
+and sdist is SHA-256
+`0ff6c87bf04ea7c5d762c8bd4121e6bc47df9bf07670f5ce3fe9c8a7bc043815`; both were
+published unchanged to `carbonteq/dev` by Posttrain workflow `36279734325`.
+It retains dev27's storage, trace-fact, payload-aggregate and inbox behavior
+and adds revisioned Markdown run notes: a `run_notes` table on SQLite/Turso and Doris, five server
 endpoints, and matching `Api` client methods. See "Run notes" below. Doris
 moves to schema version 4, which requires the explicit, backup-gated
 `trackio storage migrate-doris --to 4` before a dev28 server starts against an
@@ -192,11 +206,79 @@ returns only those safe scalar summaries. This repairs historical Observatory
 rows whose full detail had timing and token evidence while their paged summary
 showed it as missing.
 
+## Project SQL (`0.31.5.post14.dev29`)
+
+Unreleased candidate on branch `codex/run-notes`. Deployment to the shared
+Trackio server and the real-Doris integration test are separate operational
+gates.
+
+`project_sql(project, sql, max_rows=None, timeout_seconds=None)` runs one
+read-only Doris SQL statement over one project's data and returns `engine`,
+`columns`, `rows` and `truncated`. The statement is written against logical
+tables that look the same on both engines:
+
+- `metric_rows(run_id, run_name, step, timestamp, metrics)`: one row per
+  logged batch; `metrics` is the JSON object of logged values.
+- `run_configs(run_id, run_name, config, created_at)`: `config` is JSON.
+- `traces(run_id, run_name, step, timestamp, trace_type, external_id,
+  metadata, fact_*)`: the materialized trace facts are columns (`fact_state`
+  through `fact_algorithm_reward`); the native payload is not exposed.
+- `run_notes(note_id, revision, scope, run_id, run_name, kind, title, body_md,
+  source, created_at, revised_at, deleted)`: every revision of every note.
+
+Behavior that must survive an upstream merge:
+
+- The statement is parsed with sqlglot in the Doris dialect. It must be
+  exactly one query (`SELECT`, optionally with `WITH`) whose table references
+  are the logical tables or its own CTEs. Qualified names, unknown tables,
+  table functions, `SELECT ... INTO`, and a CTE that reuses a logical table
+  name are refused with `ProjectSqlError` (a `ValueError`) naming the reason.
+- Every logical table the statement reads is prepended as a CTE over the base
+  table. On Doris that CTE is `SELECT <columns> FROM <database>.<base> WHERE
+  project_id = '<project>'`, so the statement cannot see another project's
+  rows. On SQLite storage the base table is qualified as `main.<base>`, so the
+  logical `traces` and `run_notes` do not resolve to themselves.
+- `max_rows` defaults to 10000 and must be 1 to 100000; `timeout_seconds`
+  defaults to 10 and must be above 0 and at most 120. One extra row is fetched
+  to report `truncated`. Decimals, dates, bytes and non-finite floats are
+  normalized to JSON-safe values.
+- Doris: the statement runs on a pooled connection with the session
+  `query_timeout` set to the rounded-up timeout and restored afterwards; a
+  PyMySQL error is re-raised as `ProjectSqlError`.
+- SQLite/Turso: the statement is translated to SQLite with sqlglot and run on a
+  read-only connection under the existing query authorizer, with a progress
+  handler enforcing the timeout. Doris stand-ins are registered for
+  `json_extract_double`, `json_extract_bigint`, `json_extract_int`,
+  `json_extract_string`, `json_extract_bool`, `max_by`, `min_by`,
+  `stddev_samp`, `stddev`, `percentile` and `unix_timestamp`; JSON paths follow
+  Doris quoting (`$."train/rl/entropy"`, `$.a.b[1].c`). Any other function
+  missing on SQLite is refused by name together with the provided list.
+- Server: `/project_sql` is an unauthenticated read like other reads; invalid
+  statements are `TrackioAPIError` (HTTP 400). Client: `Api.project_sql` calls
+  the server, or local `SQLiteStorage` without a server, and
+  `Api.capabilities()["project_sql"]` is `True`. The older SQLite-only
+  `query_project` is unchanged and still refused on Doris.
+
+The delta is in `trackio/project_sql.py`, `trackio/doris_storage.py`,
+`trackio/sqlite_storage.py`, `trackio/server.py`, `trackio/api.py` and
+`pyproject.toml`/`uv.lock` (the `sqlglot>=30.19,<31` runtime dependency).
+Regression tests are `tests/unit/test_project_sql.py` (validation, Doris
+scoping and timeout set/restore against a fake connection, SQLite execution
+with the stand-in functions, refusals, truncation, JSON path quoting, logical
+tables named like base tables, `unix_timestamp`, and the local `Api` round
+trip), the capability case in `tests/unit/test_api_reads.py`, and
+`tests/integration/test_doris_storage.py::test_project_sql_is_scoped_read_only_and_uses_doris_functions`,
+which has not yet been run against a real Doris: it needs `TRACKIO_DORIS_*`
+and remains a release gate before a dev29 server is deployed against Doris.
+Validate with `uv run python -m pytest -q tests/unit/test_project_sql.py` and
+then `uv run python -m pytest -q tests/unit` under the default engine and with
+`TRACKIO_DATABASE_ENGINE=sqlite`.
+
 ## Run notes (`0.31.5.post14.dev28`)
 
-Unreleased candidate on branch `codex/run-notes`. Publication, deployment to
-the shared Trackio server, and the Doris v3-to-v4 migration are separate
-operational gates.
+Released as the `0.31.5.post14.dev28` prerelease candidate from branch
+`codex/run-notes`. Deployment to the shared Trackio server and the Doris
+v3-to-v4 migration are separate operational gates.
 
 A run note is Markdown attached to one run (`scope = 'run'`) or to the project
 (`scope = 'project'`), with a `kind`, an optional `title`, optional JSON
@@ -278,7 +360,8 @@ in-memory SQLite stand-in), the version-4 cases in
 `tests/unit/test_doris_schema.py`, the run-note cases in
 `tests/unit/test_doris_migration.py`, and
 `tests/integration/test_doris_storage.py::test_run_notes_revisions_and_lifecycle_on_real_doris`,
-which has not yet been run against a real Doris. Validate with
+which has not yet been run against a real Doris and remains a release gate
+before a dev28 or later server is deployed against Doris. Validate with
 `uv run python -m pytest -q tests/unit/test_run_notes.py
 tests/unit/test_doris_schema.py tests/unit/test_doris_migration.py` and then
 `uv run python -m pytest -q tests/unit`.
@@ -584,8 +667,11 @@ for an unbounded inbox replay. The native Verifiers trace artifact remains the
 complete replay authority. This repair is not deployed or consumable until its
 tests, immutable commit, wheel, and real-Doris backlog replay pass.
 
-Raw project SQL remains deliberately unavailable with Doris because its tables
-are shared across projects rather than stored in one project-local database.
+Raw project SQL (`query_project`) remains deliberately unavailable with Doris
+because its tables are shared across projects rather than stored in one
+project-local database. From `0.31.5.post14.dev29`, `project_sql` provides a
+validated, project-scoped read-only query over logical tables on both engines;
+see "Project SQL" above.
 The first release remains single-server: the process lock and idempotent
 artifact operations do not provide cross-process version allocation or a
 multi-table transaction. HA requires a staged or optimistic artifact protocol
@@ -622,6 +708,7 @@ added later without changing the Trackio SDK contract.
 | `0.31.5.post14.dev26` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev27` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev28` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
+| `0.31.5.post14.dev29` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 
 `0.31.5.post4` adds project-scoped bulk read APIs so a client can describe every
 run without one configuration request and one history request per run:
