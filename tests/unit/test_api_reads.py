@@ -97,6 +97,7 @@ def test_api_exposes_stable_run_reads(temp_dir):
         "alerts": True,
         "system_metrics": True,
         "run_notes": True,
+        "project_sql": True,
     }
     assert run.created_at is not None
     assert run.summary()["config"]["model"] == {"id": "org/model"}

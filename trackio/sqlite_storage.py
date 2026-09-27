@@ -27,6 +27,7 @@ import orjson
 
 from trackio import cas, references
 from trackio import database as sqlite3
+from trackio import project_sql as project_sql_module
 from trackio import run_notes as notes
 from trackio.artifact_storage import get_artifact_store
 from trackio.commit_scheduler import CommitScheduler
@@ -4079,6 +4080,30 @@ class SQLiteStorage:
         if isinstance(value, (bytes, bytearray, memoryview)):
             return bytes(value).hex()
         return value
+
+    @staticmethod
+    def project_sql(
+        project: str,
+        sql: str,
+        max_rows: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """Run read-only Doris SQL over the project's logical tables (translated to SQLite)."""
+        rows_limit, seconds = project_sql_module.clamp(max_rows, timeout_seconds)
+        SQLiteStorage._ensure_hub_loaded()
+        db_path = SQLiteStorage.get_project_db_path(project)
+        if not db_path.exists():
+            raise FileNotFoundError(f"Project '{project}' not found.")
+        prepared = project_sql_module.prepare(sql, engine="sqlite", project=project)
+        with sqlite3.readonly_sqlite_connect(str(db_path)) as conn:
+            columns, rows, truncated = project_sql_module.run_sqlite(
+                conn,
+                prepared,
+                max_rows=rows_limit,
+                timeout_seconds=seconds,
+                authorizer=SQLiteStorage._query_authorizer,
+            )
+        return project_sql_module.result("sqlite", columns, rows, truncated)
 
     @staticmethod
     def query_project(

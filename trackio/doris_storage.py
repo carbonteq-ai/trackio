@@ -18,6 +18,7 @@ import pymysql
 from pymysql.cursors import DictCursor
 
 import trackio.cas as cas
+import trackio.project_sql as project_sql_module
 import trackio.references as references
 import trackio.run_notes as notes
 from trackio.artifact_storage import get_artifact_store
@@ -2592,6 +2593,28 @@ class DorisStorage:
                     }
                 )
         return result
+
+    @classmethod
+    def project_sql(
+        cls,
+        project: str,
+        sql: str,
+        max_rows: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """Run read-only Doris SQL over the project's logical tables."""
+        rows_limit, seconds = project_sql_module.clamp(max_rows, timeout_seconds)
+        prepared = project_sql_module.prepare(
+            sql, engine="doris", project=project, database=cls._settings()["database"]
+        )
+        try:
+            with cls._connection() as connection:
+                columns, rows, truncated = project_sql_module.run_doris(
+                    connection, prepared, max_rows=rows_limit, timeout_seconds=seconds
+                )
+        except pymysql.MySQLError as error:
+            raise project_sql_module.ProjectSqlError(str(error)) from error
+        return project_sql_module.result("doris", columns, rows, truncated)
 
     @classmethod
     def query_project(

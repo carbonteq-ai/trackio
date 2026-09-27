@@ -517,6 +517,7 @@ class Api:
             "alerts": True,
             "system_metrics": True,
             "run_notes": True,
+            "project_sql": True,
         }
 
     def run_configs(self, project: str) -> dict[str, Any]:
@@ -573,6 +574,31 @@ class Api:
             kind=kind,
             include_deleted=include_deleted,
             api_name="/get_run_notes",
+        )
+
+    def project_sql(
+        self,
+        project: str,
+        sql: str,
+        *,
+        max_rows: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """Read-only Doris SQL over one project's logical tables.
+
+        Returns ``engine``, ``columns``, ``rows`` and ``truncated``. On SQLite
+        storage the statement is translated; see :mod:`trackio.project_sql`.
+        """
+        if self._remote_client is None:
+            return SQLiteStorage.project_sql(
+                project, sql, max_rows=max_rows, timeout_seconds=timeout_seconds
+            )
+        return self._remote_client.predict(
+            project=project,
+            sql=sql,
+            max_rows=max_rows,
+            timeout_seconds=timeout_seconds,
+            api_name="/project_sql",
         )
 
     def run_note_history(self, project: str, note_id: str) -> list[dict[str, Any]]:

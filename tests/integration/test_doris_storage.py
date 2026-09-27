@@ -551,3 +551,37 @@ def test_run_notes_revisions_and_lifecycle_on_real_doris():
 
     assert DorisStorage.delete_run(project, run_id=run_id)
     assert DorisStorage.get_run_note_history(project, note_id) == []
+
+
+def test_project_sql_is_scoped_read_only_and_uses_doris_functions():
+    project = "trackio-project-sql-qualification"
+    other = "trackio-project-sql-other"
+    run = "sql-run"
+    run_id = f"sql-run-{os.getpid()}"
+    for name, rewards in ((project, (0.1, 0.4, 0.3)), (other, (9.0,))):
+        DorisStorage.bulk_log(
+            project=name,
+            run=run,
+            run_id=run_id,
+            metrics_list=[{"train/rl/reward_mean": reward} for reward in rewards],
+            steps=list(range(1, len(rewards) + 1)),
+            timestamps=["2026-09-27T00:00:00+00:00"] * len(rewards),
+            log_ids=[f"{name}-{run_id}-{step}" for step in range(len(rewards))],
+        )
+    result = DorisStorage.project_sql(
+        project,
+        """
+        select run_id, count(*) as updates,
+               max_by(json_extract_double(metrics, '$."train/rl/reward_mean"'), step) as last_reward,
+               percentile(json_extract_double(metrics, '$."train/rl/reward_mean"'), 0.5) as median_reward,
+               stddev_samp(json_extract_double(metrics, '$."train/rl/reward_mean"')) as spread
+        from metric_rows where run_id = '{run_id}' group by run_id
+        """.replace("{run_id}", run_id),
+        timeout_seconds=30,
+    )
+    assert result["engine"] == "doris"
+    ((_, updates, last, median, spread),) = result["rows"]
+    assert (updates, last, median) == (3, 0.3, 0.3)
+    assert spread == pytest.approx(0.1527525231)
+    with pytest.raises(ValueError):
+        DorisStorage.project_sql(project, "select * from metrics")

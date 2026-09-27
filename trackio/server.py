@@ -1763,6 +1763,21 @@ def query_project(project: str, query: str) -> dict[str, Any]:
     return Storage.query_project(project, query)
 
 
+def project_sql(
+    project: str,
+    sql: str,
+    max_rows: int | None = None,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Read-only Doris SQL over one project's logical tables, on either engine."""
+    project = _run_note_project(project)
+    return _run_note_call(
+        lambda: Storage.project_sql(
+            project, sql, max_rows=max_rows, timeout_seconds=timeout_seconds
+        )
+    )
+
+
 def get_settings() -> dict[str, Any]:
     return {
         "logo_urls": utils.get_logo_urls(),
@@ -1946,6 +1961,7 @@ def _api_registry() -> dict[str, Any]:
         "bulk_alert": bulk_alert,
         "get_alerts": get_alerts,
         "get_run_notes": get_run_notes,
+        "project_sql": project_sql,
         "get_run_note_history": get_run_note_history,
         "add_run_note": add_run_note,
         "revise_run_note": revise_run_note,
