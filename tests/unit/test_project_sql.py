@@ -182,6 +182,14 @@ def test_json_paths_follow_doris_quoting():
     assert project_sql.json_value(document.encode(), '$."train/rl/entropy"') == 0.5
 
 
+def test_unix_timestamp_reads_iso_times(local_project):
+    result = SQLiteStorage.project_sql(
+        local_project,
+        "select unix_timestamp('2026-09-27T00:01:30+00:00') - unix_timestamp('2026-09-27T00:00:00+00:00') as seconds",
+    )
+    assert result["rows"] == [[90]]
+
+
 def test_client_reads_local_projects(local_project):
     result = trackio.Api().project_sql(
         local_project, "select count(*) as rows_logged from metric_rows"

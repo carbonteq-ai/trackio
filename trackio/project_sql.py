@@ -102,6 +102,7 @@ SQLITE_FUNCTIONS = (
     "stddev_samp",
     "stddev",
     "percentile",
+    "unix_timestamp",
 )
 
 
@@ -417,8 +418,27 @@ class _Percentile:
         return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
+def _unix_timestamp(value: Any = None) -> int | None:
+    if value is None:
+        return int(time.time())
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = _datetime.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_datetime.timezone.utc)
+    return int(parsed.timestamp())
+
+
 def register_doris_functions(connection: Any) -> None:
     """Provide the Doris functions semantic queries rely on to a SQLite connection."""
+
+    connection.create_function("unix_timestamp", 1, _unix_timestamp)
+    connection.create_function("unix_timestamp", 0, _unix_timestamp)
 
     connection.create_function(
         "json_extract_double",
