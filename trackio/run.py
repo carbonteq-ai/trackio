@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import huggingface_hub
+import orjson
 from gradio_client import handle_file
 
 from trackio import cas, fragments, references, utils
@@ -29,7 +30,11 @@ from trackio.histogram import Histogram
 from trackio.markdown import Markdown
 from trackio.media import TrackioMedia, get_project_media_path
 from trackio.pending_uploads import classify_pending_uploads, replay_pending_uploads
-from trackio.remote_client import RemoteClient, is_transient_remote_error
+from trackio.remote_client import (
+    RemoteClient,
+    is_transient_remote_error,
+    last_upload_progress,
+)
 from trackio.sqlite_storage import SQLiteStorage
 from trackio.table import Table
 from trackio.trace import Trace
@@ -50,6 +55,49 @@ BUCKET_FLUSH_INTERVAL = 30
 ARTIFACT_LOG_RETRY_BACKOFFS = (0.5, 1.0, 2.0)
 TRACE_FACT_PARENT_READY_BACKOFFS = (0.1, 0.2, 0.5)
 TRACE_FACT_DELIVERY_BATCH_SIZE = 1_000
+# Upper bound on one remote log request. Trace entries run to hundreds of KB, so
+# an unbounded request (a whole backlog resent after one failure) only grows and
+# can exceed a proxy's body or time limit on every retry.
+LOG_DELIVERY_MAX_BYTES = 8 * 1024 * 1024
+LOG_DELIVERY_MAX_ENTRIES = 1_000
+# Report a failing remote route at most this often, with the error and counts.
+DELIVERY_FAILURE_WARNING_INTERVAL = 60.0
+
+
+# Longest single wait between checks for artifact upload progress.
+ARTIFACT_PROGRESS_POLL_SECONDS = 5.0
+
+
+def _stalled_for(started: float) -> float:
+    """Seconds since the later of ``started`` and the last uploaded artifact part."""
+
+    return time.monotonic() - max(started, last_upload_progress())
+
+
+def _bounded_batches(
+    entries: list[Any],
+    *,
+    max_bytes: int = LOG_DELIVERY_MAX_BYTES,
+    max_entries: int = LOG_DELIVERY_MAX_ENTRIES,
+) -> list[list[Any]]:
+    """Split entries into requests of at most ``max_bytes`` of JSON each.
+
+    A single entry larger than the bound is sent on its own.
+    """
+
+    batches: list[list[Any]] = []
+    batch: list[Any] = []
+    size = 0
+    for entry in entries:
+        entry_size = len(orjson.dumps(entry, default=str))
+        if batch and (size + entry_size > max_bytes or len(batch) >= max_entries):
+            batches.append(batch)
+            batch, size = [], 0
+        batch.append(entry)
+        size += entry_size
+    if batch:
+        batches.append(batch)
+    return batches
 
 
 def _is_missing_trace_error(error: RuntimeError) -> bool:
@@ -131,6 +179,7 @@ class Run:
         self.project = project
         self._client_lock = threading.Lock()
         self._warning_lock = threading.Lock()
+        self._delivery_failures: dict[str, tuple[int, float | None]] = {}
         self._warned_failures: set[str] = set()
         self._local_sender_thread: threading.Thread | None = None
         self._client_thread = None
@@ -278,6 +327,28 @@ class Run:
             return _get_default_namespace()
         except Exception:
             return None
+
+    def _report_delivery_failure(
+        self, route: str, error: BaseException, entries: int
+    ) -> None:
+        """Warn about a failing remote route with its error, at a bounded rate."""
+
+        now = time.monotonic()
+        with self._warning_lock:
+            failures = self._delivery_failures
+            count, last_warned = failures.get(route, (0, None))
+            count += 1
+            due = (
+                last_warned is None
+                or now - last_warned >= DELIVERY_FAILURE_WARNING_INTERVAL
+            )
+            failures[route] = (count, now if due else last_warned)
+        if due:
+            _emit_nonfatal_warning(
+                f"trackio could not deliver {entries} buffered entries to '{route}' for run "
+                f"'{self.name}' ({count} failures so far): {type(error).__name__}: {error}. "
+                "The entries are kept and retried."
+            )
 
     def _warn_once(self, key: str, message: str) -> None:
         with self._warning_lock:
@@ -617,15 +688,24 @@ class Run:
                     if self._queued_logs:
                         logs_to_send = self._queued_logs.copy()
                         self._queued_logs.clear()
-                        try:
-                            self._client.predict(
-                                api_name="/bulk_log",
-                                logs=logs_to_send,
-                                hf_token=self._hf_token_for_remote(),
-                            )
-                        except Exception:
-                            self._persist_logs_locally(logs_to_send)
-                            failed = True
+                        batches = _bounded_batches(logs_to_send)
+                        for index, batch in enumerate(batches):
+                            try:
+                                self._client.predict(
+                                    api_name="/bulk_log",
+                                    logs=batch,
+                                    hf_token=self._hf_token_for_remote(),
+                                )
+                            except Exception as error:
+                                unsent = [
+                                    entry for rest in batches[index:] for entry in rest
+                                ]
+                                self._persist_logs_locally(unsent)
+                                self._report_delivery_failure(
+                                    "/bulk_log", error, len(unsent)
+                                )
+                                failed = True
+                                break
 
                     if self._queued_system_logs:
                         system_logs_to_send = self._queued_system_logs.copy()
@@ -890,24 +970,42 @@ class Run:
         try:
             buffered_logs = SQLiteStorage.get_pending_logs(self.project)
             if buffered_logs:
-                self._client.predict(
-                    api_name="/bulk_log",
-                    logs=buffered_logs["logs"],
-                    synchronous=synchronous,
-                    hf_token=self._hf_token_for_remote(),
-                )
-                SQLiteStorage.clear_pending_logs(self.project, buffered_logs["ids"])
+                ids_by_entry = {
+                    id(entry): row_id
+                    for entry, row_id in zip(
+                        buffered_logs["logs"], buffered_logs["ids"]
+                    )
+                }
+                for batch in _bounded_batches(buffered_logs["logs"]):
+                    try:
+                        self._client.predict(
+                            api_name="/bulk_log",
+                            logs=batch,
+                            synchronous=synchronous,
+                            hf_token=self._hf_token_for_remote(),
+                        )
+                    except Exception as error:
+                        self._report_delivery_failure("/bulk_log", error, len(batch))
+                        raise
+                    SQLiteStorage.clear_pending_logs(
+                        self.project, [ids_by_entry[id(entry)] for entry in batch]
+                    )
 
             buffered_sys = SQLiteStorage.get_pending_system_logs(self.project)
             if buffered_sys:
-                self._client.predict(
-                    api_name="/bulk_log_system",
-                    logs=buffered_sys["logs"],
-                    hf_token=self._hf_token_for_remote(),
-                )
-                SQLiteStorage.clear_pending_system_logs(
-                    self.project, buffered_sys["ids"]
-                )
+                ids_by_entry = {
+                    id(entry): row_id
+                    for entry, row_id in zip(buffered_sys["logs"], buffered_sys["ids"])
+                }
+                for batch in _bounded_batches(buffered_sys["logs"]):
+                    self._client.predict(
+                        api_name="/bulk_log_system",
+                        logs=batch,
+                        hf_token=self._hf_token_for_remote(),
+                    )
+                    SQLiteStorage.clear_pending_system_logs(
+                        self.project, [ids_by_entry[id(entry)] for entry in batch]
+                    )
 
             buffered_uploads = SQLiteStorage.get_pending_uploads(self.project)
             if buffered_uploads:
@@ -1568,7 +1666,7 @@ class Run:
                 artifact.add_dir(path)
             else:
                 artifact.add_file(path)
-        deadline = None if queue_timeout is None else time.monotonic() + queue_timeout
+        started = time.monotonic()
         while True:
             with self._artifact_lock:
                 active = tuple(
@@ -1588,12 +1686,20 @@ class Run:
                     self._artifact_futures[submission_id] = future
                     artifact._attach_background_future(future, submission_id)
                     return artifact
-            if deadline is None:
+            if queue_timeout is None:
                 raise RuntimeError("Trackio artifact publication queue is full")
-            remaining = max(0.0, deadline - time.monotonic())
-            completed, _ = wait(active, timeout=remaining, return_when=FIRST_COMPLETED)
-            if not completed:
-                raise TimeoutError("Trackio artifact publication queue wait timed out")
+            # The timeout bounds a stall, not the wait: a large upload ahead in
+            # the queue may take far longer while its parts keep landing.
+            remaining = queue_timeout - _stalled_for(started)
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Trackio artifact publication queue wait timed out: no upload progress for {queue_timeout:g} s"
+                )
+            completed, _ = wait(
+                active,
+                timeout=min(remaining, ARTIFACT_PROGRESS_POLL_SECONDS),
+                return_when=FIRST_COMPLETED,
+            )
             for future in completed:
                 future.result()
 
@@ -1896,23 +2002,36 @@ class Run:
             _emit_nonfatal_warning(f"trackio.log_system() failed: {e}")
 
     def flush_artifacts(self, timeout: float | None = None) -> tuple[Artifact, ...]:
-        """Wait for every queued artifact and propagate publication failures."""
+        """Wait for every queued artifact and propagate publication failures.
+
+        ``timeout`` bounds how long uploads may make no progress, not the total
+        wait, so a large artifact on a slow link still completes.
+        """
         with self._artifact_lock:
             futures = tuple(self._artifact_futures.values())
         if not futures:
             return ()
-        deadline = None if timeout is None else time.monotonic() + timeout
+        started = time.monotonic()
         committed: list[Artifact] = []
         for future in futures:
-            remaining = (
-                None if deadline is None else max(0.0, deadline - time.monotonic())
-            )
-            try:
-                committed.append(future.result(timeout=remaining))
-            except FutureTimeoutError:
-                raise TimeoutError(
-                    "Trackio artifact publication drain timed out"
-                ) from None
+            while True:
+                if timeout is None:
+                    committed.append(future.result())
+                    break
+                remaining = timeout - _stalled_for(started)
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Trackio artifact publication drain timed out: no upload progress for {timeout:g} s"
+                    )
+                try:
+                    committed.append(
+                        future.result(
+                            timeout=min(remaining, ARTIFACT_PROGRESS_POLL_SECONDS)
+                        )
+                    )
+                    break
+                except FutureTimeoutError:
+                    continue
         with self._artifact_lock:
             self._artifact_futures = {
                 submission_id: future

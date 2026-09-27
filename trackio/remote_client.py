@@ -97,6 +97,27 @@ def is_transient_remote_error(exc: BaseException) -> bool:
     return isinstance(exc, (httpx.RequestError, ConnectionError))
 
 
+_last_upload_progress = time.monotonic()
+
+
+def note_upload_progress() -> None:
+    """Record that an artifact upload just moved bytes to storage."""
+
+    global _last_upload_progress
+    _last_upload_progress = time.monotonic()
+
+
+def last_upload_progress() -> float:
+    """Monotonic time of the last artifact part or chunk that reached storage."""
+
+    return _last_upload_progress
+
+
+# Reopen a direct-upload session once this share of its part URLs' lifetime has
+# passed, so no part is sent on a URL about to expire.
+DIRECT_PART_URL_REFRESH_FRACTION = 0.5
+
+
 def _request_with_transient_retry(
     operation: Callable[[], httpx.Response],
 ) -> httpx.Response:
@@ -272,6 +293,7 @@ class _TrackioHTTPClient:
                     **self.httpx_kwargs,
                 )
                 response.raise_for_status()
+                note_upload_progress()
         complete_response = httpx.post(
             urljoin(self.src, f"api/artifact-upload/{project}/{upload_id}"),
             headers=self.headers,
@@ -288,32 +310,62 @@ class _TrackioHTTPClient:
             )
         return True
 
-    def _upload_artifact_blob_direct(self, project: str, digest: str, path: Path) -> bool:
+    def _upload_artifact_blob_direct(
+        self, project: str, digest: str, path: Path
+    ) -> bool:
         """Upload artifact parts directly to the configured S3-compatible store."""
 
         size_bytes = path.stat().st_size
         idempotency_key = hashlib.sha256(
             f"{project}\0{digest}".encode("utf-8")
         ).hexdigest()
-        init_response = _request_with_transient_retry(
-            lambda: httpx.post(
-                urljoin(self.src, f"api/artifact-upload/direct/{project}"),
-                headers=self.headers,
-                json={
-                    "digest": digest,
-                    "size_bytes": size_bytes,
-                    "idempotency_key": idempotency_key,
-                },
-                **self.httpx_kwargs,
+
+        def open_session() -> tuple[dict[str, Any], dict[int, str], float]:
+            # Reopening the session is idempotent and signs every part again, so
+            # a long upload refreshes its part URLs before they expire.
+            opened_at = time.monotonic()
+            response = _request_with_transient_retry(
+                lambda: httpx.post(
+                    urljoin(self.src, f"api/artifact-upload/direct/{project}"),
+                    headers=self.headers,
+                    json={
+                        "digest": digest,
+                        "size_bytes": size_bytes,
+                        "idempotency_key": idempotency_key,
+                    },
+                    **self.httpx_kwargs,
+                )
             )
-        )
-        session = init_response.json()
-        if session.get("already_present") is True or session.get("state") == "completed":
+            opened = response.json()
+            urls: dict[int, str] = {}
+            if not (
+                opened.get("already_present") is True
+                or opened.get("state") == "completed"
+            ):
+                listed = opened.get("parts")
+                if not isinstance(listed, list) or len(listed) != int(
+                    opened["chunk_count"]
+                ):
+                    raise RuntimeError(
+                        "Trackio returned an incomplete direct-upload session"
+                    )
+                urls = {int(part["part_number"]): str(part["url"]) for part in listed}
+            lifetime = float(opened.get("expires_in") or 0)
+            refresh_at = (
+                opened_at + lifetime * DIRECT_PART_URL_REFRESH_FRACTION
+                if lifetime > 0
+                else float("inf")
+            )
+            return opened, urls, refresh_at
+
+        session, part_urls, refresh_at = open_session()
+        if (
+            session.get("already_present") is True
+            or session.get("state") == "completed"
+        ):
             return True
 
-        parts = session.get("parts")
-        if not isinstance(parts, list) or len(parts) != int(session["chunk_count"]):
-            raise RuntimeError("Trackio returned an incomplete direct-upload session")
+        parts = session["parts"]
         chunk_size = int(session["chunk_size_bytes"])
         uploaded_parts: list[dict[str, Any]] = []
         acknowledged = {
@@ -331,21 +383,41 @@ class _TrackioHTTPClient:
                     index = int(part["index"])
                     chunk = handle.read(chunk_size)
                     if len(chunk) == 0 and index < int(session["chunk_count"]) - 1:
-                        raise RuntimeError("Trackio direct-upload session has too many parts")
+                        raise RuntimeError(
+                            "Trackio direct-upload session has too many parts"
+                        )
                     part_number = int(part["part_number"])
                     if part_number in acknowledged:
                         uploaded_parts.append(
-                            {"PartNumber": part_number, "ETag": acknowledged[part_number]}
+                            {
+                                "PartNumber": part_number,
+                                "ETag": acknowledged[part_number],
+                            }
                         )
                         continue
-                    response = _request_with_transient_retry(
-                        lambda: httpx.put(
-                            part["url"],
-                            headers=dict(part.get("headers") or {}),
-                            content=chunk,
-                            **self.httpx_kwargs,
+                    if time.monotonic() >= refresh_at:
+                        session, part_urls, refresh_at = open_session()
+
+                    def put_part() -> httpx.Response:
+                        return _request_with_transient_retry(
+                            lambda: httpx.put(
+                                part_urls[part_number],
+                                headers=dict(part.get("headers") or {}),
+                                content=chunk,
+                                **self.httpx_kwargs,
+                            )
                         )
-                    )
+
+                    try:
+                        response = put_part()
+                    except httpx.HTTPStatusError as error:
+                        # The store refuses a part whose signed URL expired
+                        # (slow links, a paused process): sign again once.
+                        if error.response.status_code != 403:
+                            raise
+                        session, part_urls, refresh_at = open_session()
+                        response = put_part()
+                    note_upload_progress()
                     etag = response.headers.get("etag") or response.headers.get("ETag")
                     if not etag:
                         raise RuntimeError(
@@ -374,7 +446,9 @@ class _TrackioHTTPClient:
                 completed.get("digest") != digest
                 or completed.get("size_bytes") != size_bytes
             ):
-                raise RuntimeError("Trackio completed a direct artifact upload with the wrong identity.")
+                raise RuntimeError(
+                    "Trackio completed a direct artifact upload with the wrong identity."
+                )
             return True
         except Exception:
             try:
@@ -536,7 +610,9 @@ class RemoteClient:
             raise RuntimeError("Trackio project delete plan must be an object")
         return result
 
-    def delete_project(self, project: str, plan_digest: str | None = None) -> dict[str, Any]:
+    def delete_project(
+        self, project: str, plan_digest: str | None = None
+    ) -> dict[str, Any]:
         """Permanently delete an isolated project after the caller confirms its plan."""
 
         payload: dict[str, Any] = {"project": project}
