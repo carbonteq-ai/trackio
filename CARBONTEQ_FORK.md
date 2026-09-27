@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev30`.
+working candidate is `0.31.5.post14.dev31`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -22,7 +22,35 @@ retains the fork's storage, trace, and query behavior.
 
 ## Current extension
 
-`0.31.5.post14.dev30` is an unreleased candidate. It retains dev29's behavior
+`0.31.5.post14.dev31` is an unreleased candidate. It retains dev30's behavior
+and makes remote delivery reliable for long training runs; only clients need
+upgrading, and no schema change is required.
+
+- Logs (metrics and traces) go to `/bulk_log` in requests of at most 8 MB
+  (`LOG_DELIVERY_MAX_BYTES`), both when sent live and when the local buffer is
+  flushed; the unsent remainder of a failed request is kept, and each failing
+  route is reported with its error at most once a minute. Before, the buffer
+  was resent as one request that grew with every failure; behind the Cloudflare
+  edge (body and 100-second limits) it never succeeded, and whatever was still
+  buffered was lost when the process exited. A 150-update Posttrain run lost
+  7,546 of its 11,876 traces this way.
+- Direct multipart uploads reopen their session, which signs the parts again,
+  at half the URL lifetime and once more when storage refuses a part with 403.
+  Before, every part was signed once for 15 minutes and a 3.8 GB upload failed
+  on part 418.
+- Artifact queue and drain timeouts bound a stall (no part uploaded for that
+  long), not the whole wait, so a large upload on a slow link completes.
+
+The regression tests are `tests/unit/test_remote_delivery.py`.
+
+`0.31.5.post14.dev30` is a published prerelease candidate tagged
+`carbonteq-v0.31.5.post14.dev30` at immutable fork commit
+`60e1306ebb406ea33776d40c7cf79ad5010f58a2`. Its retained wheel is
+SHA-256 `606c10633bedcaab210565f5b77f3d595db00e2a1ba44471c16583aa9fe85859`
+and sdist is SHA-256
+`9beacecc5c5a6773350348a4d2b93ad714d68b54a68c37f1fbae9c9d9ac8b832`; both were
+published unchanged to `carbonteq/dev` by Posttrain workflow `36289612769`, and
+it serves the shared Trackio since 2026-09-27. It retains dev29's behavior
 and replaces trace facts with set-oriented Doris writes: a batch fact write now
 applies every source projection whose id changes with one reward-component
 insert and one `UPDATE` for the page, not a `SELECT`, insert and `UPDATE` per
@@ -732,6 +760,7 @@ added later without changing the Trackio SDK contract.
 | `0.31.5.post14.dev28` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev29` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev30` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
+| `0.31.5.post14.dev31` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 
 `0.31.5.post4` adds project-scoped bulk read APIs so a client can describe every
 run without one configuration request and one history request per run:
