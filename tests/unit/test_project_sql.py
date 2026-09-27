@@ -182,6 +182,12 @@ def test_json_paths_follow_doris_quoting():
     assert project_sql.json_value(document.encode(), '$."train/rl/entropy"') == 0.5
 
 
+def test_logical_tables_named_like_base_tables_resolve_on_sqlite(local_project):
+    result = SQLiteStorage.project_sql(local_project, "select count(*) from traces")
+    assert result["rows"] == [[0]]
+    assert SQLiteStorage.project_sql(local_project, "select count(*) from run_notes")["rows"] == [[0]]
+
+
 def test_unix_timestamp_reads_iso_times(local_project):
     result = SQLiteStorage.project_sql(
         local_project,

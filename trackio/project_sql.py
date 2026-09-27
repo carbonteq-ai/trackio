@@ -177,7 +177,8 @@ def _scope(name: str, *, engine: str, project: str, database: str | None) -> exp
             )
         )
     else:
-        select = select.from_(exp.table_(base))
+        # Qualified, so a logical table named like its base table (traces) is not a circular CTE.
+        select = select.from_(exp.table_(base, db="main"))
     return exp.CTE(this=select, alias=exp.TableAlias(this=exp.to_identifier(name)))
 
 
