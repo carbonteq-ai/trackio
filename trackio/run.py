@@ -34,6 +34,7 @@ from trackio.remote_client import (
     RemoteClient,
     is_transient_remote_error,
     last_upload_progress,
+    note_upload_progress,
 )
 from trackio.sqlite_storage import SQLiteStorage
 from trackio.table import Table
@@ -52,7 +53,12 @@ from trackio.utils import MEDIA_DIR, _emit_nonfatal_warning, _get_default_namesp
 BATCH_SEND_INTERVAL = 0.5
 MAX_BACKOFF = 30
 BUCKET_FLUSH_INTERVAL = 30
-ARTIFACT_LOG_RETRY_BACKOFFS = (0.5, 1.0, 2.0)
+# Committing a version is idempotent: the server keys it by manifest digest and
+# returns the existing version on a repeat. A busy server can outlast a few
+# short retries and still commit, so transient failures are retried with
+# growing waits until a deadline rather than failing the run that produced it.
+ARTIFACT_LOG_RETRY_BACKOFFS = (0.5, 1.0, 2.0, 5.0, 10.0, 30.0)
+ARTIFACT_LOG_RETRY_DEADLINE_SECONDS = 1800.0
 TRACE_FACT_PARENT_READY_BACKOFFS = (0.1, 0.2, 0.5)
 TRACE_FACT_DELIVERY_BATCH_SIZE = 1_000
 # Upper bound on one remote log request. Trace entries run to hundreds of KB, so
@@ -1586,31 +1592,39 @@ class Run:
             "add_reference, you need to upgrade trackio to a more recent "
             "release."
         )
-        attempts = len(ARTIFACT_LOG_RETRY_BACKOFFS) + 1
-        for attempt in range(attempts):
-            if attempt > 0:
-                time.sleep(ARTIFACT_LOG_RETRY_BACKOFFS[attempt - 1])
+        deadline = time.monotonic() + ARTIFACT_LOG_RETRY_DEADLINE_SECONDS
+        attempt = 0
+        while True:
             try:
                 with self._client_lock:
                     record = self._client.predict(api_name="/artifact_log", **kwargs)
             except Exception as e:
-                if attempt == attempts - 1 or not is_transient_remote_error(e):
-                    message = str(e)
-                    pre_reference_rejection = ref_entries and (
-                        "Invalid sha256 digest" in message
-                        or (
-                            "blobs not on server" in message
-                            and any(entry["digest"] in message for entry in ref_entries)
-                        )
+                delay = ARTIFACT_LOG_RETRY_BACKOFFS[
+                    min(attempt, len(ARTIFACT_LOG_RETRY_BACKOFFS) - 1)
+                ]
+                if is_transient_remote_error(e) and time.monotonic() + delay < deadline:
+                    attempt += 1
+                    self._report_delivery_failure("/artifact_log", e, 1)
+                    # A retry in progress is not a stalled publisher.
+                    note_upload_progress()
+                    time.sleep(delay)
+                    continue
+                message = str(e)
+                pre_reference_rejection = ref_entries and (
+                    "Invalid sha256 digest" in message
+                    or (
+                        "blobs not on server" in message
+                        and any(entry["digest"] in message for entry in ref_entries)
                     )
-                    if pre_reference_rejection:
-                        raise RuntimeError(
-                            "The remote trackio server rejected this artifact's "
-                            f"reference entries ({message}). {upgrade_hint} "
-                            "Alternatively, log this artifact without "
-                            "add_reference entries."
-                        ) from e
-                    raise
+                )
+                if pre_reference_rejection:
+                    raise RuntimeError(
+                        "The remote trackio server rejected this artifact's "
+                        f"reference entries ({message}). {upgrade_hint} "
+                        "Alternatively, log this artifact without "
+                        "add_reference entries."
+                    ) from e
+                raise
             else:
                 stored = record.get("manifest")
                 stored_ref_paths = {

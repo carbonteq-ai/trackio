@@ -18,6 +18,13 @@ from trackio.utils import parse_trackio_server_url
 
 HTTP_API_VERSION = 1
 FORCE_SYNC_TIMEOUT = 180.0
+# Committing an artifact version can wait behind other server work; the call is
+# idempotent (keyed by manifest digest), so it gets a longer read window.
+ARTIFACT_LOG_TIMEOUT = 300.0
+_LONG_READ_TIMEOUTS = {
+    "force_sync": FORCE_SYNC_TIMEOUT,
+    "artifact_log": ARTIFACT_LOG_TIMEOUT,
+}
 ARTIFACT_CONTROL_RETRY_BACKOFFS = (0.5, 1.0, 2.0)
 
 WRITE_TOKEN_HEADER = "x-trackio-write-token"
@@ -75,17 +82,18 @@ def _merge_client_headers(
 def _request_timeout_for_api(
     timeout: httpx.Timeout | float | int | None, api_name: str
 ) -> httpx.Timeout | float | int | None:
-    if api_name != "force_sync":
+    minimum = _LONG_READ_TIMEOUTS.get(api_name.lstrip("/"))
+    if minimum is None:
         return timeout
 
     normalized = httpx.Timeout(timeout)
     read_timeout = normalized.read if normalized.read is not None else 0.0
-    if read_timeout >= FORCE_SYNC_TIMEOUT:
+    if read_timeout >= minimum:
         return timeout
 
     return httpx.Timeout(
         connect=normalized.connect,
-        read=FORCE_SYNC_TIMEOUT,
+        read=minimum,
         write=normalized.write,
         pool=normalized.pool,
     )

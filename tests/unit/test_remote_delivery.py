@@ -186,3 +186,91 @@ def test_artifact_drain_times_out_when_uploads_stall(monkeypatch):
 
     with pytest.raises(TimeoutError, match="no upload progress"):
         run.flush_artifacts(timeout=0.1)
+
+
+@pytest.fixture(autouse=True)
+def _restore_upload_progress(monkeypatch):
+    # Retries record upload progress in module state; keep it test-local.
+    monkeypatch.setattr(
+        remote_client, "_last_upload_progress", remote_client._last_upload_progress
+    )
+
+
+def _artifact_run(client) -> Run:
+    return Run(
+        url="https://trackio.invalid",
+        project="proj",
+        client=client,
+        name="artifact-run",
+        server_base_url="https://trackio.invalid",
+    )
+
+
+def test_artifact_commit_keeps_retrying_a_slow_server_until_it_commits(monkeypatch):
+    # The commit is idempotent (keyed by manifest digest), so a server that is
+    # slow for longer than a few short retries must not fail the run.
+    class Client:
+        def __init__(self):
+            self.calls = 0
+
+        def predict(self, *, api_name, **kwargs):
+            self.calls += 1
+            if self.calls <= 6:
+                raise httpx.ReadTimeout("server busy")
+            return {"manifest": kwargs["manifest"], "version": 0}
+
+    client = Client()
+    run = _artifact_run(client)
+    sleeps: list[float] = []
+    monkeypatch.setattr(run_module.time, "sleep", sleeps.append)
+    warnings: list[str] = []
+    monkeypatch.setattr(run_module, "_emit_nonfatal_warning", warnings.append)
+    before = remote_client.last_upload_progress()
+
+    record = run._artifact_log_with_retry(
+        manifest=[{"path": "a", "digest": "sha256:" + "0" * 64}]
+    )
+
+    assert record["version"] == 0
+    assert client.calls == 7
+    assert sleeps == [0.5, 1.0, 2.0, 5.0, 10.0, 30.0]
+    assert warnings and "/artifact_log" in warnings[0]
+    assert remote_client.last_upload_progress() >= before
+
+
+def test_artifact_commit_stops_at_its_deadline_and_on_rejections(monkeypatch):
+    class Timeouts:
+        def predict(self, *, api_name, **kwargs):
+            raise httpx.ReadTimeout("server busy")
+
+    run = _artifact_run(Timeouts())
+    clock = [0.0]
+    monkeypatch.setattr(run_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        run_module.time,
+        "sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
+    monkeypatch.setattr(run_module, "_emit_nonfatal_warning", lambda message: None)
+    with pytest.raises(httpx.ReadTimeout):
+        run._artifact_log_with_retry(manifest=[])
+    assert clock[0] < run_module.ARTIFACT_LOG_RETRY_DEADLINE_SECONDS
+
+    class Rejects:
+        calls = 0
+
+        def predict(self, *, api_name, **kwargs):
+            Rejects.calls += 1
+            raise ValueError("Artifact manifest must be a non-empty list of entries.")
+
+    with pytest.raises(ValueError):
+        _artifact_run(Rejects())._artifact_log_with_retry(manifest=[])
+    assert Rejects.calls == 1
+
+
+def test_artifact_commit_requests_wait_longer_than_ordinary_calls():
+    ordinary = remote_client._request_timeout_for_api(60, "/log")
+    commit = remote_client._request_timeout_for_api(60, "/artifact_log")
+    assert ordinary == 60
+    assert commit.read == remote_client.ARTIFACT_LOG_TIMEOUT >= 300
+    assert remote_client._request_timeout_for_api(600, "artifact_log") == 600
