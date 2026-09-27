@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -12,6 +13,7 @@ from trackio.trace_facts import (
     TraceAggregate,
     TraceFactsQuery,
     TraceFactUpdate,
+    TraceRewardComponent,
     TracePayloadMeasure,
     TracePayloadQuery,
     projection_id,
@@ -160,6 +162,94 @@ def test_prompt_group_fact_moments_on_real_doris():
     assert bucket.trace_count == 2
     assert bucket.values == {"sum_task_reward": 1.0, "sum_squares_task_reward": 1.0}
     assert bucket.coverage == {"sum_task_reward": 2, "sum_squares_task_reward": 2}
+
+
+def test_batch_fact_replacement_is_set_oriented_and_exact_on_real_doris():
+    project = "trackio-fact-replacement-qualification"
+    run = "fact-replacement"
+    run_id = f"fact-replacement-{time.time_ns()}"
+    for index in range(3):
+        DorisStorage.bulk_log(
+            project=project,
+            run=run,
+            run_id=run_id,
+            metrics_list=[{
+                "rollout": VerifiersTrace({
+                    "id": f"replacement-trace-{index}",
+                    "version": 2,
+                    "nodes": [{"message": {"role": "user", "content": f"sample {index}"}}],
+                    "rewards": {"task": float(index)},
+                })._to_dict(project=project, run=run, step=index)
+            }],
+            steps=[index],
+            timestamps=[f"2026-09-27T00:00:0{index}+00:00"],
+            log_ids=[f"{run_id}-{index}"],
+            config={"qualification": "fact-replacement"},
+        )
+    traces = sorted(
+        DorisStorage.get_traces(project, run_id=run_id, trace_type="verifiers"),
+        key=lambda item: item["external_id"],
+    )
+
+    def updates(version, task, reward_offset):
+        result = []
+        for index, trace in enumerate(traces):
+            dimensions = {"task_id": task, "rollout_step": index}
+            measures = {"task_reward": index + reward_offset}
+            components = (TraceRewardComponent("task", index + reward_offset, source_kind="environment"),)
+            projection = projection_id({
+                "namespace": "verifiers.trace",
+                "calculator_version": version,
+                "dimensions": dimensions,
+                "measures": measures,
+                "reward_components": [
+                    {
+                        "name": component.name,
+                        "contribution": component.contribution,
+                        "score": component.score,
+                        "weight": component.weight,
+                        "source": {"kind": component.source_kind, "id": component.source_id},
+                    }
+                    for component in components
+                ],
+                "provenance": {},
+                "state": "complete",
+            })
+            result.append(TraceFactUpdate(
+                trace_type=trace["trace_type"],
+                external_id=trace["external_id"],
+                namespace="verifiers.trace",
+                calculator_version=version,
+                projection_id=projection,
+                dimensions=dimensions,
+                measures=measures,
+                reward_components=components,
+                replace_reward_components=True,
+            ))
+        return result
+
+    def stored():
+        values = {}
+        for measure in ("task_reward", "reward_component_contribution"):
+            result = DorisStorage.aggregate_trace_facts(project, run, TraceFactsQuery(
+                trace_type=traces[0]["trace_type"],
+                group_by=("task_id",),
+                aggregates=(TraceAggregate(measure, "sum"),),
+            ), run_id=run_id)
+            for bucket in result.buckets:
+                values.setdefault(bucket.dimensions["task_id"], {}).update(bucket.values)
+        return values
+
+    first = DorisStorage.upsert_trace_facts_batch(project, run, updates("test.v1", "row-7", 0.0), run_id=run_id)
+    assert [receipt.applied for receipt in first] == [True, True, True]
+    # A re-projection replaces every trace's facts in one set-oriented write,
+    # and reads join only the current projection's reward components.
+    second = DorisStorage.upsert_trace_facts_batch(project, run, updates("test.v2", "simple.task", 10.0), run_id=run_id)
+    assert [receipt.applied for receipt in second] == [True, True, True]
+    assert stored() == {"simple.task": {"sum_task_reward": 33.0, "sum_reward_component_contribution": 33.0}}
+    again = DorisStorage.upsert_trace_facts_batch(project, run, updates("test.v2", "simple.task", 10.0), run_id=run_id)
+    assert [receipt.applied for receipt in again] == [False, False, False]
+    assert stored() == {"simple.task": {"sum_task_reward": 33.0, "sum_reward_component_contribution": 33.0}}
 
 
 def test_payload_timing_aggregates_on_real_doris():

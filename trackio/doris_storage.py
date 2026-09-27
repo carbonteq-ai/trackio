@@ -2014,18 +2014,27 @@ class DorisStorage:
             )
             if missing is not None:
                 raise KeyError(f"trace {missing!r} does not exist")
-            # Historical source projections have no prior projection.  Apply
-            # those rows with set-oriented statements so a page does not make
-            # a Doris round trip for every trace.  Existing/replaced
-            # projections retain the conservative single-row transition below.
+            # Source projections are applied with set-oriented statements,
+            # whether a trace has no projection yet or an older one: one insert
+            # for reward components and one UPDATE for every trace whose
+            # projection changes. A per-trace UPDATE rewrites the whole row,
+            # payload included, which made re-projecting a run cost about
+            # 0.4 s per trace. Algorithm projections keep the single-row path.
             fresh = [
                 update
                 for update in updates
                 if update.replace_reward_components
-                and not traces[(update.trace_type, update.external_id)].get(
+                and traces[(update.trace_type, update.external_id)].get(
                     "fact_projection_id"
                 )
+                != update.projection_id
             ]
+            fresh_keys = {(update.trace_type, update.external_id) for update in fresh}
+            unchanged = {
+                (update.trace_type, update.external_id)
+                for update in updates
+                if update.replace_reward_components
+            } - fresh_keys
             if fresh:
                 component_rows = [
                     (
@@ -2138,18 +2147,18 @@ class DorisStorage:
                     f"WHERE project_id=%s AND trace_id IN ({placeholders})",
                     parameters,
                 )
-            fresh_keys = {(update.trace_type, update.external_id) for update in fresh}
             receipts = []
             for update in updates:
                 key = (update.trace_type, update.external_id)
                 trace_id = str(traces[key]["trace_id"])
-                applied = (
-                    True
-                    if key in fresh_keys
-                    else cls._upsert_trace_facts_cursor(
+                if key in fresh_keys:
+                    applied = True
+                elif key in unchanged:
+                    applied = False
+                else:
+                    applied = cls._upsert_trace_facts_cursor(
                         cursor, project, trace_id, update
                     )
-                )
                 receipts.append(
                     TraceFactWriteReceipt(trace_id, update.projection_id, applied)
                 )
