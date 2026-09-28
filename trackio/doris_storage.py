@@ -1913,7 +1913,7 @@ class DorisStorage:
                 """UPDATE traces SET fact_namespace=%s, fact_calculator_version=%s, fact_projection_id=%s,
                fact_state=%s, fact_calculated_at=%s, fact_dimensions=%s, fact_provenance=%s,
                fact_model=%s, fact_task_type=%s, fact_task_id=%s, fact_prompt_group_id=%s,
-               fact_rollout_step=%s, fact_is_truncated=%s,
+               fact_episode_ending=%s, fact_rollout_step=%s, fact_is_truncated=%s,
                fact_has_error=%s, fact_model_input_tokens=%s, fact_model_output_tokens=%s,
                fact_thinking_tokens=%s, fact_tool_calls=%s, fact_model_calls=%s,
                fact_trace_latency_ms=%s, fact_task_reward=%s
@@ -1930,6 +1930,7 @@ class DorisStorage:
                     dimensions.get("task_type"),
                     dimensions.get("task_id"),
                     dimensions.get("prompt_group_id"),
+                    dimensions.get("episode_ending"),
                     dimensions.get("rollout_step"),
                     dimensions.get("is_truncated"),
                     dimensions.get("has_error"),
@@ -2086,6 +2087,10 @@ class DorisStorage:
                         lambda update: update.dimensions.get("prompt_group_id"),
                     ),
                     (
+                        "fact_episode_ending",
+                        lambda update: update.dimensions.get("episode_ending"),
+                    ),
+                    (
                         "fact_rollout_step",
                         lambda update: update.dimensions.get("rollout_step"),
                     ),
@@ -2178,6 +2183,7 @@ class DorisStorage:
             "task_type": "traces.fact_task_type",
             "task_id": "traces.fact_task_id",
             "prompt_group_id": "traces.fact_prompt_group_id",
+            "episode_ending": "traces.fact_episode_ending",
             "rollout_step": "traces.fact_rollout_step",
             "is_truncated": "traces.fact_is_truncated",
             "has_error": "traces.fact_has_error",
@@ -2274,6 +2280,7 @@ class DorisStorage:
             "task_type": "fact_task_type",
             "task_id": "fact_task_id",
             "prompt_group_id": "fact_prompt_group_id",
+            "episode_ending": "fact_episode_ending",
             "rollout_step": "fact_rollout_step",
             "is_truncated": "fact_is_truncated",
             "has_error": "fact_has_error",

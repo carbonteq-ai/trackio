@@ -63,7 +63,6 @@ def test_version_two_migration_adds_trace_facts_before_recording_the_version():
 
 
 def test_version_four_adds_the_revisioned_run_notes_table():
-    assert SCHEMA_VERSION == 4
     assert "run_notes" in MANAGED_TABLES
     (statement,) = migration_statements(3, 4)
     normalized = " ".join(statement.split())
@@ -85,12 +84,92 @@ def test_version_four_adds_the_revisioned_run_notes_table():
     assert normalized in bootstrap
 
 
+def test_version_five_adds_the_episode_ending_fact_column():
+    assert SCHEMA_VERSION == 5
+    assert migration_statements(4, 5) == (
+        "ALTER TABLE traces ADD COLUMN fact_episode_ending VARCHAR(128) NULL",
+    )
+    traces = next(
+        " ".join(statement.split())
+        for statement in schema_statements()
+        if "CREATE TABLE IF NOT EXISTS traces" in statement
+    )
+    assert "fact_episode_ending VARCHAR(128) NULL" in traces
+    assert migration_statements(3, 5)[-1] == migration_statements(4, 5)[0]
+
+
+def test_version_five_migration_skips_an_existing_column_and_records_the_version(
+    monkeypatch, tmp_path
+):
+    from trackio import doris_schema_migration
+
+    class _Cursor:
+        def __init__(self, columns):
+            self.columns = columns
+            self.executed = []
+            self.result = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, query, params=None):
+            self.executed.append(query)
+            if query.startswith("SELECT version FROM schema_versions"):
+                self.result = [{"version": 4}]
+            elif query == "DESCRIBE traces":
+                self.result = [{"Field": column} for column in self.columns]
+            elif query.startswith("SELECT TABLE_NAME"):
+                self.result = [{"table_name": table} for table in MANAGED_TABLES]
+            else:
+                self.result = []
+
+        def fetchone(self):
+            return self.result[0] if self.result else None
+
+        def fetchall(self):
+            return self.result
+
+    class _Connection:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def cursor(self):
+            return self._cursor
+
+    receipt = tmp_path / "backup-receipt.json"
+    receipt.write_text("{}")
+    for columns, altered in (({"trace_id"}, True), ({"trace_id", "fact_episode_ending"}, False)):
+        cursor = _Cursor(columns)
+        monkeypatch.setattr(
+            doris_schema_migration.DorisStorage,
+            "_connection",
+            staticmethod(lambda initialize=True, cursor=cursor: _Connection(cursor)),
+        )
+        result = doris_schema_migration.apply(5, receipt)
+        assert result["current_version"] == 4 and result["target_version"] == 5
+        assert any(query.startswith("ALTER TABLE traces ADD COLUMN fact_episode_ending") for query in cursor.executed) is altered
+        assert any(query.lstrip().startswith("INSERT INTO schema_versions") for query in cursor.executed)
+
+
 def test_multi_version_migration_is_the_ordered_single_steps():
     assert migration_statements(2, 4) == (
         *migration_statements(2, 3),
         *migration_statements(3, 4),
     )
     assert migration_statements(1, 4)[-1] == migration_statements(3, 4)[0]
+    assert migration_statements(3, 5) == (
+        *migration_statements(3, 4),
+        *migration_statements(4, 5),
+    )
     with pytest.raises(ValueError, match="unsupported"):
         migration_statements(4, 3)
     with pytest.raises(ValueError, match="unsupported"):

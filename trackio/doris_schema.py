@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MANAGED_TABLES = (
     "schema_versions",
     "metrics",
@@ -129,6 +129,8 @@ def migration_statements(from_version: int, to_version: int, replication_num: in
             for statement in migration_statements(version, version + 1, replication_num)
         )
     properties = f'PROPERTIES ("replication_num" = "{replication_num}")'
+    if (from_version, to_version) == (4, 5):
+        return ("ALTER TABLE traces ADD COLUMN fact_episode_ending VARCHAR(128) NULL",)
     if (from_version, to_version) == (3, 4):
         return (_run_notes_table(properties),)
     if (from_version, to_version) == (2, 3):
@@ -247,6 +249,7 @@ def schema_statements(replication_num: int = 1) -> tuple[str, ...]:
             fact_task_type VARCHAR(512) NULL,
             fact_task_id VARCHAR(768) NULL,
             fact_prompt_group_id VARCHAR(768) NULL,
+            fact_episode_ending VARCHAR(128) NULL,
             fact_rollout_step BIGINT NULL,
             fact_is_truncated BOOLEAN NULL,
             fact_has_error BOOLEAN NULL,

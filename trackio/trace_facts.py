@@ -43,6 +43,7 @@ _DIMENSION_NAMES = frozenset(
         "task_type",
         "task_id",
         "prompt_group_id",
+        "episode_ending",
         "rollout_step",
         "is_truncated",
         "has_error",
@@ -167,6 +168,8 @@ class TraceFactUpdate:
                 raise ValueError(f"trace fact dimension {name!r} must be scalar")
             if name in {"task_id", "prompt_group_id"} and value is not None:
                 _text(value, f"trace fact dimension {name!r}", maximum=768)
+            if name == "episode_ending" and value is not None:
+                _text(value, f"trace fact dimension {name!r}", maximum=128)
         for name, value in self.measures.items():
             if name not in _MEASURE_NAMES:
                 raise ValueError(f"unsupported trace fact measure {name!r}")

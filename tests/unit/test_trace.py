@@ -264,6 +264,62 @@ def test_prompt_group_reward_moments_use_indexed_fact_dimensions(temp_dir):
     assert "idx_trace_facts_prompt_group" in indexes
 
 
+def test_episode_ending_is_a_materialized_fact_dimension(temp_dir):
+    run = Run(url=None, project="proj", client=None, name="ending-facts-run", space_id=None)
+    endings = ("completed", "reply_token_limit", "reply_token_limit", None)
+    for index in range(len(endings)):
+        run.log({"rollout": VerifiersTrace(verifiers_record(f"ending-trace-{index}"))})
+    run._flush_queues_inline()
+    for index, ending in enumerate(endings):
+        dimensions = {"rollout_step": 1, "episode_ending": ending}
+        measures = {"task_reward": float(index)}
+        run.upsert_trace_facts(TraceFactUpdate(
+            trace_type="verifiers",
+            external_id=f"ending-trace-{index}",
+            namespace="verifiers.trace",
+            calculator_version="test.v1",
+            projection_id=_projection_id("verifiers.trace", "test.v1", dimensions, measures),
+            dimensions=dimensions,
+            measures=measures,
+            replace_reward_components=True,
+        ))
+    result = run.aggregate_trace_facts(TraceFactsQuery(
+        group_by=("episode_ending",),
+        aggregates=(TraceAggregate("task_reward", "sum"),),
+    ))
+    buckets = {bucket.dimensions["episode_ending"]: bucket for bucket in result.buckets}
+    assert {name: bucket.trace_count for name, bucket in buckets.items()} == {
+        "completed": 1,
+        "reply_token_limit": 2,
+        None: 1,
+    }
+    assert buckets["reply_token_limit"].values == {"sum_task_reward": 3.0}
+    filtered = run.aggregate_trace_facts(TraceFactsQuery(
+        dimensions={"episode_ending": "completed"},
+        aggregates=(TraceAggregate("task_reward", "count"),),
+    ))
+    assert [bucket.trace_count for bucket in filtered.buckets] == [1]
+    sql = SQLiteStorage.project_sql(
+        "proj",
+        "select fact_episode_ending, count(*) from traces group by fact_episode_ending order by fact_episode_ending",
+    )
+    assert sql["rows"] == [[None, 1], ["completed", 1], ["reply_token_limit", 2]]
+
+
+@pytest.mark.parametrize("value", ["", "   ", 7, "x" * 129])
+def test_episode_ending_dimension_must_be_bounded_text(value):
+    with pytest.raises(ValueError, match="episode_ending"):
+        TraceFactUpdate(
+            trace_type="verifiers",
+            external_id="ending-trace",
+            namespace="verifiers.trace",
+            calculator_version="test.v1",
+            projection_id="0" * 64,
+            dimensions={"episode_ending": value},
+            measures={},
+        )
+
+
 def test_bulk_trace_fact_upsert_validates_a_page_before_writing(monkeypatch):
     update = TraceFactUpdate(
         trace_type="verifiers",

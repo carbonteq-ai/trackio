@@ -252,6 +252,74 @@ def test_batch_fact_replacement_is_set_oriented_and_exact_on_real_doris():
     assert stored() == {"simple.task": {"sum_task_reward": 33.0, "sum_reward_component_contribution": 33.0}}
 
 
+def test_episode_ending_fact_dimension_on_real_doris():
+    project = "trackio-episode-ending-qualification"
+    run = "episode-endings"
+    run_id = f"episode-endings-{time.time_ns()}"
+    endings = ("completed", "context_rejected", "context_rejected")
+    for index in range(len(endings)):
+        DorisStorage.bulk_log(
+            project=project,
+            run=run,
+            run_id=run_id,
+            metrics_list=[{
+                "rollout": VerifiersTrace({
+                    "id": f"ending-trace-{index}",
+                    "version": 2,
+                    "nodes": [{"message": {"role": "user", "content": f"sample {index}"}}],
+                    "rewards": {"task": float(index)},
+                })._to_dict(project=project, run=run, step=index)
+            }],
+            steps=[index],
+            timestamps=[f"2026-09-28T00:00:0{index}+00:00"],
+            log_ids=[f"{run_id}-{index}"],
+            config={"qualification": "episode-endings"},
+        )
+    traces = sorted(
+        DorisStorage.get_traces(project, run_id=run_id, trace_type="verifiers"),
+        key=lambda item: item["external_id"],
+    )
+    updates = []
+    for trace, ending in zip(traces, endings, strict=True):
+        dimensions = {"rollout_step": 1, "episode_ending": ending}
+        measures = {"task_reward": 1.0}
+        updates.append(TraceFactUpdate(
+            trace_type=trace["trace_type"],
+            external_id=trace["external_id"],
+            namespace="verifiers.trace",
+            calculator_version="test.v1",
+            projection_id=projection_id({
+                "namespace": "verifiers.trace",
+                "calculator_version": "test.v1",
+                "dimensions": dimensions,
+                "measures": measures,
+                "reward_components": [],
+                "provenance": {},
+                "state": "complete",
+            }),
+            dimensions=dimensions,
+            measures=measures,
+            replace_reward_components=True,
+        ))
+    DorisStorage.upsert_trace_facts_batch(project, run, updates[:2], run_id=run_id)
+    DorisStorage.upsert_trace_facts(project, run, updates[2], run_id=run_id)
+    result = DorisStorage.aggregate_trace_facts(project, run, TraceFactsQuery(
+        trace_type=traces[0]["trace_type"],
+        group_by=("episode_ending",),
+        aggregates=(TraceAggregate("task_reward", "sum"),),
+    ), run_id=run_id)
+    assert {bucket.dimensions["episode_ending"]: bucket.trace_count for bucket in result.buckets} == {
+        "completed": 1,
+        "context_rejected": 2,
+    }
+    sql = DorisStorage.project_sql(
+        project,
+        f"select fact_episode_ending, count(*) from traces where run_id = '{run_id}' "
+        "group by fact_episode_ending order by fact_episode_ending",
+    )
+    assert sql["rows"] == [["completed", 1], ["context_rejected", 2]]
+
+
 def test_payload_timing_aggregates_on_real_doris():
     project = "trackio-payload-aggregate-qualification"
     run = "payload-timing"

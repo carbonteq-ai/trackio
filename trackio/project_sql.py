@@ -42,6 +42,7 @@ FACT_COLUMNS = (
     "fact_task_type",
     "fact_task_id",
     "fact_prompt_group_id",
+    "fact_episode_ending",
     "fact_rollout_step",
     "fact_is_truncated",
     "fact_has_error",
