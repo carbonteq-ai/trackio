@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev31`.
+working candidate is `0.31.5.post14.dev32`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -22,9 +22,55 @@ retains the fork's storage, trace, and query behavior.
 
 ## Current extension
 
-`0.31.5.post14.dev31` is an unreleased candidate. It retains dev30's behavior
-and makes remote delivery reliable for long training runs; only clients need
-upgrading, and no schema change is required.
+`0.31.5.post14.dev32` is an unreleased candidate built on dev31 (tag
+`carbonteq-v0.31.5.post14.dev31`). It adds two changes:
+
+- `episode_ending` is a trace-fact dimension. A producer may label how each
+  episode ended with bounded text (at most 128 characters; Posttrain uses
+  labels such as `completed`, `turn_limit`, `reply_token_limit` and
+  `context_rejected`, but Trackio does not interpret them). Both engines store
+  it in the nullable column `fact_episode_ending`, written by the single and
+  batch fact upserts, grouped and filtered by `TraceFactsQuery` and
+  `TracePayloadQuery`, and exposed by `project_sql` in the logical `traces`
+  table. SQLite and Turso add the column on open. Doris moves to schema
+  version 5 with one explicit, backup-gated step,
+  `trackio storage migrate-doris --to 5`, whose only statement is
+  `ALTER TABLE traces ADD COLUMN fact_episode_ending VARCHAR(128) NULL`
+  (skipped when the column already exists). A dev32 server refuses a v4
+  database, and a dev31-or-older server refuses a v5 database at startup, so
+  migrate and switch the server in one maintenance step. Existing facts keep a
+  null ending until the producer re-projects them; native traces are not
+  rewritten. Regression tests:
+  `tests/unit/test_trace.py::test_episode_ending_is_a_materialized_fact_dimension`,
+  `tests/unit/test_trace.py::test_episode_ending_dimension_must_be_bounded_text`,
+  `tests/unit/test_doris_schema.py::test_version_five_adds_the_episode_ending_fact_column`,
+  `tests/unit/test_doris_schema.py::test_version_five_migration_skips_an_existing_column_and_records_the_version`,
+  and, against an isolated Doris database,
+  `tests/integration/test_doris_storage.py::test_episode_ending_fact_dimension_on_real_doris`.
+- Artifact version commits keep retrying while the server is slow. The commit
+  is keyed by manifest digest, so repeating it returns the committed version.
+  The client used to give up after four 60-second attempts, and a 150-update
+  training run failed at the end although the server had committed every
+  artifact. The commit now has a 300-second read window (also when the
+  endpoint name carries its leading slash), retries transient failures with
+  growing waits until a 30-minute deadline, reports retries at a bounded rate,
+  and counts them as progress so the artifact flush does not time out
+  meanwhile. The delta is in `trackio/remote_client.py` and `trackio/run.py`;
+  the regression tests are in `tests/unit/test_remote_delivery.py`.
+
+Both the server (schema, fact writes, queries) and producing clients (the
+dimension name is validated client-side, and the artifact-commit retry is a
+client change) must be upgraded to use `episode_ending`.
+
+`0.31.5.post14.dev31` is a published prerelease candidate tagged
+`carbonteq-v0.31.5.post14.dev31` at immutable fork commit
+`6f292fe247eed46e6c8d0a5507205b6b9d830d97`. Its retained wheel is SHA-256
+`4980ee67e56788c3a0755df2fe2eaacce8a95884b46a82403b0161990fa082d1` and sdist is
+SHA-256 `7ce09dc7b5cbc956ad005cc31501307a9d3732459ff6c7f50d3f4f1402bb5121`;
+both were published unchanged to `carbonteq/dev` by Posttrain workflow
+`36293308911`. It retains dev30's behavior and makes remote delivery reliable
+for long training runs; only clients need upgrading, and no schema change is
+required.
 
 - Logs (metrics and traces) go to `/bulk_log` in requests of at most 8 MB
   (`LOG_DELIVERY_MAX_BYTES`), both when sent live and when the local buffer is
@@ -761,6 +807,7 @@ added later without changing the Trackio SDK contract.
 | `0.31.5.post14.dev29` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev30` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev31` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
+| `0.31.5.post14.dev32` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 
 `0.31.5.post4` adds project-scoped bulk read APIs so a client can describe every
 run without one configuration request and one history request per run:
