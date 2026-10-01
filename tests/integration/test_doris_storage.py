@@ -320,6 +320,98 @@ def test_episode_ending_fact_dimension_on_real_doris():
     assert sql["rows"] == [["completed", 1], ["context_rejected", 2]]
 
 
+def test_environment_metrics_on_real_doris():
+    project = "trackio-environment-metrics-qualification"
+    run = "environment-metrics"
+    run_id = f"environment-metrics-{time.time_ns()}"
+    for index in range(3):
+        DorisStorage.bulk_log(
+            project=project,
+            run=run,
+            run_id=run_id,
+            metrics_list=[{
+                "rollout": VerifiersTrace({
+                    "id": f"metrics-trace-{index}",
+                    "version": 2,
+                    "nodes": [{"message": {"role": "user", "content": f"sample {index}"}}],
+                    "rewards": {"task": float(index)},
+                })._to_dict(project=project, run=run, step=index)
+            }],
+            steps=[index],
+            timestamps=[f"2026-10-01T00:00:0{index}+00:00"],
+            log_ids=[f"{run_id}-{index}"],
+            config={"qualification": "environment-metrics"},
+        )
+    traces = sorted(
+        DorisStorage.get_traces(project, run_id=run_id, trace_type="verifiers"),
+        key=lambda item: item["external_id"],
+    )
+
+    def update(trace, metrics, version="test.v1"):
+        dimensions = {"rollout_step": 1}
+        measures = {"task_reward": 1.0}
+        payload = {
+            "namespace": "verifiers.trace",
+            "calculator_version": version,
+            "dimensions": dimensions,
+            "measures": measures,
+            "reward_components": [],
+            "provenance": {},
+            "state": "complete",
+        }
+        if metrics:
+            payload["environment_metrics"] = dict(sorted(metrics.items()))
+        return TraceFactUpdate(
+            trace_type=trace["trace_type"],
+            external_id=trace["external_id"],
+            namespace="verifiers.trace",
+            calculator_version=version,
+            projection_id=projection_id(payload),
+            dimensions=dimensions,
+            measures=measures,
+            replace_reward_components=True,
+            environment_metrics=metrics,
+        )
+
+    first = [
+        update(traces[0], {"tool_mistakes": 3, "tool_unknown_id": 1}),
+        update(traces[1], {"tool_mistakes": 0}),
+    ]
+    DorisStorage.upsert_trace_facts_batch(project, run, first, run_id=run_id)
+    receipt = DorisStorage.upsert_trace_facts(project, run, update(traces[2], {"tool_mistakes": 2}), run_id=run_id)
+    assert receipt.applied
+    rewrite = DorisStorage.upsert_trace_facts_batch(project, run, first, run_id=run_id)
+    assert [item.applied for item in rewrite] == [False, False]
+
+    sql = (
+        "select m.external_id, m.name, m.value from trace_environment_metrics m "
+        f"where m.run_id = '{run_id}' order by m.external_id, m.name"
+    )
+    assert DorisStorage.project_sql(project, sql)["rows"] == [
+        ["metrics-trace-0", "tool_mistakes", 3.0],
+        ["metrics-trace-0", "tool_unknown_id", 1.0],
+        ["metrics-trace-1", "tool_mistakes", 0.0],
+        ["metrics-trace-2", "tool_mistakes", 2.0],
+    ]
+
+    # A new projection replaces a trace's metrics: through the single-row path here, dropping them.
+    DorisStorage.upsert_trace_facts(project, run, update(traces[0], {"tool_mistakes": 1}, "test.v2"), run_id=run_id)
+    DorisStorage.upsert_trace_facts(project, run, update(traces[1], {}, "test.v2"), run_id=run_id)
+    joined = DorisStorage.project_sql(
+        project,
+        "select t.external_id, avg(m.value) from traces t left join trace_environment_metrics m "
+        "on m.run_id = t.run_id and m.trace_type = t.trace_type and m.external_id = t.external_id "
+        f"where t.run_id = '{run_id}' group by t.external_id order by t.external_id",
+    )
+    assert joined["rows"] == [["metrics-trace-0", 1.0], ["metrics-trace-1", None], ["metrics-trace-2", 2.0]]
+
+    # Deleting the run removes the per-trace metric rows and reward-component rows with it.
+    assert DorisStorage.delete_run(project, run, run_id=run_id)
+    assert DorisStorage.project_sql(project, f"select count(*) from trace_environment_metrics where run_id = '{run_id}'")[
+        "rows"
+    ] == [[0]]
+
+
 def test_payload_timing_aggregates_on_real_doris():
     project = "trackio-payload-aggregate-qualification"
     run = "payload-timing"

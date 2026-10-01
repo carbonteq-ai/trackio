@@ -60,7 +60,11 @@ retains the fork's storage, trace, and query behavior.
   `tests/unit/test_trace.py::test_project_sql_scopes_environment_metrics_to_the_project_on_doris`,
   `tests/unit/test_doris_schema.py::test_version_six_adds_the_trace_environment_metrics_table`,
   `tests/unit/test_doris_schema.py::test_version_five_migration_skips_an_existing_column_and_records_the_version`,
-  and `tests/unit/test_run_notes.py::test_doris_run_deletion_removes_per_trace_reward_components_and_environment_metrics`.
+  `tests/unit/test_run_notes.py::test_doris_run_deletion_removes_per_trace_reward_components_and_environment_metrics`,
+  and, against an isolated Doris database (2026-10-02, the database dropped
+  afterwards), `tests/integration/test_doris_storage.py::test_environment_metrics_on_real_doris`
+  plus the real version 5 to 6 migration, which applied its single statement and
+  recorded version 6.
 
 ### dev32 (published)
 
