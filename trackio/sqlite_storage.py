@@ -651,6 +651,19 @@ class SQLiteStorage:
                     )
                     """
                 )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS trace_environment_metrics (
+                        trace_id TEXT NOT NULL,
+                        run_id TEXT NOT NULL,
+                        projection_id TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        value REAL,
+                        PRIMARY KEY(trace_id, projection_id, name),
+                        FOREIGN KEY(trace_id) REFERENCES traces(id) ON DELETE CASCADE
+                    )
+                    """
+                )
 
                 cursor.execute(
                     """
@@ -893,6 +906,10 @@ class SQLiteStorage:
                 cursor.execute(
                     """CREATE INDEX IF NOT EXISTS idx_trace_reward_components_current
                     ON trace_reward_components(trace_id, projection_id)"""
+                )
+                cursor.execute(
+                    """CREATE INDEX IF NOT EXISTS idx_trace_environment_metrics_run
+                    ON trace_environment_metrics(run_id, name)"""
                 )
                 alerts_cols = SQLiteStorage._table_columns(conn, "alerts")
                 alerts_run_key = "run_id" if "run_id" in alerts_cols else "run_name"
@@ -3258,6 +3275,17 @@ class SQLiteStorage:
                 for item in update.reward_components
             ],
         )
+        cursor.execute(
+            "DELETE FROM trace_environment_metrics WHERE trace_id = ?", (trace_id,)
+        )
+        cursor.executemany(
+            """INSERT INTO trace_environment_metrics
+               (trace_id, run_id, projection_id, name, value) VALUES (?, ?, ?, ?, ?)""",
+            [
+                (trace_id, row["run_id"], update.projection_id, name, value)
+                for name, value in update.environment_metrics.items()
+            ],
+        )
         return True
 
     @staticmethod
@@ -3338,7 +3366,9 @@ class SQLiteStorage:
                     trace_ids[(update.trace_type, update.external_id)],
                     update.projection_id,
                     SQLiteStorage._upsert_trace_facts_cursor(
-                        cursor, trace_ids[(update.trace_type, update.external_id)], update
+                        cursor,
+                        trace_ids[(update.trace_type, update.external_id)],
+                        update,
                     ),
                 )
                 for update in updates
@@ -3402,7 +3432,8 @@ class SQLiteStorage:
                     else f"traces.fact_{item.measure}"
                 )
                 expression = (
-                    f"SUM({field} * {field})" if item.operation == "sum_squares"
+                    f"SUM({field} * {field})"
+                    if item.operation == "sum_squares"
                     else f"{ {'mean': 'AVG', 'sum': 'SUM', 'count': 'COUNT', 'min': 'MIN', 'max': 'MAX'}[item.operation] }({field})"
                 )
                 select += [
@@ -3457,7 +3488,13 @@ class SQLiteStorage:
         }
         if any(name not in columns for name in (*query.group_by, *query.dimensions)):
             raise ValueError("requested dimension is not materialized for aggregation")
-        operations = {"mean": "AVG", "sum": "SUM", "count": "COUNT", "min": "MIN", "max": "MAX"}
+        operations = {
+            "mean": "AVG",
+            "sum": "SUM",
+            "count": "COUNT",
+            "min": "MIN",
+            "max": "MAX",
+        }
         db_path = SQLiteStorage.get_project_db_path(project)
         if not db_path.exists():
             return TraceAggregateResult(())
@@ -5613,7 +5650,9 @@ class SQLiteStorage:
             except sqlite3.OperationalError:
                 pass
             try:
-                cursor.execute("SELECT EXISTS(SELECT 1 FROM pending_trace_facts LIMIT 1)")
+                cursor.execute(
+                    "SELECT EXISTS(SELECT 1 FROM pending_trace_facts LIMIT 1)"
+                )
                 if cursor.fetchone()[0]:
                     return True
             except sqlite3.OperationalError:

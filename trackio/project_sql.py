@@ -9,6 +9,11 @@ on both engines:
 - ``traces(run_id, run_name, step, timestamp, trace_type, external_id,
   metadata, fact_*)``: trace facts are columns.
 - ``run_notes(...)``: every revision of every note.
+- ``trace_environment_metrics(run_id, trace_type, external_id, name, value)``: the
+  environment's own numeric per-episode diagnostics (an agent benchmark's tool
+  mistakes, for example), one row per trace and metric name, for each trace's
+  current fact projection only. Join to ``traces`` on ``run_id``, ``trace_type``
+  and ``external_id``.
 
 The statement must be one query (``SELECT``, optionally with ``WITH``) whose
 table references are these names or its own CTEs, never qualified names or
@@ -89,6 +94,11 @@ LOGICAL_TABLES: dict[str, tuple[str, tuple[str, ...]]] = {
         ),
     ),
 }
+ENVIRONMENT_METRIC_COLUMNS = ("run_id", "trace_type", "external_id", "name", "value")
+LOGICAL_TABLES["trace_environment_metrics"] = (
+    "trace_environment_metrics",
+    ENVIRONMENT_METRIC_COLUMNS,
+)
 DEFAULT_MAX_ROWS = 10_000
 DEFAULT_TIMEOUT_SECONDS = 10.0
 MAX_TIMEOUT_SECONDS = 120.0
@@ -166,7 +176,40 @@ def prepare(sql: str, *, engine: str, project: str, database: str | None = None)
     return statement.sql(dialect="doris" if engine == "doris" else "sqlite")
 
 
+def _environment_metrics_scope(
+    *, engine: str, project: str, database: str | None
+) -> exp.CTE:
+    """The metrics of each trace's current projection, with the trace's public identity."""
+
+    literal = exp.Literal.string(project).sql(dialect="doris")
+    if engine == "doris":
+        if not database:
+            raise ProjectSqlError("Doris queries need the database name")
+        quoted = "`" + database.replace("`", "``") + "`"
+        source = (
+            f"SELECT m.run_id AS run_id, t.trace_type AS trace_type, t.external_id AS external_id, "
+            f"m.name AS name, m.value AS value FROM {quoted}.trace_environment_metrics AS m "
+            f"JOIN {quoted}.traces AS t ON t.project_id = m.project_id AND t.trace_id = m.trace_id "
+            f"AND t.fact_projection_id = m.projection_id WHERE m.project_id = {literal}"
+        )
+    else:
+        source = (
+            "SELECT m.run_id AS run_id, t.trace_type AS trace_type, t.external_id AS external_id, "
+            "m.name AS name, m.value AS value FROM main.trace_environment_metrics AS m "
+            "JOIN main.traces AS t ON t.id = m.trace_id AND t.fact_projection_id = m.projection_id"
+        )
+    select = sqlglot.parse_one(source, read="doris" if engine == "doris" else "sqlite")
+    return exp.CTE(
+        this=select,
+        alias=exp.TableAlias(this=exp.to_identifier("trace_environment_metrics")),
+    )
+
+
 def _scope(name: str, *, engine: str, project: str, database: str | None) -> exp.CTE:
+    if name == "trace_environment_metrics":
+        return _environment_metrics_scope(
+            engine=engine, project=project, database=database
+        )
     base, columns = LOGICAL_TABLES[name]
     select = exp.select(*(exp.column(column) for column in columns))
     if engine == "doris":

@@ -147,6 +147,10 @@ class TraceFactUpdate:
     state: FactState = "complete"
     replace_reward_components: bool = False
     calculated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    # The environment's own numeric per-episode diagnostics (for example an agent benchmark's
+    # tool-mistake counts). The environment chooses the names and their meaning; Trackio stores
+    # one row per trace and name and never interprets them. Only a source projection supplies them.
+    environment_metrics: Mapping[str, int | float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _text(self.trace_type, "trace type", maximum=64)
@@ -182,6 +186,11 @@ class TraceFactUpdate:
             for component in self.reward_components
         ):
             raise ValueError("reward components must be TraceRewardComponent values")
+        for name, value in self.environment_metrics.items():
+            _text(name, "environment metric name", maximum=256)
+            if value is None:
+                raise ValueError(f"environment metric {name!r} must be a finite number")
+            _number(value, f"environment metric {name!r}")
         if self.replace_reward_components:
             if self.namespace != "verifiers.trace":
                 raise ValueError(
@@ -190,6 +199,7 @@ class TraceFactUpdate:
         elif (
             self.reward_components
             or self.dimensions
+            or self.environment_metrics
             or set(self.measures) != {"algorithm_reward"}
         ):
             raise ValueError("a trace-fact enrichment may only supply algorithm_reward")
@@ -199,6 +209,17 @@ class TraceFactUpdate:
                 "calculator_version": self.calculator_version,
                 "dimensions": dict(sorted(self.dimensions.items())),
                 "measures": dict(sorted(self.measures.items())),
+                # Present only when supplied, so projections without environment metrics keep
+                # the identity they had before the field existed.
+                **(
+                    {
+                        "environment_metrics": dict(
+                            sorted(self.environment_metrics.items())
+                        )
+                    }
+                    if self.environment_metrics
+                    else {}
+                ),
                 "reward_components": [
                     {
                         "name": component.name,
@@ -229,6 +250,11 @@ class TraceFactUpdate:
             tuple(sorted(self.reward_components, key=lambda item: item.name)),
         )
         object.__setattr__(self, "provenance", MappingProxyType(dict(self.provenance)))
+        object.__setattr__(
+            self,
+            "environment_metrics",
+            MappingProxyType(dict(sorted(self.environment_metrics.items()))),
+        )
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> TraceFactUpdate:
@@ -250,6 +276,7 @@ class TraceFactUpdate:
             provenance=payload.get("provenance", {}),  # type: ignore[arg-type]
             state=payload.get("state", "complete"),  # type: ignore[arg-type]
             replace_reward_components=payload.get("replace_reward_components", False),  # type: ignore[arg-type]
+            environment_metrics=payload.get("environment_metrics", {}),  # type: ignore[arg-type]
             calculated_at=(
                 datetime.fromisoformat(calculated_at)
                 if isinstance(calculated_at, str)
@@ -280,6 +307,7 @@ class TraceFactUpdate:
             "provenance": dict(self.provenance),
             "state": self.state,
             "replace_reward_components": self.replace_reward_components,
+            "environment_metrics": dict(self.environment_metrics),
             "calculated_at": self.calculated_at.isoformat(),
         }
 

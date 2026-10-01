@@ -85,7 +85,7 @@ def test_version_four_adds_the_revisioned_run_notes_table():
 
 
 def test_version_five_adds_the_episode_ending_fact_column():
-    assert SCHEMA_VERSION == 5
+    assert SCHEMA_VERSION >= 5
     assert migration_statements(4, 5) == (
         "ALTER TABLE traces ADD COLUMN fact_episode_ending VARCHAR(128) NULL",
     )
@@ -154,9 +154,10 @@ def test_version_five_migration_skips_an_existing_column_and_records_the_version
             "_connection",
             staticmethod(lambda initialize=True, cursor=cursor: _Connection(cursor)),
         )
-        result = doris_schema_migration.apply(5, receipt)
-        assert result["current_version"] == 4 and result["target_version"] == 5
+        result = doris_schema_migration.apply(SCHEMA_VERSION, receipt)
+        assert result["current_version"] == 4 and result["target_version"] == SCHEMA_VERSION
         assert any(query.startswith("ALTER TABLE traces ADD COLUMN fact_episode_ending") for query in cursor.executed) is altered
+        assert any("CREATE TABLE IF NOT EXISTS trace_environment_metrics" in query for query in cursor.executed)
         assert any(query.lstrip().startswith("INSERT INTO schema_versions") for query in cursor.executed)
 
 
@@ -288,3 +289,23 @@ def test_empty_database_records_version_only_after_all_tables(monkeypatch):
     ]
     assert len(table_writes) == len(MANAGED_TABLES)
     assert version_write > max(table_writes)
+
+
+def test_version_six_adds_the_trace_environment_metrics_table():
+    assert SCHEMA_VERSION == 6
+    assert "trace_environment_metrics" in MANAGED_TABLES
+    (statement,) = migration_statements(5, 6)
+    normalized = " ".join(statement.split())
+
+    assert "CREATE TABLE IF NOT EXISTS trace_environment_metrics" in normalized
+    assert "UNIQUE KEY(project_id, trace_id, projection_id, name)" in normalized
+    assert "value DOUBLE NULL" in normalized
+    assert "idx_trace_environment_metrics_run_id(run_id) USING INVERTED" in normalized
+    # A fresh install creates the same table, and a multi-version upgrade includes this step.
+    assert any(
+        "CREATE TABLE IF NOT EXISTS trace_environment_metrics" in item
+        for item in schema_statements()
+    )
+    assert any(
+        "trace_environment_metrics" in item for item in migration_statements(4, 6)
+    )

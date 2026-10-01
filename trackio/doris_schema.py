@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 MANAGED_TABLES = (
     "schema_versions",
     "metrics",
@@ -10,6 +10,7 @@ MANAGED_TABLES = (
     "system_metrics",
     "traces",
     "trace_reward_components",
+    "trace_environment_metrics",
     "alerts",
     "project_metadata",
     "artifacts",
@@ -111,7 +112,26 @@ def _run_notes_table(properties: str) -> str:
     """
 
 
-def migration_statements(from_version: int, to_version: int, replication_num: int = 1) -> tuple[str, ...]:
+def _environment_metrics_table(properties: str) -> str:
+    return f"""
+        CREATE TABLE IF NOT EXISTS trace_environment_metrics (
+            project_id VARCHAR(255) NOT NULL,
+            trace_id VARCHAR(768) NOT NULL,
+            projection_id VARCHAR(64) NOT NULL,
+            name VARCHAR(256) NOT NULL,
+            run_id VARCHAR(255) NOT NULL,
+            value DOUBLE NULL,
+            INDEX idx_trace_environment_metrics_run_id(run_id) USING INVERTED
+        )
+        UNIQUE KEY(project_id, trace_id, projection_id, name)
+        DISTRIBUTED BY HASH(project_id, trace_id) BUCKETS 1
+        {properties}
+    """
+
+
+def migration_statements(
+    from_version: int, to_version: int, replication_num: int = 1
+) -> tuple[str, ...]:
     """Return the explicit supported Doris database transition.
 
     Startup deliberately refuses to apply this itself. Operators inspect and
@@ -121,7 +141,9 @@ def migration_statements(from_version: int, to_version: int, replication_num: in
     """
 
     if not 1 <= from_version < to_version <= SCHEMA_VERSION:
-        raise ValueError(f"unsupported Trackio Doris migration {from_version} -> {to_version}")
+        raise ValueError(
+            f"unsupported Trackio Doris migration {from_version} -> {to_version}"
+        )
     if to_version - from_version > 1:
         return tuple(
             statement
@@ -129,6 +151,8 @@ def migration_statements(from_version: int, to_version: int, replication_num: in
             for statement in migration_statements(version, version + 1, replication_num)
         )
     properties = f'PROPERTIES ("replication_num" = "{replication_num}")'
+    if (from_version, to_version) == (5, 6):
+        return (_environment_metrics_table(properties),)
     if (from_version, to_version) == (4, 5):
         return ("ALTER TABLE traces ADD COLUMN fact_episode_ending VARCHAR(128) NULL",)
     if (from_version, to_version) == (3, 4):
@@ -288,6 +312,7 @@ def schema_statements(replication_num: int = 1) -> tuple[str, ...]:
         DISTRIBUTED BY HASH(project_id, trace_id) BUCKETS 1
         {properties}
         """,
+        _environment_metrics_table(properties),
         f"""
         CREATE TABLE IF NOT EXISTS alerts (
             project_id VARCHAR(255) NOT NULL,

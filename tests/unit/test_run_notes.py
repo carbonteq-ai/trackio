@@ -511,6 +511,8 @@ _DORIS_TABLES = {
     "configs": "project_id, run_id, run_name, config, created_at",
     "system_metrics": "project_id, event_id, run_id, timestamp, run_name, metrics",
     "traces": "project_id, trace_id, run_id, timestamp, run_name",
+    "trace_reward_components": "project_id, trace_id, run_id, projection_id, name",
+    "trace_environment_metrics": "project_id, trace_id, run_id, projection_id, name, value",
     "alerts": "project_id, event_id, run_id, timestamp, run_name",
     "artifacts": "project_id, artifact_id, name",
     "artifact_versions": (
@@ -579,6 +581,7 @@ def doris(monkeypatch):
             (project, f"{run_id}-0", run_id, "2026-09-01T00:00:00", run_name, 0, "{}"),
         )
 
+    log_run.connection = connection
     yield log_run
     connection.close()
 
@@ -646,3 +649,22 @@ def test_doris_run_lifecycle_updates_and_removes_notes(doris):
     assert remaining[renamed["note_id"]]["run_name"] == "train-renamed"
     assert DorisStorage.get_run_note_history("proj", deleted["note_id"]) == []
     assert DorisStorage.get_run_note_history("proj", purged["note_id"]) == []
+
+
+def test_doris_run_deletion_removes_per_trace_reward_components_and_environment_metrics(doris):
+    for run_id, name in (("run-1", "keep"), ("run-2", "delete"), ("run-3", "purge")):
+        doris("proj", run_id, name)
+        for table in ("trace_reward_components", "trace_environment_metrics"):
+            doris.connection.execute(
+                f"INSERT INTO {table} (project_id, trace_id, run_id, projection_id, name) VALUES (?, ?, ?, ?, ?)",
+                ("proj", f"trace-{run_id}", run_id, "p" * 64, "metric"),
+            )
+
+    def remaining(table):
+        rows = doris.connection.execute(f"SELECT run_id FROM {table} ORDER BY run_id").fetchall()
+        return [row["run_id"] for row in rows]
+
+    assert DorisStorage.delete_run("proj", "delete", run_id="run-2")
+    DorisStorage.purge_runs("proj", ("run-3",), ())
+    for table in ("trace_reward_components", "trace_environment_metrics"):
+        assert remaining(table) == ["run-1"]

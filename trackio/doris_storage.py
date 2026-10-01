@@ -1182,6 +1182,8 @@ class DorisStorage:
                 "artifact_versions",
                 "artifacts",
                 "traces",
+                "trace_reward_components",
+                "trace_environment_metrics",
                 "alerts",
                 "run_notes",
                 "system_metrics",
@@ -1907,6 +1909,23 @@ class DorisStorage:
                     for item in update.reward_components
                 ],
             )
+        if update.environment_metrics:
+            cursor.executemany(
+                """INSERT INTO trace_environment_metrics
+                   (project_id, trace_id, run_id, projection_id, name, value)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                [
+                    (
+                        project,
+                        trace_id,
+                        row["run_id"],
+                        update.projection_id,
+                        name,
+                        value,
+                    )
+                    for name, value in update.environment_metrics.items()
+                ],
+            )
         applied = row[projection_column] != update.projection_id
         if applied:
             cursor.execute(
@@ -1947,6 +1966,11 @@ class DorisStorage:
             )
         cursor.execute(
             """DELETE FROM trace_reward_components
+               WHERE project_id = %s AND trace_id = %s AND projection_id <> %s""",
+            (project, trace_id, update.projection_id),
+        )
+        cursor.execute(
+            """DELETE FROM trace_environment_metrics
                WHERE project_id = %s AND trace_id = %s AND projection_id <> %s""",
             (project, trace_id, update.projection_id),
         )
@@ -2061,6 +2085,27 @@ class DorisStorage:
                            (project_id, trace_id, run_id, projection_id, name, contribution, score, weight, source_kind, source_id)
                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                         component_rows,
+                    )
+                metric_rows = [
+                    (
+                        project,
+                        str(
+                            traces[(update.trace_type, update.external_id)]["trace_id"]
+                        ),
+                        str(traces[(update.trace_type, update.external_id)]["run_id"]),
+                        update.projection_id,
+                        name,
+                        value,
+                    )
+                    for update in fresh
+                    for name, value in update.environment_metrics.items()
+                ]
+                if metric_rows:
+                    cursor.executemany(
+                        """INSERT INTO trace_environment_metrics
+                           (project_id, trace_id, run_id, projection_id, name, value)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        metric_rows,
                     )
                 columns = (
                     ("fact_namespace", lambda update: update.namespace),
@@ -2714,6 +2759,8 @@ class DorisStorage:
                 "configs",
                 "system_metrics",
                 "traces",
+                "trace_reward_components",
+                "trace_environment_metrics",
                 "alerts",
                 "run_notes",
                 "run_artifact_links",
@@ -3249,6 +3296,8 @@ class DorisStorage:
                     "configs",
                     "system_metrics",
                     "traces",
+                    "trace_reward_components",
+                    "trace_environment_metrics",
                     "alerts",
                     "run_notes",
                     "run_artifact_links",

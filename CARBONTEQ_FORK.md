@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev32`.
+working candidate is `0.31.5.post14.dev33`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -22,7 +22,49 @@ retains the fork's storage, trace, and query behavior.
 
 ## Current extension
 
-`0.31.5.post14.dev32` is an unreleased candidate built on dev31 (tag
+`0.31.5.post14.dev33` is an unreleased candidate built on dev32 (tag
+`carbonteq-v0.31.5.post14.dev32`, published). It adds one change:
+
+- **Environment metrics.** A source projection (`verifiers.trace`) may supply
+  `environment_metrics`: the environment's own numeric per-episode diagnostics
+  (an agent benchmark's tool mistakes, empty results, unknown ids, and so on).
+  The environment chooses the names (at most 256 characters) and their meaning;
+  Trackio stores finite numbers and never interprets them. Both engines keep
+  one row per trace, projection and name in the new table
+  `trace_environment_metrics(project_id, trace_id, projection_id, name, run_id,
+  value)` (SQLite: `trace_id, run_id, projection_id, name, value`, cascading
+  with the trace). The single and batch fact upserts write it, a newer
+  projection replaces a trace's rows, and `delete_run`, `purge_runs` and
+  `delete_project` remove them. The metrics enter the projection identity only
+  when supplied, so projections without them keep the ids they already have; an
+  enrichment (algorithm) update may not supply them. `project_sql` exposes the
+  logical table `trace_environment_metrics(run_id, trace_type, external_id,
+  name, value)`, which shows only each trace's current projection and joins to
+  `traces` on `run_id`, `trace_type` and `external_id`. Doris moves to schema
+  version 6 with one explicit, backup-gated step,
+  `trackio storage migrate-doris --to 6`, whose only statement is
+  `CREATE TABLE IF NOT EXISTS trace_environment_metrics` (unique key on
+  project, trace, projection and name; inverted index on `run_id`). A dev33
+  server refuses a v5 database, and a dev32-or-older server refuses a v6
+  database at startup, so migrate and switch the server in one maintenance step.
+  SQLite and Turso create the table on open. Existing facts have no metrics
+  until the producer re-projects them. The same change closes a leak: Doris
+  `delete_run`, `purge_runs` and `delete_project` never removed
+  `trace_reward_components` rows, so deleted runs left orphaned component rows;
+  they now remove those too. Regression tests:
+  `tests/unit/test_trace.py::test_environment_metrics_are_stored_per_trace_and_replaced_by_a_new_projection`,
+  `tests/unit/test_trace.py::test_projections_without_environment_metrics_keep_their_identity`,
+  `tests/unit/test_trace.py::test_environment_metrics_round_trip_through_the_server_payload`,
+  `tests/unit/test_trace.py::test_environment_metrics_must_be_finite_numbers_with_bounded_names`,
+  `tests/unit/test_trace.py::test_an_enrichment_cannot_supply_environment_metrics`,
+  `tests/unit/test_trace.py::test_project_sql_scopes_environment_metrics_to_the_project_on_doris`,
+  `tests/unit/test_doris_schema.py::test_version_six_adds_the_trace_environment_metrics_table`,
+  `tests/unit/test_doris_schema.py::test_version_five_migration_skips_an_existing_column_and_records_the_version`,
+  and `tests/unit/test_run_notes.py::test_doris_run_deletion_removes_per_trace_reward_components_and_environment_metrics`.
+
+### dev32 (published)
+
+`0.31.5.post14.dev32` is built on dev31 (tag
 `carbonteq-v0.31.5.post14.dev31`). It adds two changes:
 
 - `episode_ending` is a trace-fact dimension. A producer may label how each
@@ -808,6 +850,7 @@ added later without changing the Trackio SDK contract.
 | `0.31.5.post14.dev30` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev31` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev32` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
+| `0.31.5.post14.dev33` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 
 `0.31.5.post4` adds project-scoped bulk read APIs so a client can describe every
 run without one configuration request and one history request per run:

@@ -939,3 +939,147 @@ def test_verifiers_trace_export_import_roundtrip(temp_dir):
 
     after = SQLiteStorage.get_traces("proj", "trace-run")
     assert after == before
+
+
+def _metrics_update(trace_id, metrics, *, version="test.v1", rewards=0.5):
+    dimensions = {"rollout_step": 1}
+    measures = {"task_reward": rewards}
+    payload = {
+        "namespace": "verifiers.trace",
+        "calculator_version": version,
+        "dimensions": dimensions,
+        "measures": measures,
+        "reward_components": [],
+        "provenance": {},
+        "state": "complete",
+    }
+    if metrics:
+        payload["environment_metrics"] = dict(sorted(metrics.items()))
+    return TraceFactUpdate(
+        trace_type="verifiers",
+        external_id=trace_id,
+        namespace="verifiers.trace",
+        calculator_version=version,
+        projection_id=projection_id(payload),
+        dimensions=dimensions,
+        measures=measures,
+        replace_reward_components=True,
+        environment_metrics=metrics,
+    )
+
+
+def test_environment_metrics_are_stored_per_trace_and_replaced_by_a_new_projection(
+    temp_dir,
+):
+    run = Run(
+        url=None, project="proj", client=None, name="env-metrics-run", space_id=None
+    )
+    for index in range(2):
+        run.log({"rollout": VerifiersTrace(verifiers_record(f"env-trace-{index}"))})
+    run._flush_queues_inline()
+    first = _metrics_update("env-trace-0", {"tool_mistakes": 3.0, "tool_unknown_id": 1})
+    run.upsert_trace_facts(first)
+    run.upsert_trace_facts(_metrics_update("env-trace-1", {"tool_mistakes": 0}))
+    # Writing the same projection again changes nothing.
+    assert run.upsert_trace_facts(first).applied is False
+
+    # The logical table shows only each trace's current metrics, keyed by the trace's public identity.
+    sql = (
+        "select m.external_id, m.name, m.value from trace_environment_metrics m "
+        "order by m.external_id, m.name"
+    )
+    assert SQLiteStorage.project_sql("proj", sql)["rows"] == [
+        ["env-trace-0", "tool_mistakes", 3.0],
+        ["env-trace-0", "tool_unknown_id", 1.0],
+        ["env-trace-1", "tool_mistakes", 0.0],
+    ]
+
+    # A new source projection replaces the trace's metrics, including by dropping them.
+    run.upsert_trace_facts(
+        _metrics_update("env-trace-0", {"tool_mistakes": 1.0}, version="test.v2")
+    )
+    run.upsert_trace_facts(_metrics_update("env-trace-1", {}, version="test.v2"))
+    assert SQLiteStorage.project_sql("proj", sql)["rows"] == [
+        ["env-trace-0", "tool_mistakes", 1.0]
+    ]
+    joined = SQLiteStorage.project_sql(
+        "proj",
+        "select t.external_id, avg(m.value) from traces t left join trace_environment_metrics m "
+        "on m.run_id = t.run_id and m.trace_type = t.trace_type and m.external_id = t.external_id "
+        "group by t.external_id order by t.external_id",
+    )
+    assert joined["rows"] == [["env-trace-0", 1.0], ["env-trace-1", None]]
+
+
+def test_projections_without_environment_metrics_keep_their_identity():
+    # The metrics enter the identity only when supplied, so facts projected before the field
+    # existed keep their stored projection ids.
+    plain = _metrics_update("t", {})
+    assert plain.projection_id == _projection_id(
+        "verifiers.trace", "test.v1", {"rollout_step": 1}, {"task_reward": 0.5}
+    )
+    assert (
+        _metrics_update("t", {"tool_mistakes": 1}).projection_id != plain.projection_id
+    )
+
+
+def test_environment_metrics_round_trip_through_the_server_payload():
+    update = _metrics_update("t", {"b": 2, "a": 1.5})
+    again = TraceFactUpdate.from_payload(update.payload())
+    assert dict(again.environment_metrics) == {"a": 1.5, "b": 2}
+    assert again.projection_id == update.projection_id
+
+
+@pytest.mark.parametrize(
+    ("metrics", "message"),
+    [
+        ({"": 1}, "environment metric name"),
+        ({"x" * 257: 1}, "environment metric name"),
+        ({"m": float("nan")}, "environment metric"),
+        ({"m": float("inf")}, "environment metric"),
+        ({"m": True}, "environment metric"),
+        ({"m": None}, "environment metric"),
+        ({"m": "3"}, "environment metric"),
+    ],
+)
+def test_environment_metrics_must_be_finite_numbers_with_bounded_names(
+    metrics, message
+):
+    with pytest.raises(ValueError, match=message):
+        TraceFactUpdate(
+            trace_type="verifiers",
+            external_id="t",
+            namespace="verifiers.trace",
+            calculator_version="test.v1",
+            projection_id="0" * 64,
+            replace_reward_components=True,
+            environment_metrics=metrics,
+        )
+
+
+def test_an_enrichment_cannot_supply_environment_metrics():
+    with pytest.raises(ValueError, match="only supply algorithm_reward"):
+        TraceFactUpdate(
+            trace_type="verifiers",
+            external_id="t",
+            namespace="algorithm.grpo",
+            calculator_version="test.v1",
+            projection_id="0" * 64,
+            measures={"algorithm_reward": 1.0},
+            environment_metrics={"tool_mistakes": 1},
+        )
+
+
+def test_project_sql_scopes_environment_metrics_to_the_project_on_doris():
+    from trackio import project_sql
+
+    prepared = project_sql.prepare(
+        "select name, avg(value) from trace_environment_metrics group by name",
+        engine="doris",
+        project="proj'x",
+        database="trackio_db",
+    )
+    assert "`trackio_db`.trace_environment_metrics" in prepared
+    assert "t.fact_projection_id = m.projection_id" in prepared
+    # The project name is escaped as a SQL literal, never concatenated raw.
+    assert "m.project_id = 'proj''x'" in prepared
