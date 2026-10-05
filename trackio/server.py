@@ -36,8 +36,13 @@ from trackio.asgi_app import (
 from trackio.exceptions import TrackioAPIError
 from trackio.media import get_project_media_path
 from trackio.purge import delete_project as _delete_project
-from trackio.purge import project_delete_plan, run_purge_summary
+from trackio.purge import (
+    project_delete_plan,
+    run_purge_summary,
+    unreferenced_artifact_purge_summary,
+)
 from trackio.purge import purge_runs as _purge_runs
+from trackio.purge import purge_unreferenced_artifacts as _purge_unreferenced_artifacts
 from trackio.storage import (
     Storage,
     StorageOperationalError,
@@ -1847,20 +1852,34 @@ def delete_run(
     return Storage.delete_run(project, run, run_id=run_id)
 
 
-def get_run_purge_plan(
-    request: Request,
-    project: str,
-    run_ids: list[str] | tuple[str, ...],
-) -> dict[str, Any]:
-    """Preview deletion of an exact set of provider run ids."""
-
-    assert_can_mutate_runs(request)
+def _exact_run_ids(run_ids: object) -> tuple[str, ...]:
     if isinstance(run_ids, str) or not isinstance(run_ids, (list, tuple)):
         raise TrackioAPIError("run_ids must be a non-empty list of exact provider ids")
     selected = tuple(str(run_id) for run_id in run_ids)
     if not selected or any(not run_id for run_id in selected):
         raise TrackioAPIError("run_ids must be a non-empty list of exact provider ids")
-    return run_purge_summary(Storage, _validate_project_name(project), selected)
+    return selected
+
+
+def get_run_purge_plan(
+    request: Request,
+    project: str,
+    run_ids: list[str] | tuple[str, ...],
+    allow_absent: bool = False,
+) -> dict[str, Any]:
+    """Preview deletion of an exact set of provider run ids.
+
+    ``allow_absent`` reports already-deleted runs in ``absent_run_ids``
+    instead of blocking, so an interrupted purge can be finished.
+    """
+
+    assert_can_mutate_runs(request)
+    return run_purge_summary(
+        Storage,
+        _validate_project_name(project),
+        _exact_run_ids(run_ids),
+        allow_absent=bool(allow_absent),
+    )
 
 
 def purge_runs(
@@ -1868,15 +1887,12 @@ def purge_runs(
     project: str,
     run_ids: list[str] | tuple[str, ...],
     plan_digest: str,
+    allow_absent: bool = False,
 ) -> dict[str, Any]:
     """Apply an exact run purge bound to its authenticated preview digest."""
 
     assert_can_mutate_runs(request)
-    if isinstance(run_ids, str) or not isinstance(run_ids, (list, tuple)):
-        raise TrackioAPIError("run_ids must be a non-empty list of exact provider ids")
-    selected = tuple(str(run_id) for run_id in run_ids)
-    if not selected or any(not run_id for run_id in selected):
-        raise TrackioAPIError("run_ids must be a non-empty list of exact provider ids")
+    selected = _exact_run_ids(run_ids)
     if not isinstance(plan_digest, str) or not plan_digest.startswith("sha256:"):
         raise TrackioAPIError("plan_digest must be a sha256 digest")
     try:
@@ -1884,6 +1900,45 @@ def purge_runs(
             Storage,
             _validate_project_name(project),
             selected,
+            plan_digest=plan_digest,
+            allow_absent=bool(allow_absent),
+        )
+    except ValueError as error:
+        raise TrackioAPIError(str(error)) from error
+
+
+def get_unreferenced_artifact_purge_plan(
+    request: Request,
+    project: str,
+    metadata: dict[str, str],
+) -> dict[str, Any]:
+    """Preview deletion of unlinked artifact versions whose metadata matches."""
+
+    assert_can_mutate_runs(request)
+    try:
+        return unreferenced_artifact_purge_summary(
+            Storage, _validate_project_name(project), metadata
+        )
+    except ValueError as error:
+        raise TrackioAPIError(str(error)) from error
+
+
+def purge_unreferenced_artifacts(
+    request: Request,
+    project: str,
+    metadata: dict[str, str],
+    plan_digest: str,
+) -> dict[str, Any]:
+    """Apply an unreferenced-artifact purge bound to its preview digest."""
+
+    assert_can_mutate_runs(request)
+    if not isinstance(plan_digest, str) or not plan_digest.startswith("sha256:"):
+        raise TrackioAPIError("plan_digest must be a sha256 digest")
+    try:
+        return _purge_unreferenced_artifacts(
+            Storage,
+            _validate_project_name(project),
+            metadata,
             plan_digest=plan_digest,
         )
     except ValueError as error:
@@ -1996,6 +2051,8 @@ def _api_registry() -> dict[str, Any]:
         "delete_run": delete_run,
         "get_run_purge_plan": get_run_purge_plan,
         "purge_runs": purge_runs,
+        "get_unreferenced_artifact_purge_plan": get_unreferenced_artifact_purge_plan,
+        "purge_unreferenced_artifacts": purge_unreferenced_artifacts,
         "get_project_delete_plan": get_project_delete_plan,
         "delete_project": delete_project,
         "rename_run": rename_run,

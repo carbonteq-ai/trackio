@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev33`.
+working candidate is `0.31.5.post14.dev34`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -19,6 +19,57 @@ Framework packages must depend on `carbonteq-trackio`, not the upstream-owned
 `trackio` distribution and not a transitive Git URL. Self-deployed Trackio
 Spaces use the same CarbonTeq distribution identity so the deployed runtime
 retains the fork's storage, trace, and query behavior.
+
+## Run purge with shared artifact versions (`0.31.5.post14.dev34`)
+
+`0.31.5.post14.dev34` is built on dev33 (tag `carbonteq-v0.31.5.post14.dev33`,
+commit `68222ffd`, the version the shared server runs since its environment
+metrics deployment). It needs no schema migration; Doris stays at schema
+version 6.
+
+- Identical artifact content logged by several runs is one shared version (the
+  version id is keyed by project, name, and manifest digest) with an output
+  link per run. The run purge preview used to mark such a version for deletion
+  because it only counted input links as dependents, and the storage apply then
+  refused it ("Trackio artifact purge set still has consumers") after it had
+  already deleted the selected run's metrics, configs, traces, and links. The
+  run disappeared, its other versions were left linked to no run, and the
+  purge could neither be repeated nor finished. Now `run_purge_summary` reads
+  every link on each version (`get_artifact_version_links` on both engines),
+  retains a version that an unselected run also produced
+  (`retained_by_run_ids`, `delete: false`, not a blocker), and blocks on an
+  unselected consumer only when no unselected producer survives.
+- Both engines validate the whole artifact deletion set (every version exists
+  and only the purged runs link it) before the first delete. Doris has no
+  multi-table transaction, so it deletes artifact versions first and the rows
+  that make a run exist (its links, then its metrics) last; an interrupted
+  purge leaves the run visible to a fresh preview.
+- `get_run_purge_plan` and `purge_runs` accept `allow_absent`. With it, a
+  selected run that no longer exists is reported in `absent_run_ids` (and the
+  receipt's `already_absent_provider_run_ids`) instead of blocking, so a caller
+  that knows it started the deletion can finish it. Without it, an absent run
+  still blocks.
+- `get_unreferenced_artifact_purge_plan(project, metadata)` and
+  `purge_unreferenced_artifacts(project, metadata, plan_digest)` preview and
+  delete artifact versions that no run links (input or output) and whose
+  producer no longer exists, selected by exact metadata values (Posttrain
+  passes its `project_id` and `run_id`). The apply is digest-bound and
+  re-checks that nothing links the versions; CAS blobs no retained manifest
+  references are deleted afterwards. The remote client exposes
+  `run_purge_plan(..., allow_absent=)`, `purge_runs(..., allow_absent=)`,
+  `unreferenced_artifact_purge_plan`, and `purge_unreferenced_artifacts`;
+  `allow_absent` is sent only when set, so ordinary previews still work against
+  older servers.
+
+Regression tests: `tests/unit/test_run_purge_shared_artifacts.py` (SQLite and
+the SQLite stand-in for Doris SQL),
+`tests/unit/test_local_server_api.py::test_remote_client_finishes_an_interrupted_purge_and_its_leftover_versions`,
+and, against an isolated Doris database,
+`tests/integration/test_doris_storage.py::test_run_purge_retains_shared_versions_and_sweeps_leftovers_on_real_doris`
+(13 passed on `trackio_candidate`, schema version 6, on 2026-10-05).
+Validate with `uv run --frozen --extra dev --extra spaces --extra gpu python -m
+pytest -q tests/unit` and, against an isolated Doris database,
+`python -m pytest -q tests/integration/test_doris_storage.py`.
 
 ## Current extension
 
@@ -855,6 +906,7 @@ added later without changing the Trackio SDK contract.
 | `0.31.5.post14.dev31` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev32` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 | `0.31.5.post14.dev33` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
+| `0.31.5.post14.dev34` | `gradio-app/trackio` | `438cb28d2c82c7b7d42431e45d5677a8cc90eb77` |
 
 `0.31.5.post4` adds project-scoped bulk read APIs so a client can describe every
 run without one configuration request and one history request per run:

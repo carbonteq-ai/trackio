@@ -555,6 +555,82 @@ def test_artifact_metadata_lineage_and_run_mutations():
     assert not DorisStorage.delete_run(project, "after", run_id=mutation_id)
 
 
+def test_run_purge_retains_shared_versions_and_sweeps_leftovers_on_real_doris():
+    from trackio.purge import (
+        purge_runs,
+        purge_unreferenced_artifacts,
+        run_purge_summary,
+        unreferenced_artifact_purge_summary,
+    )
+
+    stamp = str(time.time_ns())
+    project = f"trackio-doris-purge-shared-{stamp}"
+    first, second = f"first-{stamp}", f"second-{stamp}"
+    for index, run_id in enumerate((first, second)):
+        DorisStorage.bulk_log(
+            project=project,
+            run=f"train-{index}",
+            run_id=run_id,
+            metrics_list=[{"loss": 1.0}],
+            steps=[0],
+            timestamps=["2026-10-05T00:00:00+00:00"],
+            log_ids=[f"{run_id}-0"],
+            config={"qualification": "purge-shared"},
+        )
+
+    def commit(name, digest_seed, run_id, run_name, metadata=None):
+        return DorisStorage.commit_artifact_version(
+            project=project,
+            name=name,
+            type="training-collection",
+            description=None,
+            manifest=[{"path": "rows.json", "digest": (digest_seed * 64)[:64], "size": 4}],
+            metadata=metadata,
+            aliases=None,
+            run_name=run_name,
+            run_id=run_id,
+        )
+
+    shared = commit("collection", "c", first, "train-0")
+    assert commit("collection", "c", second, "train-1")["version_id"] == shared["version_id"]
+    commit("rollouts", "d", first, "train-0")
+
+    preview = run_purge_summary(DorisStorage, project, (first,))
+    assert preview["blockers"] == []
+    by_name = {artifact["name"]: artifact for artifact in preview["artifacts"]}
+    assert by_name["collection"]["retained_by_run_ids"] == [second]
+    assert by_name["collection"]["delete"] is False
+    assert by_name["rollouts"]["delete"] is True
+    with pytest.raises(ValueError, match="still linked to unselected run"):
+        DorisStorage.purge_runs(project, (first,), (shared["version_id"],))
+    assert {record["id"] for record in DorisStorage.get_run_records(project)} == {first, second}
+
+    purge_runs(DorisStorage, project, (first,), plan_digest=preview["digest"])
+    assert [record["id"] for record in DorisStorage.get_run_records(project)] == [second]
+    outputs = DorisStorage.get_run_artifacts(project, "train-1", run_id=second)["output"]
+    assert [item["version_id"] for item in outputs] == [shared["version_id"]]
+    assert DorisStorage.get_artifact_manifest(project, "rollouts", None) is None
+    resumed = run_purge_summary(DorisStorage, project, (first,), allow_absent=True)
+    assert resumed["blockers"] == [] and resumed["absent_run_ids"] == [first]
+
+    leftover = commit("leftover", "e", f"ghost-{stamp}", "ghost", metadata={"run_id": f"ghost-{stamp}"})
+    with DorisStorage._connection() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "DELETE FROM run_artifact_links WHERE project_id = %s AND version_id = %s",
+            (project, leftover["version_id"]),
+        )
+    selector = {"run_id": f"ghost-{stamp}"}
+    sweep = unreferenced_artifact_purge_summary(DorisStorage, project, selector)
+    assert [item["version_id"] for item in sweep["artifacts"]] == [leftover["version_id"]]
+    purge_unreferenced_artifacts(DorisStorage, project, selector, plan_digest=sweep["digest"])
+    assert DorisStorage.get_artifact_manifest(project, "leftover", None) is None
+
+    final = run_purge_summary(DorisStorage, project, (second,))
+    purge_runs(DorisStorage, project, (second,), plan_digest=final["digest"])
+    assert DorisStorage.get_run_records(project) == []
+    assert DorisStorage.get_artifact_manifest(project, "collection", None) is None
+
+
 def test_sqlite_copy_and_reconciliation(tmp_path):
     source = tmp_path / "trackio-doris-migration-integration.db"
     connection = sqlite3.connect(source)

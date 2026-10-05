@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import sqlite3
 import tempfile
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -151,6 +152,57 @@ def test_remote_client_reports_stale_run_purge_and_accepts_reviewed_digest(temp_
         receipt = client.purge_runs(project, [run.id], preview["digest"])
         assert receipt["deleted_provider_run_ids"] == [run.id]
         assert client.run_purge_plan(project, [run.id])["exists"] is False
+    finally:
+        trackio.delete_project(project, force=True)
+        app.close()
+
+
+def test_remote_client_finishes_an_interrupted_purge_and_its_leftover_versions(temp_dir):
+    project = "remote-run-purge-resume"
+    run = trackio.init(project=project, name="train")
+    trackio.log(metrics={"loss": 0.1})
+    trackio.finish()
+    from trackio.sqlite_storage import SQLiteStorage
+
+    leftover = SQLiteStorage.commit_artifact_version(
+        project=project,
+        name="leftover",
+        type="training-collection",
+        description=None,
+        manifest=[],
+        metadata={"run_id": "smoke-r4"},
+        aliases=None,
+        run_name=None,
+        run_id=None,
+    )
+    with sqlite3.connect(SQLiteStorage.get_project_db_path(project)) as conn:
+        # What an interrupted purge leaves behind: no link, no producer.
+        conn.execute(
+            "DELETE FROM run_artifact_links WHERE artifact_version_id = ?",
+            (leftover["version_id"],),
+        )
+    app, _, _, full_url = trackio.show(block_thread=False, open_browser=False)
+
+    try:
+        client = Client(full_url, verbose=False)
+        preview = client.run_purge_plan(project, [run.id])
+        client.purge_runs(project, [run.id], preview["digest"])
+
+        assert client.run_purge_plan(project, [run.id])["blockers"]
+        resumed = client.run_purge_plan(project, [run.id], allow_absent=True)
+        assert resumed["blockers"] == []
+        assert resumed["absent_run_ids"] == [run.id]
+        receipt = client.purge_runs(project, [run.id], resumed["digest"], allow_absent=True)
+        assert receipt["already_absent_provider_run_ids"] == [run.id]
+
+        selector = {"run_id": "smoke-r4"}
+        plan = client.unreferenced_artifact_purge_plan(project, selector)
+        assert [item["version_id"] for item in plan["artifacts"]] == [leftover["version_id"]]
+        with pytest.raises(RuntimeError, match="artifact purge plan is stale"):
+            client.purge_unreferenced_artifacts(project, selector, "sha256:" + "0" * 64)
+        deleted = client.purge_unreferenced_artifacts(project, selector, plan["digest"])
+        assert deleted["deleted_artifact_version_ids"] == [leftover["version_id"]]
+        assert client.unreferenced_artifact_purge_plan(project, selector)["artifacts"] == []
     finally:
         trackio.delete_project(project, force=True)
         app.close()

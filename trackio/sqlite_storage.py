@@ -4490,12 +4490,10 @@ class SQLiteStorage:
         if missing:
             raise ValueError(f"Trackio runs do not exist: {missing!r}")
 
-        from trackio.purge import manifest_blob_digests
-
-        deleted_digests: set[str] = set()
         with SQLiteStorage._get_process_lock(project):
             with SQLiteStorage._get_connection(db_path) as conn:
                 cursor = conn.cursor()
+                identities = []
                 for run_id in run_ids:
                     record = records[run_id]
                     identity = SQLiteStorage._resolve_run_identity(
@@ -4503,6 +4501,17 @@ class SQLiteStorage:
                     )
                     if identity is None:
                         raise ValueError(f"Trackio run {run_id!r} disappeared")
+                    identities.append((identity, record["name"]))
+                deleted_digests = SQLiteStorage._artifact_purge_digests(
+                    cursor,
+                    artifact_version_ids,
+                    allowed=lambda link: any(
+                        SQLiteStorage._link_belongs_to(link, identity, name)
+                        for identity, name in identities
+                    ),
+                )
+                SQLiteStorage._delete_artifact_versions(cursor, artifact_version_ids)
+                for identity, name in identities:
                     for table in (
                         "metrics",
                         "configs",
@@ -4519,59 +4528,115 @@ class SQLiteStorage:
                         except sqlite3.OperationalError:
                             pass
                     SQLiteStorage._detach_run_artifact_refs(
-                        cursor, identity[0], identity[1], record["name"]
-                    )
-
-                if artifact_version_ids:
-                    placeholders = ",".join("?" for _ in artifact_version_ids)
-                    rows = cursor.execute(
-                        f"SELECT id, manifest FROM artifact_versions WHERE id IN ({placeholders})",
-                        artifact_version_ids,
-                    ).fetchall()
-                    if len(rows) != len(set(artifact_version_ids)):
-                        raise ValueError(
-                            "Trackio artifact purge set changed; obtain a new preview"
-                        )
-                    linked = cursor.execute(
-                        f"SELECT DISTINCT artifact_version_id FROM run_artifact_links WHERE artifact_version_id IN ({placeholders})",
-                        artifact_version_ids,
-                    ).fetchall()
-                    if linked:
-                        raise ValueError(
-                            "Trackio artifact purge set still has consumers"
-                        )
-                    for row in rows:
-                        try:
-                            deleted_digests.update(
-                                manifest_blob_digests(json_mod.loads(row["manifest"]))
-                            )
-                        except (TypeError, ValueError, json_mod.JSONDecodeError):
-                            pass
-                    cursor.execute(
-                        f"DELETE FROM artifact_aliases WHERE artifact_version_id IN ({placeholders})",
-                        artifact_version_ids,
-                    )
-                    cursor.execute(
-                        f"DELETE FROM artifact_versions WHERE id IN ({placeholders})",
-                        artifact_version_ids,
-                    )
-                    cursor.execute(
-                        "DELETE FROM artifacts WHERE id NOT IN (SELECT DISTINCT artifact_id FROM artifact_versions)",
+                        cursor, identity[0], identity[1], name
                     )
                 conn.commit()
+                unretained = SQLiteStorage._unretained_digests(cursor, deleted_digests)
 
-                retained_digests: set[str] = set()
-                for row in cursor.execute(
-                    "SELECT manifest FROM artifact_versions"
-                ).fetchall():
-                    try:
-                        retained_digests.update(
-                            manifest_blob_digests(json_mod.loads(row["manifest"]))
-                        )
-                    except (TypeError, ValueError, json_mod.JSONDecodeError):
-                        pass
+        for digest in unretained:
+            get_artifact_store().delete(project, digest)
 
-        for digest in deleted_digests - retained_digests:
+    @staticmethod
+    def _link_belongs_to(link, identity: tuple[str, str], run_name) -> bool:
+        """Whether a run_artifact_links row belongs to one resolved run.
+
+        A row with a run id matches only that id; a legacy row without one
+        (or a database without run ids) matches by name.
+        """
+        if identity[0] == "run_id" and link["run_id"] is not None:
+            return link["run_id"] == identity[1]
+        return run_name is not None and link["run_name"] == run_name
+
+    @staticmethod
+    def _artifact_purge_digests(cursor, version_ids, *, allowed) -> set[str]:
+        """Validate an artifact deletion set and return its CAS digests.
+
+        Every version must exist and only links ``allowed`` accepts (those
+        of the runs being purged) may reference it.
+        """
+        from trackio.purge import manifest_blob_digests
+
+        if not version_ids:
+            return set()
+        placeholders = ",".join("?" for _ in version_ids)
+        rows = cursor.execute(
+            f"SELECT id, manifest FROM artifact_versions WHERE id IN ({placeholders})",
+            version_ids,
+        ).fetchall()
+        if len(rows) != len(set(version_ids)):
+            raise ValueError("Trackio artifact purge set changed; obtain a new preview")
+        links = cursor.execute(
+            f"SELECT DISTINCT run_id, run_name FROM run_artifact_links WHERE artifact_version_id IN ({placeholders})",
+            version_ids,
+        ).fetchall()
+        others = sorted(
+            str(link["run_id"] or link["run_name"]) for link in links if not allowed(link)
+        )
+        if others:
+            raise ValueError(
+                "Trackio artifact purge set is still linked to unselected run(s): "
+                + ", ".join(repr(run) for run in others)
+            )
+        digests: set[str] = set()
+        for row in rows:
+            try:
+                digests.update(manifest_blob_digests(json_mod.loads(row["manifest"])))
+            except (TypeError, ValueError, json_mod.JSONDecodeError):
+                pass
+        return digests
+
+    @staticmethod
+    def _delete_artifact_versions(cursor, version_ids) -> None:
+        if not version_ids:
+            return
+        placeholders = ",".join("?" for _ in version_ids)
+        cursor.execute(
+            f"DELETE FROM run_artifact_links WHERE artifact_version_id IN ({placeholders})",
+            version_ids,
+        )
+        cursor.execute(
+            f"DELETE FROM artifact_aliases WHERE artifact_version_id IN ({placeholders})",
+            version_ids,
+        )
+        cursor.execute(
+            f"DELETE FROM artifact_versions WHERE id IN ({placeholders})",
+            version_ids,
+        )
+        cursor.execute(
+            "DELETE FROM artifacts WHERE id NOT IN (SELECT DISTINCT artifact_id FROM artifact_versions)",
+        )
+
+    @staticmethod
+    def _unretained_digests(cursor, deleted_digests: set[str]) -> set[str]:
+        from trackio.purge import manifest_blob_digests
+
+        if not deleted_digests:
+            return set()
+        retained: set[str] = set()
+        for row in cursor.execute("SELECT manifest FROM artifact_versions").fetchall():
+            try:
+                retained.update(manifest_blob_digests(json_mod.loads(row["manifest"])))
+            except (TypeError, ValueError, json_mod.JSONDecodeError):
+                pass
+        return deleted_digests - retained
+
+    @staticmethod
+    def purge_artifact_versions(project: str, version_ids: tuple[int, ...]) -> None:
+        """Delete exact artifact versions that no run links."""
+        db_path = SQLiteStorage.get_project_db_path(project)
+        if not db_path.exists():
+            raise ValueError(f"Trackio project {project!r} does not exist")
+        with SQLiteStorage._get_process_lock(project):
+            with SQLiteStorage._get_connection(db_path) as conn:
+                cursor = conn.cursor()
+                deleted_digests = SQLiteStorage._artifact_purge_digests(
+                    cursor, version_ids, allowed=lambda link: False
+                )
+                SQLiteStorage._delete_artifact_versions(cursor, version_ids)
+                conn.commit()
+                unretained = SQLiteStorage._unretained_digests(cursor, deleted_digests)
+
+        for digest in unretained:
             get_artifact_store().delete(project, digest)
 
     @staticmethod
@@ -6573,6 +6638,67 @@ class SQLiteStorage:
                 if row["direction"] in ("input", "output"):
                     entry[row["direction"]] += 1
             return list(counts.values())
+
+    @staticmethod
+    def get_artifact_version_links(project: str, version_id: int) -> list[dict]:
+        """Every run link (input and output) on one artifact version."""
+        SQLiteStorage._ensure_hub_loaded()
+        db_path = SQLiteStorage.get_project_db_path(project)
+        if not db_path.exists():
+            return []
+        with SQLiteStorage._get_connection(db_path) as conn:
+            try:
+                rows = conn.execute(
+                    """SELECT run_name, run_id, direction, created_at
+                    FROM run_artifact_links
+                    WHERE artifact_version_id = ?
+                    ORDER BY created_at, id""",
+                    (version_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+            return [dict(row) for row in rows]
+
+    @staticmethod
+    def get_unreferenced_artifact_versions(project: str) -> list[dict]:
+        """Artifact versions that no run links as an input or an output."""
+        SQLiteStorage._ensure_hub_loaded()
+        db_path = SQLiteStorage.get_project_db_path(project)
+        if not db_path.exists():
+            return []
+        with SQLiteStorage._get_connection(db_path) as conn:
+            try:
+                rows = conn.execute(
+                    """SELECT v.id, v.version, v.size_bytes, v.metadata,
+                              v.producer_run_id, v.producer_run_name, a.name
+                    FROM artifact_versions v
+                    JOIN artifacts a ON a.id = v.artifact_id
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM run_artifact_links l
+                        WHERE l.artifact_version_id = v.id
+                    )
+                    ORDER BY v.id"""
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+        result = []
+        for row in rows:
+            try:
+                metadata = json_mod.loads(row["metadata"]) if row["metadata"] else None
+            except (TypeError, ValueError, json_mod.JSONDecodeError):
+                metadata = None
+            result.append(
+                {
+                    "version_id": int(row["id"]),
+                    "name": row["name"],
+                    "version": int(row["version"]),
+                    "size_bytes": int(row["size_bytes"] or 0),
+                    "metadata": metadata,
+                    "producer_run_id": row["producer_run_id"],
+                    "producer_run_name": row["producer_run_name"],
+                }
+            )
+        return result
 
     @staticmethod
     def get_artifact_consumers(project: str, version_id: int) -> list[dict]:

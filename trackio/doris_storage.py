@@ -3271,28 +3271,173 @@ class DorisStorage:
             return list(cursor.fetchall())
 
     @classmethod
+    def get_artifact_version_links(cls, project: str, version_id: int) -> list[dict]:
+        """Every run link (input and output) on one artifact version."""
+        with cls._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT run_name, run_id, direction, created_at
+                FROM run_artifact_links
+                WHERE project_id = %s AND version_id = %s
+                ORDER BY created_at, run_name, run_id, direction
+                """,
+                (project, version_id),
+            )
+            return list(cursor.fetchall())
+
+    @classmethod
+    def get_unreferenced_artifact_versions(cls, project: str) -> list[dict]:
+        """Artifact versions that no run links as an input or an output."""
+        with cls._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT versions.version_id, versions.version_number,
+                       versions.size_bytes, versions.metadata,
+                       versions.producer_run_id, versions.producer_run_name,
+                       artifacts.name
+                FROM artifact_versions versions
+                JOIN artifacts
+                  ON artifacts.project_id = versions.project_id
+                 AND artifacts.artifact_id = versions.artifact_id
+                WHERE versions.project_id = %s
+                  AND NOT EXISTS (
+                    SELECT 1 FROM run_artifact_links links
+                    WHERE links.project_id = versions.project_id
+                      AND links.version_id = versions.version_id
+                  )
+                ORDER BY versions.version_id
+                """,
+                (project,),
+            )
+            rows = list(cursor.fetchall())
+        return [
+            {
+                "version_id": int(row["version_id"]),
+                "name": row["name"],
+                "version": int(row["version_number"]),
+                "size_bytes": int(row["size_bytes"] or 0),
+                "metadata": _decode(row["metadata"]) if row["metadata"] else None,
+                "producer_run_id": row["producer_run_id"],
+                "producer_run_name": row["producer_run_name"],
+            }
+            for row in rows
+        ]
+
+    @classmethod
+    def _artifact_purge_digests(
+        cls,
+        cursor: DictCursor,
+        project: str,
+        version_ids: tuple[int, ...],
+        allowed_run_ids: set[str],
+    ) -> set[str]:
+        """Validate an artifact deletion set before any row changes.
+
+        Doris has no multi-table transaction, so every check runs first:
+        each version must exist and only runs being purged may link it.
+        Returns the CAS digests the deleted manifests reference.
+        """
+        if not version_ids:
+            return set()
+        placeholders = ",".join("%s" for _ in version_ids)
+        params = (project, *version_ids)
+        cursor.execute(
+            f"SELECT version_id, manifest FROM artifact_versions "
+            f"WHERE project_id = %s AND version_id IN ({placeholders})",
+            params,
+        )
+        rows = list(cursor.fetchall())
+        if len(rows) != len(set(version_ids)):
+            raise ValueError("Trackio artifact purge set changed; obtain a new preview")
+        cursor.execute(
+            f"SELECT DISTINCT run_id, run_name FROM run_artifact_links "
+            f"WHERE project_id = %s AND version_id IN ({placeholders})",
+            params,
+        )
+        others = sorted(
+            str(row["run_id"] or row["run_name"])
+            for row in cursor.fetchall()
+            if row["run_id"] is None or str(row["run_id"]) not in allowed_run_ids
+        )
+        if others:
+            raise ValueError(
+                "Trackio artifact purge set is still linked to unselected run(s): "
+                + ", ".join(repr(run) for run in others)
+            )
+        digests: set[str] = set()
+        for row in rows:
+            digests.update(manifest_blob_digests(_decode(row["manifest"])))
+        return digests
+
+    @classmethod
+    def _delete_artifact_versions(
+        cls, cursor: DictCursor, project: str, version_ids: tuple[int, ...]
+    ) -> None:
+        if not version_ids:
+            return
+        placeholders = ",".join("%s" for _ in version_ids)
+        params = (project, *version_ids)
+        for table in ("run_artifact_links", "artifact_aliases", "artifact_versions"):
+            cursor.execute(
+                f"DELETE FROM {table} WHERE project_id = %s AND version_id IN ({placeholders})",
+                params,
+            )
+        cursor.execute(
+            "DELETE FROM artifacts WHERE project_id = %s AND NOT EXISTS "
+            "(SELECT 1 FROM artifact_versions WHERE artifact_versions.project_id = artifacts.project_id "
+            "AND artifact_versions.artifact_id = artifacts.artifact_id)",
+            (project,),
+        )
+
+    @classmethod
+    def _delete_unretained_blobs(
+        cls, cursor: DictCursor, project: str, deleted_digests: set[str]
+    ) -> set[str]:
+        if not deleted_digests:
+            return set()
+        cursor.execute(
+            "SELECT manifest FROM artifact_versions WHERE project_id = %s",
+            (project,),
+        )
+        retained: set[str] = set()
+        for row in cursor.fetchall():
+            retained.update(manifest_blob_digests(_decode(row["manifest"])))
+        return deleted_digests - retained
+
+    @classmethod
     def purge_runs(
         cls,
         project: str,
         run_ids: tuple[str, ...],
         artifact_version_ids: tuple[int, ...],
     ) -> None:
-        """Delete exact runs and artifact versions after closure validation."""
+        """Delete exact runs and artifact versions after closure validation.
+
+        All validation happens before the first delete. Artifact versions go
+        first and the rows that make a run exist (its artifact links, then
+        its metrics) go last, so an interrupted purge leaves the run visible
+        to a fresh preview instead of leaking unreachable artifact versions.
+        """
         records = {record["id"]: record for record in cls.get_run_records(project)}
         missing = [run_id for run_id in run_ids if run_id not in records]
         if missing:
             raise ValueError(f"Trackio runs do not exist: {missing!r}")
 
-        deleted_digests: set[str] = set()
         with cls._connection() as connection, connection.cursor() as cursor:
+            resolved_ids: list[str] = []
             for run_id in run_ids:
                 resolved = cls._resolve_run_id(
                     cursor, project, records[run_id]["name"], run_id
                 )
                 if resolved is None:
                     raise ValueError(f"Trackio run {run_id!r} disappeared")
+                resolved_ids.append(resolved)
+            deleted_digests = cls._artifact_purge_digests(
+                cursor, project, artifact_version_ids, set(resolved_ids)
+            )
+            cls._delete_artifact_versions(cursor, project, artifact_version_ids)
+            for resolved in resolved_ids:
                 for table in (
-                    "metrics",
                     "configs",
                     "system_metrics",
                     "traces",
@@ -3300,7 +3445,6 @@ class DorisStorage:
                     "trace_environment_metrics",
                     "alerts",
                     "run_notes",
-                    "run_artifact_links",
                 ):
                     cursor.execute(
                         f"DELETE FROM {table} WHERE project_id = %s AND run_id = %s",
@@ -3311,55 +3455,29 @@ class DorisStorage:
                     "WHERE project_id = %s AND producer_run_id = %s",
                     (project, resolved),
                 )
-
-            if artifact_version_ids:
-                placeholders = ",".join("%s" for _ in artifact_version_ids)
-                params = (project, *artifact_version_ids)
-                cursor.execute(
-                    f"SELECT version_id, manifest FROM artifact_versions "
-                    f"WHERE project_id = %s AND version_id IN ({placeholders})",
-                    params,
-                )
-                rows = list(cursor.fetchall())
-                if len(rows) != len(set(artifact_version_ids)):
-                    raise ValueError(
-                        "Trackio artifact purge set changed; obtain a new preview"
+                for table in ("run_artifact_links", "metrics"):
+                    cursor.execute(
+                        f"DELETE FROM {table} WHERE project_id = %s AND run_id = %s",
+                        (project, resolved),
                     )
-                cursor.execute(
-                    f"SELECT version_id FROM run_artifact_links "
-                    f"WHERE project_id = %s AND version_id IN ({placeholders}) LIMIT 1",
-                    params,
-                )
-                if cursor.fetchone() is not None:
-                    raise ValueError("Trackio artifact purge set still has consumers")
-                for row in rows:
-                    deleted_digests.update(
-                        manifest_blob_digests(_decode(row["manifest"]))
-                    )
-                cursor.execute(
-                    f"DELETE FROM artifact_aliases WHERE project_id = %s AND version_id IN ({placeholders})",
-                    params,
-                )
-                cursor.execute(
-                    f"DELETE FROM artifact_versions WHERE project_id = %s AND version_id IN ({placeholders})",
-                    params,
-                )
-                cursor.execute(
-                    "DELETE FROM artifacts WHERE project_id = %s AND NOT EXISTS "
-                    "(SELECT 1 FROM artifact_versions WHERE artifact_versions.project_id = artifacts.project_id "
-                    "AND artifact_versions.artifact_id = artifacts.artifact_id)",
-                    (project,),
-                )
+            unretained = cls._delete_unretained_blobs(cursor, project, deleted_digests)
 
-            cursor.execute(
-                "SELECT manifest FROM artifact_versions WHERE project_id = %s",
-                (project,),
+        for digest in unretained:
+            get_artifact_store().delete(project, digest)
+
+    @classmethod
+    def purge_artifact_versions(
+        cls, project: str, version_ids: tuple[int, ...]
+    ) -> None:
+        """Delete exact artifact versions that no run links."""
+        with cls._connection() as connection, connection.cursor() as cursor:
+            deleted_digests = cls._artifact_purge_digests(
+                cursor, project, version_ids, set()
             )
-            retained_digests: set[str] = set()
-            for row in cursor.fetchall():
-                retained_digests.update(manifest_blob_digests(_decode(row["manifest"])))
+            cls._delete_artifact_versions(cursor, project, version_ids)
+            unretained = cls._delete_unretained_blobs(cursor, project, deleted_digests)
 
-        for digest in deleted_digests - retained_digests:
+        for digest in unretained:
             get_artifact_store().delete(project, digest)
 
     @classmethod

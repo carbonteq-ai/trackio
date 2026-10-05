@@ -632,13 +632,23 @@ class RemoteClient:
         return result
 
     def run_purge_plan(
-        self, project: str, provider_run_ids: list[str] | tuple[str, ...]
+        self,
+        project: str,
+        provider_run_ids: list[str] | tuple[str, ...],
+        *,
+        allow_absent: bool = False,
     ) -> dict[str, Any]:
-        """Preview deletion of exact provider run ids."""
+        """Preview deletion of exact provider run ids.
 
+        ``allow_absent`` needs a dev34-or-later server; it is sent only when
+        set so older servers keep accepting ordinary previews.
+        """
+
+        options = {"allow_absent": True} if allow_absent else {}
         result = self.predict(
             project=project,
             run_ids=list(provider_run_ids),
+            **options,
             api_name="/get_run_purge_plan",
         )
         if not isinstance(result, dict):
@@ -650,15 +660,48 @@ class RemoteClient:
         project: str,
         provider_run_ids: list[str] | tuple[str, ...],
         plan_digest: str,
+        *,
+        allow_absent: bool = False,
     ) -> dict[str, Any]:
         """Apply a run purge bound to a previously previewed digest."""
 
+        options = {"allow_absent": True} if allow_absent else {}
         result = self.predict(
             project=project,
             run_ids=list(provider_run_ids),
             plan_digest=plan_digest,
+            **options,
             api_name="/purge_runs",
         )
         if not isinstance(result, dict):
             raise RuntimeError("Trackio run purge result must be an object")
+        return result
+
+    def unreferenced_artifact_purge_plan(
+        self, project: str, metadata: dict[str, str]
+    ) -> dict[str, Any]:
+        """Preview deletion of unlinked artifact versions matching metadata."""
+
+        result = self.predict(
+            project=project,
+            metadata=dict(metadata),
+            api_name="/get_unreferenced_artifact_purge_plan",
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("Trackio artifact purge plan must be an object")
+        return result
+
+    def purge_unreferenced_artifacts(
+        self, project: str, metadata: dict[str, str], plan_digest: str
+    ) -> dict[str, Any]:
+        """Apply an unreferenced-artifact purge bound to its preview digest."""
+
+        result = self.predict(
+            project=project,
+            metadata=dict(metadata),
+            plan_digest=plan_digest,
+            api_name="/purge_unreferenced_artifacts",
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("Trackio artifact purge result must be an object")
         return result
