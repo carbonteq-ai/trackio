@@ -6557,7 +6557,8 @@ class SQLiteStorage:
                     f"""{with_clause}
                     SELECT ral.direction, MIN(ral.created_at) AS created_at,
                            av.id AS version_id, av.version, av.size_bytes,
-                           a.name, a.type
+                           av.manifest_digest, av.metadata,
+                           a.name, a.type, a.description
                     FROM run_artifact_links ral
                     JOIN artifact_versions av ON av.id = ral.artifact_version_id
                     JOIN artifacts a ON a.id = av.artifact_id
@@ -6578,6 +6579,13 @@ class SQLiteStorage:
                         "version": int(row["version"]),
                         "size_bytes": int(row["size_bytes"]),
                         "created_at": row["created_at"],
+                        "description": row["description"],
+                        "metadata": (
+                            orjson.loads(row["metadata"])
+                            if row["metadata"] is not None
+                            else None
+                        ),
+                        "manifest_digest": row["manifest_digest"],
                     }
                 )
             return result

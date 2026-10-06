@@ -221,15 +221,17 @@ def test_project_delete_plan_digest_rejects_stale_apply(temp_dir):
     preview = project_delete_plan(SQLiteStorage, "digest-project")
     assert preview["digest"].startswith("sha256:")
     with pytest.raises(ValueError, match="stale"):
-        delete_project(SQLiteStorage, "digest-project", plan_digest="sha256:" + "0" * 64)
+        delete_project(
+            SQLiteStorage, "digest-project", plan_digest="sha256:" + "0" * 64
+        )
     assert SQLiteStorage.project_delete_summary("digest-project")["exists"] is True
-    deleted = delete_project(SQLiteStorage, "digest-project", plan_digest=preview["digest"])
+    deleted = delete_project(
+        SQLiteStorage, "digest-project", plan_digest=preview["digest"]
+    )
     assert deleted["plan_digest"] == preview["digest"]
 
 
-def test_run_purge_requires_dependency_closure_and_removes_cas(
-    temp_dir, stage_blob
-):
+def test_run_purge_requires_dependency_closure_and_removes_cas(temp_dir, stage_blob):
     payload = b"run-owned-weights"
     digest, blob = stage_blob("run-purge", payload)
     artifact = _commit(
@@ -286,3 +288,51 @@ def test_legacy_metrics_db_resolves_artifact_links_by_name(temp_dir):
             "output": 1,
         }
     ]
+
+
+def test_run_artifacts_carry_manifest_fields_so_readers_need_one_request(
+    temp_dir, monkeypatch
+):
+    import trackio
+
+    artifact = _commit()
+    manifest = SQLiteStorage.get_artifact_manifest("p", "m", "latest")
+    output = server.get_run_artifacts("p", run="producer", run_id="producer-id")[
+        "output"
+    ]
+    assert [
+        (row["description"], row["metadata"], row["manifest_digest"]) for row in output
+    ] == [(manifest["description"], manifest["metadata"], manifest["manifest_digest"])]
+    assert output[0]["version_id"] == artifact["version_id"]
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("per-artifact manifest read")
+
+    monkeypatch.setattr(SQLiteStorage, "get_artifact_manifest", unexpected)
+    run = next(run for run in trackio.Api().runs("p") if run.id == "producer-id")
+    link = run.artifacts()["output"][0]
+    assert link["digest"] == manifest["manifest_digest"]
+    assert link["metadata"] == (manifest["metadata"] or {})
+    assert "manifest_digest" not in link
+
+
+def test_run_artifacts_read_manifests_from_servers_without_manifest_fields(
+    temp_dir, monkeypatch
+):
+    import trackio
+
+    _commit()
+    manifest = SQLiteStorage.get_artifact_manifest("p", "m", "latest")
+    original = SQLiteStorage.get_run_artifacts
+
+    def legacy(project, run_name=None, run_id=None):
+        links = original(project, run_name, run_id)
+        for records in links.values():
+            for record in records:
+                for key in ("description", "metadata", "manifest_digest"):
+                    record.pop(key)
+        return links
+
+    monkeypatch.setattr(SQLiteStorage, "get_run_artifacts", legacy)
+    run = next(run for run in trackio.Api().runs("p") if run.id == "producer-id")
+    assert run.artifacts()["output"][0]["digest"] == manifest["manifest_digest"]

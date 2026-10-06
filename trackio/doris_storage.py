@@ -2498,14 +2498,30 @@ class DorisStorage:
         run_id: str | None = None,
         trace_type: str | None = None,
     ) -> dict[str, Any]:
-        traces = cls.get_traces(
-            project, run, run_id=run_id, trace_type=trace_type, sort="step_asc"
-        )
-        counts: dict[int, int] = {}
-        for trace in traces:
-            counts[int(trace["step"])] = counts.get(int(trace["step"]), 0) + 1
-        steps = [{"step": step, "count": counts[step]} for step in sorted(counts)]
-        return {"total": len(traces), "steps": steps}
+        with cls._connection() as connection, connection.cursor() as cursor:
+            resolved = cls._resolve_run_id(cursor, project, run, run_id, table="traces")
+            if resolved is None:
+                return {"total": 0, "steps": []}
+            conditions = ["project_id = %s", "run_id = %s"]
+            params: list[Any] = [project, resolved]
+            if trace_type:
+                conditions.append("trace_type = %s")
+                params.append(trace_type)
+            cursor.execute(
+                f"""
+                SELECT step, COUNT(*) AS count
+                FROM traces
+                WHERE {" AND ".join(conditions)}
+                GROUP BY step
+                ORDER BY step ASC
+                """,
+                params,
+            )
+            steps = [
+                {"step": int(row["step"]), "count": int(row["count"])}
+                for row in cursor.fetchall()
+            ]
+        return {"total": sum(item["count"] for item in steps), "steps": steps}
 
     @classmethod
     def get_tab_availability_flags(cls, project: str) -> dict[str, bool]:
@@ -3214,7 +3230,8 @@ class DorisStorage:
                 f"""
                 SELECT links.direction, links.created_at, versions.version_id,
                        versions.version_number, versions.size_bytes,
-                       artifacts.name, artifacts.artifact_type
+                       versions.manifest_digest, versions.metadata,
+                       artifacts.name, artifacts.artifact_type, artifacts.description
                 FROM run_artifact_links links
                 JOIN artifact_versions versions
                   ON versions.project_id = links.project_id
@@ -3237,6 +3254,11 @@ class DorisStorage:
                         "version": int(row["version_number"]),
                         "size_bytes": int(row["size_bytes"]),
                         "created_at": row["created_at"],
+                        "description": row["description"],
+                        "metadata": _decode(row["metadata"])
+                        if row["metadata"] is not None
+                        else None,
+                        "manifest_digest": row["manifest_digest"],
                     }
                 )
             return result

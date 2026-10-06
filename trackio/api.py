@@ -390,6 +390,10 @@ class Run:
             )
         for records in links.values():
             for record in records:
+                if "manifest_digest" in record:
+                    record["metadata"] = record.get("metadata") or {}
+                    record["digest"] = record.pop("manifest_digest")
+                    continue
                 if self._remote_client is not None:
                     manifest = self._remote(
                         "/get_artifact_manifest",

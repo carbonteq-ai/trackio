@@ -11,7 +11,7 @@ integrations.
 CarbonTeq publishes the fork as `carbonteq-trackio` while preserving the
 `trackio` import package and `trackio` console command. The current published
 fork release is `0.31.5.post13`, derived from upstream Trackio `0.31.5`; the
-working candidate is `0.31.5.post14.dev34`.
+working candidate is `0.31.5.post14.dev35`.
 Post-release numbers advance when CarbonTeq publishes additional fork changes
 without moving the upstream base.
 
@@ -19,6 +19,38 @@ Framework packages must depend on `carbonteq-trackio`, not the upstream-owned
 `trackio` distribution and not a transitive Git URL. Self-deployed Trackio
 Spaces use the same CarbonTeq distribution identity so the deployed runtime
 retains the fork's storage, trace, and query behavior.
+
+## Bounded run reads for Observatory (`0.31.5.post14.dev35`)
+
+`0.31.5.post14.dev35` is built on dev34 (tag `carbonteq-v0.31.5.post14.dev34`,
+commit `29815340`, the version the shared server runs). It needs no schema
+migration; Doris stays at schema version 6. Both changes remove reads that
+grew with the size of a run rather than with what the caller asked for.
+
+- `get_run_artifacts` returns each linked version's `description`, `metadata`
+  and `manifest_digest` from the join it already performs (both engines).
+  `Api` `Run.artifacts()` uses those fields when present and reads one
+  manifest per artifact only from an older server that omits them. A 2.6B
+  training run with 144 linked artifacts went from 145 requests (13.7 s) to
+  one (0.07 s) against the production database, with identical output.
+- Doris `get_trace_steps` counts rows per step with one `GROUP BY` instead of
+  reading every trace's transcript and payload (about 650 KB per Verifiers
+  trace) and counting in Python; SQLite already counted in SQL. The same run's
+  4,480 traces count in 0.08 s.
+
+Considered and not taken: storing a compact per-trace summary column so
+summary pages skip the full payload. It needs a schema-version-7 migration,
+so it waits until reads that cannot use indexed fact columns still prove too
+slow.
+
+Regression tests: `tests/unit/test_artifact_server.py`
+(`test_run_artifacts_carry_manifest_fields_so_readers_need_one_request`,
+`test_run_artifacts_read_manifests_from_servers_without_manifest_fields`),
+`tests/unit/test_doris_trace_steps.py`, and the SQLite stand-in for Doris SQL in
+`tests/unit/test_run_purge_shared_artifacts.py`. The read paths were checked
+read-only against the production database from a local dev35 server
+(2026-10-06). Validate with `uv run --frozen --extra dev --extra spaces python
+-m pytest -q tests/unit` (the GPU hardware test needs a GPU and `--extra gpu`).
 
 ## Run purge with shared artifact versions (`0.31.5.post14.dev34`)
 

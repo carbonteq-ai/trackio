@@ -227,10 +227,10 @@ _DORIS_TABLES = {
     "trace_environment_metrics": "project_id, run_id",
     "alerts": "project_id, run_id",
     "run_notes": "project_id, run_id",
-    "artifacts": "project_id, artifact_id, name, artifact_type",
+    "artifacts": "project_id, artifact_id, name, artifact_type, description",
     "artifact_versions": (
-        "project_id, version_id, artifact_id, version_number, manifest, metadata, "
-        "size_bytes, producer_run_id, producer_run_name"
+        "project_id, version_id, artifact_id, version_number, manifest, "
+        "manifest_digest, metadata, size_bytes, producer_run_id, producer_run_name"
     ),
     "artifact_aliases": "project_id, artifact_id, alias, version_id",
     "run_artifact_links": "project_id, run_id, run_name, version_id, direction, created_at",
@@ -297,11 +297,13 @@ def doris(monkeypatch):
             (run_id, f"train.{run_id}"),
         )
     connection.execute(
-        "INSERT INTO artifacts VALUES ('p', 70, 'collection', 'training-collection')"
+        "INSERT INTO artifacts VALUES "
+        "('p', 70, 'collection', 'training-collection', NULL)"
     )
     connection.execute(
-        "INSERT INTO artifact_versions VALUES ('p', 7, 70, 0, ?, ?, 4, 'first', 'train.first')",
-        (manifest, '{"run_id": "smoke"}'),
+        "INSERT INTO artifact_versions VALUES "
+        "('p', 7, 70, 0, ?, ?, ?, 4, 'first', 'train.first')",
+        (manifest, digest, '{"run_id": "smoke"}'),
     )
     yield connection, statements, deleted, digest
     connection.close()
